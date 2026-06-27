@@ -1,0 +1,21 @@
+[package]
+name = "peers-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "peers-client"
+path = "src/main.rs"
+
+[dependencies]
+peers-core = { path = "../peers-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+time = { version = "0.3", features = ["formatting"] }

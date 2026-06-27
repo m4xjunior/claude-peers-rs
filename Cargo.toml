@@ -1,0 +1,28 @@
+# Workspace claude-peers-rs — reescritura en Rust de claude-peers (TS/bun).
+# Herramienta privada de Max. 2 binarios distribuibles sin deps: peers-broker + peers-client.
+# Diseño: Claudio. Implementación: Jefin (ai-studio) vía ultracode.
+[workspace]
+resolver = "2"
+members = [
+    "crates/peers-core",
+    "crates/peers-broker",
+    "crates/peers-client",
+]
+
+# Dependencias compartidas centralizadas — una sola fuente de versiones para los 3 crates.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Perfil release: binario enxuto y portable (criterio de distribución del diseño).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "z"
