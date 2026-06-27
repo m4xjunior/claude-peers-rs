@@ -263,3 +263,113 @@ fn fila_a_instancia(fila: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
         visto_en: fila.get("visto_en")?,
     })
 }
+
+#[cfg(test)]
+mod pruebas {
+    use super::*;
+
+    /// Base en memoria para tests deterministas (sin tocar disco ni red).
+    fn base_memoria() -> Base {
+        Base::abrir(":memory:").expect("base en memoria")
+    }
+
+    #[test]
+    fn id_estable_reregistro_hereda_la_fila() {
+        // CRITERIO DE PRONTO #3 — el fix de mayor valor frente al TS.
+        let base = base_memoria();
+        base.registrar("jefin", 111, "/x", None, None, "papel jefin", "2026-01-01T00:00:00Z")
+            .unwrap();
+        base.registrar("claudia", 222, "/y", None, None, "papel claudia", "2026-01-01T00:00:00Z")
+            .unwrap();
+        // claudia encola un mensaje para jefin.
+        base.encolar_mensaje("claudia", "jefin", "hola pre-restart", "2026-01-01T00:00:01Z")
+            .unwrap();
+
+        // jefin "reinicia": re-registro con MISMO id pero pid distinto.
+        base.registrar("jefin", 999, "/x", None, None, "papel jefin", "2026-01-01T00:01:00Z")
+            .unwrap();
+
+        // La fila DEBE sobrevivir: el mensaje sigue ahí.
+        let msgs = base.recibir_mensajes("jefin").unwrap();
+        assert_eq!(msgs.len(), 1, "el mensaje pre-restart debe sobrevivir al re-registro");
+        assert_eq!(msgs[0].texto, "hola pre-restart");
+        assert_eq!(msgs[0].de_id, "claudia");
+    }
+
+    #[test]
+    fn recibir_marca_entregado_y_no_duplica() {
+        let base = base_memoria();
+        base.registrar("a", 1, "/x", None, None, "", "2026-01-01T00:00:00Z").unwrap();
+        base.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").unwrap();
+        assert_eq!(base.recibir_mensajes("a").unwrap().len(), 1);
+        // Segundo recibir: ya entregado, vacío.
+        assert_eq!(base.recibir_mensajes("a").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reregistro_conserva_registrada_en_y_resumen() {
+        let base = base_memoria();
+        base.registrar("x", 1, "/d", None, None, "resumen original", "2026-01-01T00:00:00Z")
+            .unwrap();
+        base.registrar("x", 2, "/d", None, None, "ignorado", "2026-02-02T00:00:00Z")
+            .unwrap();
+        let inst = &base
+            .listar(Alcance::Maquina, "/d", None, None, "1970-01-01T00:00:00Z")
+            .unwrap()[0];
+        // El re-registro NO pisa el resumen (eso es trabajo de definir_resumen)...
+        assert_eq!(inst.resumen, "resumen original");
+        // ...ni la fecha de registro original, pero sí actualiza pid y visto_en.
+        assert_eq!(inst.registrada_en, "2026-01-01T00:00:00Z");
+        assert_eq!(inst.pid, 2);
+    }
+
+    #[test]
+    fn liveness_filtra_instancias_vencidas() {
+        // CRITERIO #5 — liveness por latido.
+        let base = base_memoria();
+        base.registrar("viva", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").unwrap();
+        base.registrar("muerta", 2, "/d", None, None, "", "2020-01-01T00:00:00Z").unwrap();
+        // Límite de vencimiento posterior a "muerta" pero anterior a "viva".
+        let vivas = base
+            .listar(Alcance::Maquina, "/d", None, None, "2026-06-27T11:59:00Z")
+            .unwrap();
+        assert_eq!(vivas.len(), 1);
+        assert_eq!(vivas[0].id, "viva");
+    }
+
+    #[test]
+    fn limpiar_vencidas_purga_instancia_y_su_fila() {
+        let base = base_memoria();
+        base.registrar("zombie", 1, "/d", None, None, "", "2020-01-01T00:00:00Z").unwrap();
+        base.encolar_mensaje("otro", "zombie", "no llegará", "2020-01-01T00:00:01Z").unwrap();
+        let n = base.limpiar_vencidas("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(n, 1);
+        assert!(!base.instancia_existe("zombie"));
+        // La fila pendiente del zombie también se purgó.
+        assert_eq!(base.recibir_mensajes("zombie").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn listar_excluye_al_solicitante() {
+        let base = base_memoria();
+        base.registrar("yo", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").unwrap();
+        base.registrar("otro", 2, "/d", None, None, "", "2026-06-27T12:00:00Z").unwrap();
+        let r = base
+            .listar(Alcance::Maquina, "/d", None, Some("yo"), "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, "otro");
+    }
+
+    #[test]
+    fn alcance_repo_sin_git_cae_a_directorio() {
+        let base = base_memoria();
+        base.registrar("a", 1, "/proj", Some("/proj"), None, "", "2026-06-27T12:00:00Z").unwrap();
+        base.registrar("b", 2, "/proj", None, None, "", "2026-06-27T12:00:00Z").unwrap();
+        // Repo sin repo_git → filtra por directorio.
+        let r = base
+            .listar(Alcance::Repo, "/proj", None, None, "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(r.len(), 2);
+    }
+}
