@@ -1,55 +1,86 @@
 //! Integración con GitHub Issues — cada tarea del equipo es una issue rastreable.
 //!
-//! ESQUELETO/CONTRATO — lo rellena Aluísio Back (jopwh40d). Reglas FIJAS (de Max):
+//! Reglas FIJAS (de Max):
+//! 1. Solo se usa contra un REPO DE PRUEBA descartable, NUNCA un repo real.
+//! 2. DEGRADACIÓN GRACIOSA: si GitHub no responde (o no hay token), la tarea sigue en
+//!    local — la integración NUNCA bloquea el trabajo. Todos los métodos devuelven Result
+//!    y el broker IGNORA el error (lo loguea con warn!).
+//! 3. Sin GITHUB_TOKEN/GITHUB_REPO → `desde_entorno` devuelve None y el broker opera sin GH.
 //!
-//! 1. Solo se prueba contra un REPO DE PRUEBA descartable, NUNCA contra un repo real.
-//! 2. DEGRADACIÓN GRACIOSA: si GitHub no responde (o no hay token), la tarea sigue
-//!    funcionando en local (Redis) — la integración NUNCA bloquea ni tumba el trabajo.
-//!    Por eso todos los métodos devuelven Result y el broker IGNORA el error (lo loguea).
-//! 3. Sin token configurado (GITHUB_TOKEN ausente) → `GitHub::desde_entorno` devuelve
-//!    None y el broker opera sin tocar GitHub.
-//!
-//! Sugerencia de stack (decidir con docs/stack-decisions.md): `octocrab` (cliente GitHub
-//! idiomático) o `reqwest` directo a la API REST. Cualquiera sirve mientras respete estas
-//! firmas y la degradación graciosa.
+//! Stack: octocrab con rustls (sin OpenSSL nativo), coherente con "zero deps nativas".
 
-#![allow(dead_code)] // se activa al cablear en main.rs
+use octocrab::models::IssueState;
+use octocrab::Octocrab;
 
-/// Cliente de GitHub Issues. Construido solo si hay token + repo configurados.
+/// Cliente de GitHub Issues. Construido solo si hay token + repo (owner/repo) en el entorno.
 pub struct GitHub {
-    // TODO(aluisio-back): token, owner, repo, cliente http/octocrab.
+    cliente: Octocrab,
+    owner: String,
+    repo: String,
 }
 
 impl GitHub {
-    /// Construye el cliente desde el entorno (GITHUB_TOKEN, GITHUB_REPO="owner/repo").
-    /// Devuelve None si falta configuración → el broker opera sin GitHub (degradación).
+    /// Construye desde el entorno: GITHUB_TOKEN + GITHUB_REPO ("owner/repo").
+    /// None si falta cualquiera de los dos → el broker opera sin GitHub (degradación).
+    ///
+    /// RECORDATORIO: GITHUB_REPO debe apuntar a un repo de PRUEBA descartable.
     pub fn desde_entorno() -> Option<Self> {
-        // TODO(aluisio-back): leer GITHUB_TOKEN y GITHUB_REPO; None si falta alguno.
-        // RECORDATORIO: GITHUB_REPO debe apuntar a un repo de PRUEBA descartable.
-        None
+        let token = std::env::var("GITHUB_TOKEN").ok()?;
+        let repo_full = std::env::var("GITHUB_REPO").ok()?;
+        let (owner, repo) = repo_full.split_once('/')?;
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        let cliente = Octocrab::builder().personal_token(token).build().ok()?;
+        Some(Self {
+            cliente,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        })
     }
 
-    /// Crea una issue para una tarea. title = descripción, labels = [instancia_id, área].
-    /// Devuelve el número de issue creado, o Err si GitHub falló (el broker lo ignora).
-    pub async fn crear_issue(
-        &self,
-        _titulo: &str,
-        _labels: &[String],
-    ) -> anyhow::Result<u64> {
-        todo!("aluisio-back: POST /repos/{{owner}}/{{repo}}/issues; devolver issue.number")
+    /// Crea una issue para una tarea. title = descripción; labels = [instancia_id, área].
+    /// Devuelve el número de issue. Err si GitHub falló (el broker lo ignora → degradación).
+    pub async fn crear_issue(&self, titulo: &str, labels: &[String]) -> anyhow::Result<u64> {
+        let issue = self
+            .cliente
+            .issues(&self.owner, &self.repo)
+            .create(titulo)
+            .labels(labels.to_vec())
+            .send()
+            .await?;
+        Ok(issue.number)
     }
 
     /// Añade un comentario a una issue (cada report de la tarea).
-    pub async fn comentar_issue(&self, _numero: u64, _texto: &str) -> anyhow::Result<()> {
-        todo!("aluisio-back: POST /repos/{{owner}}/{{repo}}/issues/{{n}}/comments")
+    pub async fn comentar_issue(&self, numero: u64, texto: &str) -> anyhow::Result<()> {
+        self.cliente
+            .issues(&self.owner, &self.repo)
+            .create_comment(numero, texto)
+            .await?;
+        Ok(())
     }
 
-    /// Cierra una issue (al cerrar la tarea), opcionalmente con comentario de conclusión.
+    /// Cierra una issue (al cerrar la tarea); comenta la conclusión si se provee.
     pub async fn cerrar_issue(
         &self,
-        _numero: u64,
-        _comentario_final: Option<&str>,
+        numero: u64,
+        comentario_final: Option<&str>,
     ) -> anyhow::Result<()> {
-        todo!("aluisio-back: comentar conclusión si hay + PATCH issue state=closed")
+        if let Some(c) = comentario_final {
+            // El comentario es best-effort: si falla, igual intentamos cerrar.
+            let _ = self
+                .cliente
+                .issues(&self.owner, &self.repo)
+                .create_comment(numero, c)
+                .await;
+        }
+        self.cliente
+            .issues(&self.owner, &self.repo)
+            .update(numero)
+            .state(IssueState::Closed)
+            .send()
+            .await?;
+        Ok(())
     }
 }
