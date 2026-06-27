@@ -7,11 +7,16 @@ edition = "2021"
 name = "peers-broker"
 path = "src/main.rs"
 
+[features]
+# SQLite queda tras feature flag (Redis es el default). Compilar con
+# `--features sqlite` da el binario 100% autocontenido (decisión de Max).
+default = []
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 peers-core = { path = "../peers-core" }
 axum = "0.8"
 tokio = { workspace = true }
-rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -19,4 +24,14 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { workspace = true }
+async-trait = { workspace = true }
+# Persistencia por defecto: Redis.
+deadpool-redis = { workspace = true }
+# GitHub Issues (degradación graciosa). rustls, sin OpenSSL nativo.
+octocrab = { workspace = true }
+# SQLite solo si se activa la feature.
+rusqlite = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

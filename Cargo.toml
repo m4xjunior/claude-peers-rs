@@ -18,6 +18,16 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+# Fase 2 — persistencia, MCP oficial y GitHub. rustls en todo: sin OpenSSL nativo.
+deadpool-redis = "0.23"
+# rmcp: SDK oficial de MCP (handshake/capabilities por macro + CustomNotification).
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+# octocrab con rustls + JWT puro Rust: cliente GitHub Issues sin deps nativas.
+# (default-features=false exige elegir backend crypto JWT explícitamente.)
+octocrab = { version = "0.53", default-features = false, features = ["rustls", "jwt-rust-crypto"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Perfil release: binario enxuto y portable (criterio de distribución del diseño).
 [profile.release]

@@ -10,6 +10,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod almacen;
+pub use almacen::{Almacen, AlcanceListado};
+
 /// Puerto por defecto del broker.
 pub const PUERTO_DEFECTO: u16 = 7899;
 
@@ -142,4 +145,89 @@ pub struct RespuestaSalud {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespuestaOk {
     pub ok: bool,
+}
+
+// ===========================================================================
+// FASE 2 — "Empresa": jornada (tiempo medido por el broker) y outbox durable.
+// ===========================================================================
+
+/// Una sesión de trabajo de una instancia. El broker timbra inicio/fin con SU reloj —
+/// la IA nunca estima el tiempo. Se abre en /registrar y se cierra en /salir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sesion {
+    pub id: String,
+    pub instancia_id: String,
+    pub inicio: String,          // ISO 8601, timbrado por el broker
+    pub fin: Option<String>,     // None mientras está abierta
+    pub duracion_seg: Option<i64>,
+}
+
+/// Una tarea dentro de una sesión. Igual que la sesión, el tiempo lo timbra el broker.
+/// Si hay integración GitHub activa, `issue_number` guarda la issue espejo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tarea {
+    pub id: String,
+    pub instancia_id: String,
+    pub sesion_id: String,
+    pub descripcion: String,
+    pub inicio: String,
+    pub fin: Option<String>,
+    pub duracion_seg: Option<i64>,
+    /// Número de la issue de GitHub espejo, si la integración está activa.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_number: Option<u64>,
+}
+
+/// Un ítem del outbox durable. Toda solicitud peer→peer que deba sobrevivir a un
+/// reinicio se materializa como un ItemOutbox con ACK: si el peer cae a mitad, al
+/// volver lo encuentra pendiente y lo retoma (mata el "no vi llegar el mensaje").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemOutbox {
+    pub id: String,
+    pub para_id: String,
+    pub texto: String,
+    pub creado_en: String,
+    /// true cuando el destinatario confirmó recepción (ACK). Hasta entonces, persiste.
+    pub confirmado: bool,
+}
+
+// --- Peticiones/respuestas de jornada ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionAbrirTarea {
+    pub instancia_id: String,
+    pub descripcion: String,
+    /// Área/etiqueta opcional para clasificar (se usa como label en la issue).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RespuestaAbrirTarea {
+    pub tarea_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_number: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionReportarTarea {
+    pub tarea_id: String,
+    pub texto: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionCerrarTarea {
+    pub tarea_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionJornada {
+    pub instancia_id: String,
+}
+
+/// Vista consolidada de la jornada de una instancia: sus sesiones y tareas con tiempos.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RespuestaJornada {
+    pub sesiones: Vec<Sesion>,
+    pub tareas: Vec<Tarea>,
 }

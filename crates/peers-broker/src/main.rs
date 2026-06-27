@@ -1,12 +1,19 @@
-//! peers-broker — daemon HTTP de la red claude-peers-rs.
+//! peers-broker — daemon HTTP de la red claude-peers-rs (fase 2).
 //!
-//! Servidor axum+tokio respaldado por SQLite. Registra las instancias de Claude Code,
-//! rutea mensajes entre ellas y mantiene la liveness por latido (no por PID, para que
-//! funcione cross-host). Binario único sin dependencias externas (SQLite va embebido).
+//! Servidor axum+tokio. La persistencia está detrás del trait `Almacen` (peers-core):
+//! por defecto `AlmacenRedis`; con `--features sqlite`, `AlmacenSqlite` (binario 100%
+//! autocontenido). El broker habla SOLO con `dyn Almacen` — agnóstico del motor.
 //!
-//! No entra en pánico en producción: anyhow en `main`, todos los handlers devuelven
-//! `Result` y traducen el error a un 500 con JSON claro.
+//! Añade la jornada medida por el broker (el reloj es del servidor, la IA nunca estima)
+//! y, si hay token, la integración con GitHub Issues (degradación graciosa: si falta o
+//! falla, el broker opera igual).
+//!
+//! No entra en pánico en producción: anyhow en `main`, handlers devuelven `Result`.
 
+mod github;
+mod jornada;
+mod store;
+#[cfg(feature = "sqlite")]
 mod db;
 
 use std::sync::Arc;
@@ -19,58 +26,56 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use db::Base;
+use github::GitHub;
 use peers_core::{
-    PeticionDefinirResumen, PeticionEnviar, PeticionLatido, PeticionListar,
-    PeticionRecibir, PeticionRegistrar, PeticionSalir, RespuestaEnviar, RespuestaOk,
-    RespuestaRecibir, RespuestaRegistrar, RespuestaSalud, PUERTO_DEFECTO, VENCIMIENTO_MS,
+    Almacen, PeticionAbrirTarea, PeticionCerrarTarea, PeticionDefinirResumen, PeticionEnviar,
+    PeticionJornada, PeticionLatido, PeticionListar, PeticionRecibir, PeticionRegistrar,
+    PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea, RespuestaEnviar, RespuestaJornada,
+    RespuestaOk, RespuestaRegistrar, RespuestaSalud, PUERTO_DEFECTO, VENCIMIENTO_MS,
 };
+use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-/// Argumentos de línea de comandos. Todos con variable de entorno equivalente.
 #[derive(Parser, Debug)]
 #[command(name = "peers-broker", about = "Daemon de la red claude-peers-rs")]
 struct Args {
-    /// Puerto de escucha.
     #[arg(long, env = "CLAUDE_PEERS_PORT", default_value_t = PUERTO_DEFECTO)]
     puerto: u16,
 
-    /// Dirección de bind. Por defecto solo localhost; usar 0.0.0.0 para exponer cross-host
-    /// (detrás de túnel/forward).
     #[arg(long, env = "CLAUDE_PEERS_HOST", default_value = "127.0.0.1")]
     host: String,
 
-    /// Ruta del archivo SQLite.
+    /// URL del Redis (backend por defecto). Namespace cprs: dentro de esa instancia.
+    #[arg(long, env = "CLAUDE_PEERS_REDIS_URL", default_value = "redis://127.0.0.1:6379")]
+    redis_url: String,
+
+    /// Ruta del archivo SQLite (solo con --features sqlite).
     #[arg(long, env = "CLAUDE_PEERS_DB")]
     db: Option<String>,
 }
 
-/// Estado de la aplicación compartido entre handlers.
+/// Estado de la aplicación: el almacén (tras el trait) y el cliente GitHub opcional.
 struct EstadoApp {
-    base: Base,
+    almacen: Arc<dyn Almacen>,
+    github: Option<GitHub>,
 }
 
 type Estado = Arc<EstadoApp>;
 
-/// Timestamp ISO 8601 (UTC) del instante actual. Formato comparable lexicográficamente,
-/// que es lo que permite filtrar la liveness con un simple `>=` sobre strings.
 fn ahora_iso() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
 }
 
-/// Timestamp ISO del límite de vencimiento: `now - VENCIMIENTO_MS`.
 fn vencidas_antes_iso() -> String {
-    let limite = OffsetDateTime::now_utc()
-        - time::Duration::milliseconds(VENCIMIENTO_MS);
-    limite
+    (OffsetDateTime::now_utc() - time::Duration::milliseconds(VENCIMIENTO_MS))
         .format(&Rfc3339)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
 }
 
-/// Convierte cualquier error en un 500 con JSON `{ "error": "..." }`. Evita el panic.
+/// Error → 500 JSON. Evita el panic en los handlers.
 struct ErrorApp(anyhow::Error);
 
 impl IntoResponse for ErrorApp {
@@ -90,108 +95,8 @@ impl<E: Into<anyhow::Error>> From<E> for ErrorApp {
     }
 }
 
-// --- Handlers ---
-
-async fn salud(State(estado): State<Estado>) -> Json<RespuestaSalud> {
-    Json(RespuestaSalud {
-        estado: "ok".into(),
-        instancias: estado.base.contar_instancias(),
-    })
-}
-
-async fn registrar(
-    State(estado): State<Estado>,
-    Json(p): Json<PeticionRegistrar>,
-) -> Result<Json<RespuestaRegistrar>, ErrorApp> {
-    // ID estable: si la instancia manda id_preferido, esa es su identidad persistente.
-    // Si no, generamos uno aleatorio (caso sin papel asignado).
-    let id = p.id_preferido.clone().unwrap_or_else(generar_id);
-    let ahora = ahora_iso();
-    estado.base.registrar(
-        &id,
-        p.pid,
-        &p.directorio,
-        p.repo_git.as_deref(),
-        p.tty.as_deref(),
-        &p.resumen,
-        &ahora,
-    )?;
-    info!("instancia registrada: {id}");
-    Ok(Json(RespuestaRegistrar { id }))
-}
-
-async fn latido(
-    State(estado): State<Estado>,
-    Json(p): Json<PeticionLatido>,
-) -> Result<Json<RespuestaOk>, ErrorApp> {
-    estado.base.latido(&p.id, &ahora_iso())?;
-    Ok(Json(RespuestaOk { ok: true }))
-}
-
-async fn definir_resumen(
-    State(estado): State<Estado>,
-    Json(p): Json<PeticionDefinirResumen>,
-) -> Result<Json<RespuestaOk>, ErrorApp> {
-    estado.base.definir_resumen(&p.id, &p.resumen)?;
-    Ok(Json(RespuestaOk { ok: true }))
-}
-
-async fn listar(
-    State(estado): State<Estado>,
-    Json(p): Json<PeticionListar>,
-) -> Result<Json<Vec<peers_core::Instancia>>, ErrorApp> {
-    let instancias = estado.base.listar(
-        p.alcance,
-        &p.directorio,
-        p.repo_git.as_deref(),
-        p.excluir_id.as_deref(),
-        &vencidas_antes_iso(),
-    )?;
-    Ok(Json(instancias))
-}
-
-async fn enviar(
-    State(estado): State<Estado>,
-    Json(p): Json<PeticionEnviar>,
-) -> Result<Json<RespuestaEnviar>, ErrorApp> {
-    // FIX frente al TS conservado: si el destino no existe NO se descarta en silencio,
-    // se devuelve un error claro para que el emisor sepa que su mensaje no llegó.
-    if !estado.base.instancia_existe(&p.para_id) {
-        return Ok(Json(RespuestaEnviar {
-            ok: false,
-            error: Some(format!("La instancia '{}' no existe", p.para_id)),
-        }));
-    }
-    estado
-        .base
-        .encolar_mensaje(&p.de_id, &p.para_id, &p.texto, &ahora_iso())?;
-    Ok(Json(RespuestaEnviar {
-        ok: true,
-        error: None,
-    }))
-}
-
-async fn recibir(
-    State(estado): State<Estado>,
-    Json(p): Json<PeticionRecibir>,
-) -> Result<Json<RespuestaRecibir>, ErrorApp> {
-    let mensajes = estado.base.recibir_mensajes(&p.id)?;
-    Ok(Json(RespuestaRecibir { mensajes }))
-}
-
-async fn salir(
-    State(estado): State<Estado>,
-    Json(p): Json<PeticionSalir>,
-) -> Result<Json<RespuestaOk>, ErrorApp> {
-    estado.base.salir(&p.id)?;
-    Ok(Json(RespuestaOk { ok: true }))
-}
-
-/// Genera un id aleatorio de 8 caracteres (minúsculas + dígitos). Solo se usa cuando una
-/// instancia se registra sin id_preferido.
+/// Genera un id corto sin colisión local (entropía: nanos + pid, xorshift).
 fn generar_id() -> String {
-    // Fuente de entropía simple sin dependencias extra: nanosegundos del reloj + pid,
-    // mezclados con un xorshift. Suficiente para un identificador no colisionante local.
     let ahora = OffsetDateTime::now_utc().unix_timestamp_nanos() as u64;
     let mut x = ahora ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
     const ALFABETO: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -205,40 +110,238 @@ fn generar_id() -> String {
     id
 }
 
+// --- Handlers fase 1 ---
+
+async fn salud(State(e): State<Estado>) -> Result<Json<RespuestaSalud>, ErrorApp> {
+    Ok(Json(RespuestaSalud {
+        estado: "ok".into(),
+        instancias: e.almacen.contar_instancias().await?,
+    }))
+}
+
+async fn registrar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionRegistrar>,
+) -> Result<Json<RespuestaRegistrar>, ErrorApp> {
+    let id = p.id_preferido.clone().unwrap_or_else(generar_id);
+    let ahora = ahora_iso();
+    e.almacen
+        .registrar(
+            &id,
+            p.pid,
+            &p.directorio,
+            p.repo_git.as_deref(),
+            p.tty.as_deref(),
+            &p.resumen,
+            &ahora,
+        )
+        .await?;
+    // Abre una sesión de jornada para esta instancia (timbrada por el broker).
+    jornada::abrir_sesion(&e.almacen, &format!("ses-{id}-{ahora}"), &id, &ahora).await?;
+    info!("instancia registrada: {id}");
+    Ok(Json(RespuestaRegistrar { id }))
+}
+
+async fn latido(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionLatido>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    e.almacen.latido(&p.id, &ahora_iso()).await?;
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+async fn definir_resumen(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionDefinirResumen>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    e.almacen.definir_resumen(&p.id, &p.resumen).await?;
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+async fn listar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionListar>,
+) -> Result<Json<Vec<peers_core::Instancia>>, ErrorApp> {
+    let r = e
+        .almacen
+        .listar(
+            p.alcance,
+            &p.directorio,
+            p.repo_git.as_deref(),
+            p.excluir_id.as_deref(),
+            &vencidas_antes_iso(),
+        )
+        .await?;
+    Ok(Json(r))
+}
+
+async fn enviar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionEnviar>,
+) -> Result<Json<RespuestaEnviar>, ErrorApp> {
+    // No descartar en silencio: si el destino no existe, error claro.
+    if !e.almacen.instancia_existe(&p.para_id).await? {
+        return Ok(Json(RespuestaEnviar {
+            ok: false,
+            error: Some(format!("La instancia '{}' no existe", p.para_id)),
+        }));
+    }
+    e.almacen
+        .encolar_mensaje(&p.de_id, &p.para_id, &p.texto, &ahora_iso())
+        .await?;
+    Ok(Json(RespuestaEnviar { ok: true, error: None }))
+}
+
+async fn recibir(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionRecibir>,
+) -> Result<Json<peers_core::RespuestaRecibir>, ErrorApp> {
+    let mensajes = e.almacen.recibir_mensajes(&p.id).await?;
+    Ok(Json(peers_core::RespuestaRecibir { mensajes }))
+}
+
+async fn salir(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionSalir>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    // Cierra la jornada (timbrada por el broker) antes de dar de baja.
+    jornada::cerrar_sesion(&e.almacen, &p.id, &ahora_iso()).await?;
+    e.almacen.salir(&p.id).await?;
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+// --- Handlers de jornada (fase 2) ---
+
+async fn tarea_abrir(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionAbrirTarea>,
+) -> Result<Json<RespuestaAbrirTarea>, ErrorApp> {
+    let ahora = ahora_iso();
+    let tarea_id = format!("tar-{}-{ahora}", p.instancia_id);
+    // La sesión activa es la abierta más reciente de la instancia.
+    let (sesiones, _) = e.almacen.jornada(&p.instancia_id).await?;
+    let sesion_id = sesiones
+        .iter()
+        .rev()
+        .find(|s| s.fin.is_none())
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| format!("ses-{}-{ahora}", p.instancia_id));
+
+    let mut tarea = jornada::abrir_tarea(
+        &e.almacen,
+        &tarea_id,
+        &p.instancia_id,
+        &sesion_id,
+        &p.descripcion,
+        &ahora,
+    )
+    .await?;
+
+    // Integración GitHub: cose el issue_number en la tarea (mi fatia, no la de Aluísio).
+    // Degradación graciosa: si GH no está o falla, la tarea sigue local.
+    let mut issue_number = None;
+    if let Some(gh) = &e.github {
+        let labels = match &p.area {
+            Some(a) => vec![p.instancia_id.clone(), a.clone()],
+            None => vec![p.instancia_id.clone()],
+        };
+        match gh.crear_issue(&p.descripcion, &labels).await {
+            Ok(n) => {
+                issue_number = Some(n);
+                tarea.issue_number = Some(n);
+                // Re-guarda la tarea con el número de issue cosido.
+                if let Err(err) = e.almacen.tarea_guardar(&tarea).await {
+                    warn!("no se pudo guardar issue_number en la tarea: {err:#}");
+                }
+            }
+            Err(err) => warn!("GitHub no creó la issue (se sigue local): {err:#}"),
+        }
+    }
+
+    Ok(Json(RespuestaAbrirTarea { tarea_id, issue_number }))
+}
+
+async fn tarea_reportar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionReportarTarea>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    // Si la tarea tiene issue y hay GitHub, comenta. Degrada si falla.
+    if let Some(gh) = &e.github {
+        if let Some(tarea) = e.almacen.tarea_obtener(&p.tarea_id).await? {
+            if let Some(n) = tarea.issue_number {
+                if let Err(err) = gh.comentar_issue(n, &p.texto).await {
+                    warn!("GitHub no comentó la issue (no crítico): {err:#}");
+                }
+            }
+        }
+    }
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+async fn tarea_cerrar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionCerrarTarea>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    let tarea = jornada::cerrar_tarea(&e.almacen, &p.tarea_id, &ahora_iso()).await?;
+    if let Some(gh) = &e.github {
+        if let Some(n) = tarea.issue_number {
+            let cierre = format!(
+                "Tarea cerrada. Duración medida por el broker: {}s.",
+                tarea.duracion_seg.unwrap_or(0)
+            );
+            if let Err(err) = gh.cerrar_issue(n, Some(&cierre)).await {
+                warn!("GitHub no cerró la issue (no crítico): {err:#}");
+            }
+        }
+    }
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+async fn jornada_consolidada(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionJornada>,
+) -> Result<Json<RespuestaJornada>, ErrorApp> {
+    Ok(Json(jornada::consolidar(&e.almacen, &p.instancia_id).await?))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
-    let ruta_db = args
-        .db
-        .clone()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.claude-peers.db")))
-        .unwrap_or_else(|| "./claude-peers.db".into());
 
-    let base = Base::abrir(&ruta_db)?;
-    // Limpieza inicial: quita lo que quedó muerto de una sesión previa.
-    if let Ok(n) = base.limpiar_vencidas(&vencidas_antes_iso()) {
+    // Selección del backend de persistencia. Redis por defecto; SQLite tras feature.
+    let almacen: Arc<dyn Almacen> = construir_almacen(&args)?;
+
+    // Cliente GitHub opcional (None si falta GITHUB_TOKEN/GITHUB_REPO → degradación).
+    let github = GitHub::desde_entorno();
+    if github.is_some() {
+        info!("integración GitHub Issues ACTIVA");
+    } else {
+        info!("integración GitHub Issues inactiva (sin GITHUB_TOKEN/GITHUB_REPO)");
+    }
+
+    // Limpieza inicial de instancias muertas.
+    if let Ok(n) = almacen.limpiar_vencidas(&vencidas_antes_iso()).await {
         if n > 0 {
-            info!("limpieza inicial: {n} instancia(s) vencida(s) eliminada(s)");
+            info!("limpieza inicial: {n} instancia(s) vencida(s)");
         }
     }
 
-    let estado: Estado = Arc::new(EstadoApp { base });
+    let estado: Estado = Arc::new(EstadoApp { almacen, github });
 
-    // Task periódica de limpieza por latido (cada 30s), igual que el TS.
-    let estado_limpieza = estado.clone();
+    // Limpieza periódica por latido (cada 30s).
+    let limpieza = estado.clone();
     tokio::spawn(async move {
         let mut intervalo = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             intervalo.tick().await;
-            match estado_limpieza.base.limpiar_vencidas(&vencidas_antes_iso()) {
+            match limpieza.almacen.limpiar_vencidas(&vencidas_antes_iso()).await {
                 Ok(n) if n > 0 => info!("limpieza periódica: {n} instancia(s) vencida(s)"),
                 Ok(_) => {}
                 Err(e) => error!("fallo en limpieza periódica: {e:#}"),
@@ -255,12 +358,37 @@ async fn main() -> anyhow::Result<()> {
         .route("/enviar", post(enviar))
         .route("/recibir", post(recibir))
         .route("/salir", post(salir))
+        .route("/tarea/abrir", post(tarea_abrir))
+        .route("/tarea/reportar", post(tarea_reportar))
+        .route("/tarea/cerrar", post(tarea_cerrar))
+        .route("/jornada", post(jornada_consolidada))
         .with_state(estado);
 
     let direccion = format!("{}:{}", args.host, args.puerto);
     let listener = tokio::net::TcpListener::bind(&direccion).await?;
-    info!("peers-broker escuchando en {direccion} (db: {ruta_db})");
-
+    info!("peers-broker escuchando en {direccion}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Construye el almacén según las features compiladas. Redis por defecto.
+#[cfg(not(feature = "sqlite"))]
+fn construir_almacen(args: &Args) -> anyhow::Result<Arc<dyn Almacen>> {
+    info!("backend de persistencia: Redis ({})", args.redis_url);
+    Ok(Arc::new(AlmacenRedis::nuevo(&args.redis_url)?))
+}
+
+/// Con la feature sqlite, si se pasa --db usa SQLite; si no, sigue Redis.
+#[cfg(feature = "sqlite")]
+fn construir_almacen(args: &Args) -> anyhow::Result<Arc<dyn Almacen>> {
+    match &args.db {
+        Some(ruta) => {
+            info!("backend de persistencia: SQLite ({ruta})");
+            Ok(Arc::new(db::AlmacenSqlite::abrir(ruta)?))
+        }
+        None => {
+            info!("backend de persistencia: Redis ({})", args.redis_url);
+            Ok(Arc::new(AlmacenRedis::nuevo(&args.redis_url)?))
+        }
+    }
 }

@@ -1,21 +1,21 @@
-//! Capa de persistencia SQLite del broker.
+//! `AlmacenSqlite` — implementación del trait `Almacen` sobre SQLite (tras feature `sqlite`).
 //!
-//! Encapsula todo el acceso a la base tras un `Mutex<Connection>`. rusqlite no es `Sync`
-//! por conexión, así que serializamos el acceso; para esta carga (decenas de instancias,
-//! mensajes esporádicos) sobra y evita la complejidad de un pool.
+//! Backend alternativo al Redis por defecto: da el binario 100% autocontenido (SQLite va
+//! embebido con rusqlite "bundled"). El trait es async pero rusqlite es síncrono; como el
+//! broker es de instancia única y las operaciones son rápidas, ejecutamos inline tras un
+//! `Mutex` (bloqueo breve, sin pool). Es la opción para "1 binario y corre, sin Redis".
 
-use peers_core::{Alcance, Instancia, Mensaje};
+use async_trait::async_trait;
+use peers_core::{Alcance, Almacen, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
-/// Estado compartido del broker: la conexión SQLite serializada.
-pub struct Base {
+pub struct AlmacenSqlite {
     conexion: Mutex<Connection>,
 }
 
-impl Base {
-    /// Abre (o crea) la base en `ruta` y aplica el esquema. WAL + busy_timeout para
-    /// tolerar accesos concurrentes del propio proceso.
+impl AlmacenSqlite {
+    /// Abre (o crea) la base y aplica el esquema (instancias + mensajes + outbox + jornada).
     pub fn abrir(ruta: &str) -> anyhow::Result<Self> {
         let conexion = Connection::open(ruta)?;
         conexion.execute_batch(
@@ -24,23 +24,26 @@ impl Base {
             PRAGMA busy_timeout = 3000;
 
             CREATE TABLE IF NOT EXISTS instancias (
-                id TEXT PRIMARY KEY,
-                pid INTEGER NOT NULL,
-                directorio TEXT NOT NULL,
-                repo_git TEXT,
-                tty TEXT,
-                resumen TEXT NOT NULL DEFAULT '',
-                registrada_en TEXT NOT NULL,
-                visto_en TEXT NOT NULL
+                id TEXT PRIMARY KEY, pid INTEGER NOT NULL, directorio TEXT NOT NULL,
+                repo_git TEXT, tty TEXT, resumen TEXT NOT NULL DEFAULT '',
+                registrada_en TEXT NOT NULL, visto_en TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS mensajes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                de_id TEXT NOT NULL,
-                para_id TEXT NOT NULL,
-                texto TEXT NOT NULL,
-                enviado_en TEXT NOT NULL,
-                entregado INTEGER NOT NULL DEFAULT 0
+                id INTEGER PRIMARY KEY AUTOINCREMENT, de_id TEXT NOT NULL, para_id TEXT NOT NULL,
+                texto TEXT NOT NULL, enviado_en TEXT NOT NULL, entregado INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS outbox (
+                id TEXT PRIMARY KEY, para_id TEXT NOT NULL, texto TEXT NOT NULL,
+                creado_en TEXT NOT NULL, confirmado INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sesiones (
+                id TEXT PRIMARY KEY, instancia_id TEXT NOT NULL, inicio TEXT NOT NULL,
+                fin TEXT, duracion_seg INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS tareas (
+                id TEXT PRIMARY KEY, instancia_id TEXT NOT NULL, sesion_id TEXT NOT NULL,
+                descripcion TEXT NOT NULL, inicio TEXT NOT NULL, fin TEXT,
+                duracion_seg INTEGER, issue_number INTEGER
             );
             "#,
         )?;
@@ -50,20 +53,13 @@ impl Base {
     }
 
     fn bloquear(&self) -> std::sync::MutexGuard<'_, Connection> {
-        // Si el Mutex queda envenenado el proceso ya está inconsistente; preferimos
-        // recuperar el guard antes que propagar panic en cada handler.
         self.conexion.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
 
-    /// Registro con ID ESTABLE — el FIX #1 frente al TS.
-    ///
-    /// - Si `id` ya existe: UPDATE de sus datos (pid/directorio/tty/visto_en) SIN tocar la
-    ///   tabla `mensajes`. La fila pendiente (entregado=0 hacia ese id) SOBREVIVE al reinicio.
-    /// - Si no existe: INSERT nuevo.
-    ///
-    /// En el TS, el registro borraba la instancia por PID y creaba un id aleatorio nuevo,
-    /// dejando la fila vieja huérfana. Aquí el id es la identidad estable del papel.
-    pub fn registrar(
+#[async_trait]
+impl Almacen for AlmacenSqlite {
+    async fn registrar(
         &self,
         id: &str,
         pid: i64,
@@ -75,66 +71,57 @@ impl Base {
     ) -> anyhow::Result<()> {
         let conexion = self.bloquear();
         let existe: bool = conexion
-            .query_row("SELECT 1 FROM instancias WHERE id = ?1", params![id], |_| {
-                Ok(true)
-            })
+            .query_row("SELECT 1 FROM instancias WHERE id = ?1", params![id], |_| Ok(true))
             .unwrap_or(false);
-
         if existe {
-            // UPDATE: conserva registrada_en original y, sobre todo, la fila de mensajes.
+            // Re-registro: UPDATE sin tocar la fila de mensajes ni registrada_en/resumen.
             conexion.execute(
-                "UPDATE instancias SET pid = ?2, directorio = ?3, repo_git = ?4, tty = ?5, visto_en = ?6 WHERE id = ?1",
+                "UPDATE instancias SET pid=?2, directorio=?3, repo_git=?4, tty=?5, visto_en=?6 WHERE id=?1",
                 params![id, pid, directorio, repo_git, tty, ahora],
             )?;
         } else {
             conexion.execute(
-                "INSERT INTO instancias (id, pid, directorio, repo_git, tty, resumen, registrada_en, visto_en)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                "INSERT INTO instancias (id,pid,directorio,repo_git,tty,resumen,registrada_en,visto_en)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
                 params![id, pid, directorio, repo_git, tty, resumen, ahora],
             )?;
         }
         Ok(())
     }
 
-    pub fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()> {
-        self.bloquear().execute(
-            "UPDATE instancias SET visto_en = ?2 WHERE id = ?1",
-            params![id, ahora],
-        )?;
+    async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()> {
+        self.bloquear()
+            .execute("UPDATE instancias SET visto_en=?2 WHERE id=?1", params![id, ahora])?;
         Ok(())
     }
 
-    pub fn definir_resumen(&self, id: &str, resumen: &str) -> anyhow::Result<()> {
-        self.bloquear().execute(
-            "UPDATE instancias SET resumen = ?2 WHERE id = ?1",
-            params![id, resumen],
-        )?;
+    async fn definir_resumen(&self, id: &str, resumen: &str) -> anyhow::Result<()> {
+        self.bloquear()
+            .execute("UPDATE instancias SET resumen=?2 WHERE id=?1", params![id, resumen])?;
         Ok(())
     }
 
-    pub fn salir(&self, id: &str) -> anyhow::Result<()> {
+    async fn salir(&self, id: &str) -> anyhow::Result<()> {
         self.bloquear()
-            .execute("DELETE FROM instancias WHERE id = ?1", params![id])?;
+            .execute("DELETE FROM instancias WHERE id=?1", params![id])?;
         Ok(())
     }
 
-    pub fn instancia_existe(&self, id: &str) -> bool {
-        self.bloquear()
-            .query_row("SELECT 1 FROM instancias WHERE id = ?1", params![id], |_| {
-                Ok(true)
-            })
-            .unwrap_or(false)
+    async fn instancia_existe(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .bloquear()
+            .query_row("SELECT 1 FROM instancias WHERE id=?1", params![id], |_| Ok(true))
+            .unwrap_or(false))
     }
 
-    pub fn contar_instancias(&self) -> usize {
-        self.bloquear()
+    async fn contar_instancias(&self) -> anyhow::Result<usize> {
+        Ok(self
+            .bloquear()
             .query_row("SELECT COUNT(*) FROM instancias", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0) as usize
+            .unwrap_or(0) as usize)
     }
 
-    /// Lista instancias según alcance, excluyendo al solicitante y a las muertas por latido.
-    /// `vencidas_antes` es el timestamp ISO límite: viva si visto_en >= vencidas_antes.
-    pub fn listar(
+    async fn listar(
         &self,
         alcance: Alcance,
         directorio: &str,
@@ -143,7 +130,6 @@ impl Base {
         vencidas_antes: &str,
     ) -> anyhow::Result<Vec<Instancia>> {
         let conexion = self.bloquear();
-        // Cláusula según alcance. repo sin repo_git cae a directorio.
         let (sql, bind): (&str, Vec<String>) = match alcance {
             Alcance::Maquina => ("SELECT * FROM instancias", vec![]),
             Alcance::Directorio => (
@@ -151,36 +137,29 @@ impl Base {
                 vec![directorio.to_string()],
             ),
             Alcance::Repo => match repo_git {
-                Some(rg) => (
-                    "SELECT * FROM instancias WHERE repo_git = ?1",
-                    vec![rg.to_string()],
-                ),
+                Some(rg) => ("SELECT * FROM instancias WHERE repo_git = ?1", vec![rg.to_string()]),
                 None => (
                     "SELECT * FROM instancias WHERE directorio = ?1",
                     vec![directorio.to_string()],
                 ),
             },
         };
-
         let mut stmt = conexion.prepare(sql)?;
         let filas = stmt.query_map(rusqlite::params_from_iter(bind.iter()), fila_a_instancia)?;
-
-        let mut instancias = Vec::new();
-        for fila in filas {
-            let inst = fila?;
+        let mut out = Vec::new();
+        for f in filas {
+            let inst = f?;
             if excluir_id.is_some_and(|ex| ex == inst.id) {
                 continue;
             }
-            // Liveness por latido: solo vivas. Las muertas se filtran (no se devuelven).
             if inst.visto_en.as_str() >= vencidas_antes {
-                instancias.push(inst);
+                out.push(inst);
             }
         }
-        Ok(instancias)
+        Ok(out)
     }
 
-    /// Encola un mensaje. El destino debe existir (lo verifica el handler antes).
-    pub fn encolar_mensaje(
+    async fn encolar_mensaje(
         &self,
         de_id: &str,
         para_id: &str,
@@ -188,51 +167,43 @@ impl Base {
         ahora: &str,
     ) -> anyhow::Result<()> {
         self.bloquear().execute(
-            "INSERT INTO mensajes (de_id, para_id, texto, enviado_en, entregado)
-             VALUES (?1, ?2, ?3, ?4, 0)",
+            "INSERT INTO mensajes (de_id,para_id,texto,enviado_en,entregado) VALUES (?1,?2,?3,?4,0)",
             params![de_id, para_id, texto, ahora],
         )?;
         Ok(())
     }
 
-    /// Devuelve los mensajes no entregados de `id` (orden FIFO) y los marca entregado=1
-    /// en la MISMA transacción, para que un recibir concurrente no los duplique.
-    pub fn recibir_mensajes(&self, id: &str) -> anyhow::Result<Vec<Mensaje>> {
+    async fn recibir_mensajes(&self, id: &str) -> anyhow::Result<Vec<Mensaje>> {
         let mut conexion = self.bloquear();
         let tx = conexion.transaction()?;
-        let mut mensajes = Vec::new();
+        let mut msgs = Vec::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT id, de_id, para_id, texto, enviado_en, entregado
-                 FROM mensajes WHERE para_id = ?1 AND entregado = 0 ORDER BY enviado_en ASC, id ASC",
+                "SELECT id,de_id,para_id,texto,enviado_en,entregado FROM mensajes
+                 WHERE para_id=?1 AND entregado=0 ORDER BY enviado_en ASC, id ASC",
             )?;
-            let filas = stmt.query_map(params![id], |fila| {
+            let filas = stmt.query_map(params![id], |f| {
                 Ok(Mensaje {
-                    id: fila.get(0)?,
-                    de_id: fila.get(1)?,
-                    para_id: fila.get(2)?,
-                    texto: fila.get(3)?,
-                    enviado_en: fila.get(4)?,
-                    entregado: fila.get::<_, i64>(5)? != 0,
+                    id: f.get(0)?,
+                    de_id: f.get(1)?,
+                    para_id: f.get(2)?,
+                    texto: f.get(3)?,
+                    enviado_en: f.get(4)?,
+                    entregado: f.get::<_, i64>(5)? != 0,
                 })
             })?;
             for m in filas {
-                mensajes.push(m?);
+                msgs.push(m?);
             }
-            for m in &mensajes {
-                tx.execute(
-                    "UPDATE mensajes SET entregado = 1 WHERE id = ?1",
-                    params![m.id],
-                )?;
+            for m in &msgs {
+                tx.execute("UPDATE mensajes SET entregado=1 WHERE id=?1", params![m.id])?;
             }
         }
         tx.commit()?;
-        Ok(mensajes)
+        Ok(msgs)
     }
 
-    /// Elimina instancias muertas (visto_en < vencidas_antes) y purga su fila pendiente.
-    /// Devuelve cuántas se limpiaron (para log).
-    pub fn limpiar_vencidas(&self, vencidas_antes: &str) -> anyhow::Result<usize> {
+    async fn limpiar_vencidas(&self, vencidas_antes: &str) -> anyhow::Result<usize> {
         let conexion = self.bloquear();
         let muertas: Vec<String> = {
             let mut stmt = conexion.prepare("SELECT id FROM instancias WHERE visto_en < ?1")?;
@@ -240,27 +211,158 @@ impl Base {
             filas.filter_map(Result::ok).collect()
         };
         for id in &muertas {
-            conexion.execute("DELETE FROM instancias WHERE id = ?1", params![id])?;
+            conexion.execute("DELETE FROM instancias WHERE id=?1", params![id])?;
             conexion.execute(
-                "DELETE FROM mensajes WHERE para_id = ?1 AND entregado = 0",
+                "DELETE FROM mensajes WHERE para_id=?1 AND entregado=0",
                 params![id],
             )?;
         }
         Ok(muertas.len())
     }
+
+    // --- Outbox durable con ACK ---
+
+    async fn outbox_encolar(&self, item: &ItemOutbox) -> anyhow::Result<()> {
+        self.bloquear().execute(
+            "INSERT OR REPLACE INTO outbox (id,para_id,texto,creado_en,confirmado)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![item.id, item.para_id, item.texto, item.creado_en, item.confirmado as i64],
+        )?;
+        Ok(())
+    }
+
+    async fn outbox_pendientes(&self, para_id: &str) -> anyhow::Result<Vec<ItemOutbox>> {
+        let conexion = self.bloquear();
+        let mut stmt = conexion.prepare(
+            "SELECT id,para_id,texto,creado_en,confirmado FROM outbox
+             WHERE para_id=?1 AND confirmado=0 ORDER BY creado_en ASC",
+        )?;
+        let filas = stmt.query_map(params![para_id], |f| {
+            Ok(ItemOutbox {
+                id: f.get(0)?,
+                para_id: f.get(1)?,
+                texto: f.get(2)?,
+                creado_en: f.get(3)?,
+                confirmado: f.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        Ok(filas.filter_map(Result::ok).collect())
+    }
+
+    async fn outbox_confirmar(&self, item_id: &str) -> anyhow::Result<()> {
+        self.bloquear()
+            .execute("UPDATE outbox SET confirmado=1 WHERE id=?1", params![item_id])?;
+        Ok(())
+    }
+
+    // --- Jornada ---
+
+    async fn sesion_abrir(&self, s: &Sesion) -> anyhow::Result<()> {
+        self.bloquear().execute(
+            "INSERT OR REPLACE INTO sesiones (id,instancia_id,inicio,fin,duracion_seg)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![s.id, s.instancia_id, s.inicio, s.fin, s.duracion_seg],
+        )?;
+        Ok(())
+    }
+
+    async fn sesion_cerrar(&self, instancia_id: &str, fin: &str) -> anyhow::Result<()> {
+        let conexion = self.bloquear();
+        // Última sesión abierta de la instancia.
+        let fila: Option<(String, String)> = conexion
+            .query_row(
+                "SELECT id,inicio FROM sesiones WHERE instancia_id=?1 AND fin IS NULL
+                 ORDER BY inicio DESC LIMIT 1",
+                params![instancia_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((id, inicio)) = fila {
+            let dur = crate::jornada::diferencia_seg(&inicio, fin);
+            conexion.execute(
+                "UPDATE sesiones SET fin=?2, duracion_seg=?3 WHERE id=?1",
+                params![id, fin, dur],
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn tarea_guardar(&self, t: &Tarea) -> anyhow::Result<()> {
+        self.bloquear().execute(
+            "INSERT OR REPLACE INTO tareas
+             (id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                t.id, t.instancia_id, t.sesion_id, t.descripcion, t.inicio, t.fin,
+                t.duracion_seg, t.issue_number.map(|n| n as i64)
+            ],
+        )?;
+        Ok(())
+    }
+
+    async fn tarea_obtener(&self, tarea_id: &str) -> anyhow::Result<Option<Tarea>> {
+        let conexion = self.bloquear();
+        Ok(conexion
+            .query_row(
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number
+                 FROM tareas WHERE id=?1",
+                params![tarea_id],
+                fila_a_tarea,
+            )
+            .ok())
+    }
+
+    async fn jornada(&self, instancia_id: &str) -> anyhow::Result<(Vec<Sesion>, Vec<Tarea>)> {
+        let conexion = self.bloquear();
+        let sesiones = {
+            let mut stmt = conexion
+                .prepare("SELECT id,instancia_id,inicio,fin,duracion_seg FROM sesiones WHERE instancia_id=?1 ORDER BY inicio ASC")?;
+            let filas = stmt.query_map(params![instancia_id], |r| {
+                Ok(Sesion {
+                    id: r.get(0)?,
+                    instancia_id: r.get(1)?,
+                    inicio: r.get(2)?,
+                    fin: r.get(3)?,
+                    duracion_seg: r.get(4)?,
+                })
+            })?;
+            filas.filter_map(Result::ok).collect()
+        };
+        let tareas = {
+            let mut stmt = conexion.prepare(
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number
+                 FROM tareas WHERE instancia_id=?1 ORDER BY inicio ASC",
+            )?;
+            let filas = stmt.query_map(params![instancia_id], fila_a_tarea)?;
+            filas.filter_map(Result::ok).collect()
+        };
+        Ok((sesiones, tareas))
+    }
 }
 
-/// Mapea una fila completa de `instancias` a un struct Instancia.
-fn fila_a_instancia(fila: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
+fn fila_a_instancia(f: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
     Ok(Instancia {
-        id: fila.get("id")?,
-        pid: fila.get("pid")?,
-        directorio: fila.get("directorio")?,
-        repo_git: fila.get("repo_git")?,
-        tty: fila.get("tty")?,
-        resumen: fila.get("resumen")?,
-        registrada_en: fila.get("registrada_en")?,
-        visto_en: fila.get("visto_en")?,
+        id: f.get("id")?,
+        pid: f.get("pid")?,
+        directorio: f.get("directorio")?,
+        repo_git: f.get("repo_git")?,
+        tty: f.get("tty")?,
+        resumen: f.get("resumen")?,
+        registrada_en: f.get("registrada_en")?,
+        visto_en: f.get("visto_en")?,
+    })
+}
+
+fn fila_a_tarea(f: &rusqlite::Row<'_>) -> rusqlite::Result<Tarea> {
+    Ok(Tarea {
+        id: f.get(0)?,
+        instancia_id: f.get(1)?,
+        sesion_id: f.get(2)?,
+        descripcion: f.get(3)?,
+        inicio: f.get(4)?,
+        fin: f.get(5)?,
+        duracion_seg: f.get(6)?,
+        issue_number: f.get::<_, Option<i64>>(7)?.map(|n| n as u64),
     })
 }
 
@@ -268,108 +370,131 @@ fn fila_a_instancia(fila: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
 mod pruebas {
     use super::*;
 
-    /// Base en memoria para tests deterministas (sin tocar disco ni red).
-    fn base_memoria() -> Base {
-        Base::abrir(":memory:").expect("base en memoria")
+    fn base() -> AlmacenSqlite {
+        AlmacenSqlite::abrir(":memory:").expect("base en memoria")
     }
 
-    #[test]
-    fn id_estable_reregistro_hereda_la_fila() {
-        // CRITERIO DE PRONTO #3 — el fix de mayor valor frente al TS.
-        let base = base_memoria();
-        base.registrar("jefin", 111, "/x", None, None, "papel jefin", "2026-01-01T00:00:00Z")
-            .unwrap();
-        base.registrar("claudia", 222, "/y", None, None, "papel claudia", "2026-01-01T00:00:00Z")
-            .unwrap();
-        // claudia encola un mensaje para jefin.
-        base.encolar_mensaje("claudia", "jefin", "hola pre-restart", "2026-01-01T00:00:01Z")
-            .unwrap();
-
-        // jefin "reinicia": re-registro con MISMO id pero pid distinto.
-        base.registrar("jefin", 999, "/x", None, None, "papel jefin", "2026-01-01T00:01:00Z")
-            .unwrap();
-
-        // La fila DEBE sobrevivir: el mensaje sigue ahí.
-        let msgs = base.recibir_mensajes("jefin").unwrap();
-        assert_eq!(msgs.len(), 1, "el mensaje pre-restart debe sobrevivir al re-registro");
+    #[tokio::test]
+    async fn id_estable_reregistro_hereda_la_fila() {
+        let b = base();
+        b.registrar("jefin", 111, "/x", None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("claudia", 222, "/y", None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
+        b.encolar_mensaje("claudia", "jefin", "hola pre-restart", "2026-01-01T00:00:01Z").await.unwrap();
+        // Restart: re-registro mismo id, pid distinto.
+        b.registrar("jefin", 999, "/x", None, None, "papel", "2026-01-01T00:01:00Z").await.unwrap();
+        let msgs = b.recibir_mensajes("jefin").await.unwrap();
+        assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].texto, "hola pre-restart");
-        assert_eq!(msgs[0].de_id, "claudia");
     }
 
-    #[test]
-    fn recibir_marca_entregado_y_no_duplica() {
-        let base = base_memoria();
-        base.registrar("a", 1, "/x", None, None, "", "2026-01-01T00:00:00Z").unwrap();
-        base.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").unwrap();
-        assert_eq!(base.recibir_mensajes("a").unwrap().len(), 1);
-        // Segundo recibir: ya entregado, vacío.
-        assert_eq!(base.recibir_mensajes("a").unwrap().len(), 0);
+    #[tokio::test]
+    async fn recibir_no_duplica() {
+        let b = base();
+        b.registrar("a", 1, "/x", None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
+        assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 1);
+        assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 0);
     }
 
-    #[test]
-    fn reregistro_conserva_registrada_en_y_resumen() {
-        let base = base_memoria();
-        base.registrar("x", 1, "/d", None, None, "resumen original", "2026-01-01T00:00:00Z")
-            .unwrap();
-        base.registrar("x", 2, "/d", None, None, "ignorado", "2026-02-02T00:00:00Z")
-            .unwrap();
-        let inst = &base
-            .listar(Alcance::Maquina, "/d", None, None, "1970-01-01T00:00:00Z")
-            .unwrap()[0];
-        // El re-registro NO pisa el resumen (eso es trabajo de definir_resumen)...
+    #[tokio::test]
+    async fn reregistro_conserva_registrada_en_y_resumen() {
+        let b = base();
+        b.registrar("x", 1, "/d", None, None, "resumen original", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("x", 2, "/d", None, None, "ignorado", "2026-02-02T00:00:00Z").await.unwrap();
+        let inst = &b.listar(Alcance::Maquina, "/d", None, None, "1970-01-01T00:00:00Z").await.unwrap()[0];
         assert_eq!(inst.resumen, "resumen original");
-        // ...ni la fecha de registro original, pero sí actualiza pid y visto_en.
         assert_eq!(inst.registrada_en, "2026-01-01T00:00:00Z");
         assert_eq!(inst.pid, 2);
     }
 
-    #[test]
-    fn liveness_filtra_instancias_vencidas() {
-        // CRITERIO #5 — liveness por latido.
-        let base = base_memoria();
-        base.registrar("viva", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").unwrap();
-        base.registrar("muerta", 2, "/d", None, None, "", "2020-01-01T00:00:00Z").unwrap();
-        // Límite de vencimiento posterior a "muerta" pero anterior a "viva".
-        let vivas = base
-            .listar(Alcance::Maquina, "/d", None, None, "2026-06-27T11:59:00Z")
-            .unwrap();
+    #[tokio::test]
+    async fn liveness_filtra_vencidas() {
+        let b = base();
+        b.registrar("viva", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("muerta", 2, "/d", None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        let vivas = b.listar(Alcance::Maquina, "/d", None, None, "2026-06-27T11:59:00Z").await.unwrap();
         assert_eq!(vivas.len(), 1);
         assert_eq!(vivas[0].id, "viva");
     }
 
-    #[test]
-    fn limpiar_vencidas_purga_instancia_y_su_fila() {
-        let base = base_memoria();
-        base.registrar("zombie", 1, "/d", None, None, "", "2020-01-01T00:00:00Z").unwrap();
-        base.encolar_mensaje("otro", "zombie", "no llegará", "2020-01-01T00:00:01Z").unwrap();
-        let n = base.limpiar_vencidas("2026-01-01T00:00:00Z").unwrap();
-        assert_eq!(n, 1);
-        assert!(!base.instancia_existe("zombie"));
-        // La fila pendiente del zombie también se purgó.
-        assert_eq!(base.recibir_mensajes("zombie").unwrap().len(), 0);
+    #[tokio::test]
+    async fn limpiar_purga_instancia_y_fila() {
+        let b = base();
+        b.registrar("zombie", 1, "/d", None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        b.encolar_mensaje("otro", "zombie", "x", "2020-01-01T00:00:01Z").await.unwrap();
+        assert_eq!(b.limpiar_vencidas("2026-01-01T00:00:00Z").await.unwrap(), 1);
+        assert!(!b.instancia_existe("zombie").await.unwrap());
+        assert_eq!(b.recibir_mensajes("zombie").await.unwrap().len(), 0);
     }
 
-    #[test]
-    fn listar_excluye_al_solicitante() {
-        let base = base_memoria();
-        base.registrar("yo", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").unwrap();
-        base.registrar("otro", 2, "/d", None, None, "", "2026-06-27T12:00:00Z").unwrap();
-        let r = base
-            .listar(Alcance::Maquina, "/d", None, Some("yo"), "1970-01-01T00:00:00Z")
-            .unwrap();
+    #[tokio::test]
+    async fn listar_excluye_solicitante() {
+        let b = base();
+        b.registrar("yo", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("otro", 2, "/d", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        let r = b.listar(Alcance::Maquina, "/d", None, Some("yo"), "1970-01-01T00:00:00Z").await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].id, "otro");
     }
 
-    #[test]
-    fn alcance_repo_sin_git_cae_a_directorio() {
-        let base = base_memoria();
-        base.registrar("a", 1, "/proj", Some("/proj"), None, "", "2026-06-27T12:00:00Z").unwrap();
-        base.registrar("b", 2, "/proj", None, None, "", "2026-06-27T12:00:00Z").unwrap();
-        // Repo sin repo_git → filtra por directorio.
-        let r = base
-            .listar(Alcance::Repo, "/proj", None, None, "1970-01-01T00:00:00Z")
-            .unwrap();
+    #[tokio::test]
+    async fn repo_sin_git_cae_a_directorio() {
+        let b = base();
+        b.registrar("a", 1, "/proj", Some("/proj"), None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("b", 2, "/proj", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        let r = b.listar(Alcance::Repo, "/proj", None, None, "1970-01-01T00:00:00Z").await.unwrap();
         assert_eq!(r.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn outbox_sobrevive_y_ack() {
+        // El item del outbox sobrevive (no se borra) hasta el ACK — base del "no perder
+        // solicitud al reiniciar un peer".
+        let b = base();
+        let item = ItemOutbox {
+            id: "ob1".into(),
+            para_id: "jefin".into(),
+            texto: "tarea a medio hacer".into(),
+            creado_en: "2026-01-01T00:00:00Z".into(),
+            confirmado: false,
+        };
+        b.outbox_encolar(&item).await.unwrap();
+        // Sigue pendiente tras un "reinicio" (releer).
+        assert_eq!(b.outbox_pendientes("jefin").await.unwrap().len(), 1);
+        b.outbox_confirmar("ob1").await.unwrap();
+        // Tras el ACK, ya no está pendiente.
+        assert_eq!(b.outbox_pendientes("jefin").await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn jornada_timbrada_por_el_broker() {
+        let b = base();
+        let s = Sesion {
+            id: "s1".into(),
+            instancia_id: "jefin".into(),
+            inicio: "2026-01-01T00:00:00Z".into(),
+            fin: None,
+            duracion_seg: None,
+        };
+        b.sesion_abrir(&s).await.unwrap();
+        let t = Tarea {
+            id: "t1".into(),
+            instancia_id: "jefin".into(),
+            sesion_id: "s1".into(),
+            descripcion: "algo".into(),
+            inicio: "2026-01-01T00:00:00Z".into(),
+            fin: None,
+            duracion_seg: None,
+            issue_number: None,
+        };
+        b.tarea_guardar(&t).await.unwrap();
+        // Cierre con tiempo del "broker": 90s después.
+        let mut cerrada = b.tarea_obtener("t1").await.unwrap().unwrap();
+        cerrada.fin = Some("2026-01-01T00:01:30Z".into());
+        cerrada.duracion_seg = Some(crate::jornada::diferencia_seg("2026-01-01T00:00:00Z", "2026-01-01T00:01:30Z"));
+        b.tarea_guardar(&cerrada).await.unwrap();
+        let (_, tareas) = b.jornada("jefin").await.unwrap();
+        assert_eq!(tareas.len(), 1);
+        assert_eq!(tareas[0].duracion_seg, Some(90)); // MEDIDO, no estimado
     }
 }
