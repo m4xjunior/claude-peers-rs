@@ -131,6 +131,7 @@ async fn registrar(
             p.pid,
             &p.directorio,
             p.repo_git.as_deref(),
+            p.repo_github.as_deref(),
             p.tty.as_deref(),
             &p.resumen,
             &ahora,
@@ -241,20 +242,31 @@ async fn tarea_abrir(
     // Degradación graciosa: si GH no está o falla, la tarea sigue local.
     let mut issue_number = None;
     if let Some(gh) = &e.github {
-        let labels = match &p.area {
-            Some(a) => vec![p.instancia_id.clone(), a.clone()],
-            None => vec![p.instancia_id.clone()],
-        };
-        match gh.crear_issue(&p.descripcion, &labels).await {
-            Ok(n) => {
-                issue_number = Some(n);
-                tarea.issue_number = Some(n);
-                // Re-guarda la tarea con el número de issue cosido.
-                if let Err(err) = e.almacen.tarea_guardar(&tarea).await {
-                    warn!("no se pudo guardar issue_number en la tarea: {err:#}");
+        // Repo DINÁMICO: el owner/repo sale del repo_github de la instancia DUEÑA de la tarea
+        // (el repo donde ese peer trabaja). Si la instancia no tiene repo_github → degradación:
+        // no creamos issue, la tarea sigue local.
+        match repo_de_instancia(&e, &p.instancia_id).await {
+            Some((owner, repo)) => {
+                let labels = match &p.area {
+                    Some(a) => vec![p.instancia_id.clone(), a.clone()],
+                    None => vec![p.instancia_id.clone()],
+                };
+                match gh.crear_issue(&owner, &repo, &p.descripcion, &labels).await {
+                    Ok(n) => {
+                        issue_number = Some(n);
+                        tarea.issue_number = Some(n);
+                        // Re-guarda la tarea con el número de issue cosido.
+                        if let Err(err) = e.almacen.tarea_guardar(&tarea).await {
+                            warn!("no se pudo guardar issue_number en la tarea: {err:#}");
+                        }
+                    }
+                    Err(err) => warn!("GitHub no creó la issue en {owner}/{repo} (se sigue local): {err:#}"),
                 }
             }
-            Err(err) => warn!("GitHub no creó la issue (se sigue local): {err:#}"),
+            None => warn!(
+                "instancia {} sin repo_github (dir sin repo GitHub): se sigue local sin issue",
+                p.instancia_id
+            ),
         }
     }
 
@@ -269,8 +281,11 @@ async fn tarea_reportar(
     if let Some(gh) = &e.github {
         if let Some(tarea) = e.almacen.tarea_obtener(&p.tarea_id).await? {
             if let Some(n) = tarea.issue_number {
-                if let Err(err) = gh.comentar_issue(n, &p.texto).await {
-                    warn!("GitHub no comentó la issue (no crítico): {err:#}");
+                // Mismo repo dinámico: el de la instancia dueña de la tarea.
+                if let Some((owner, repo)) = repo_de_instancia(&e, &tarea.instancia_id).await {
+                    if let Err(err) = gh.comentar_issue(&owner, &repo, n, &p.texto).await {
+                        warn!("GitHub no comentó la issue (no crítico): {err:#}");
+                    }
                 }
             }
         }
@@ -285,16 +300,37 @@ async fn tarea_cerrar(
     let tarea = jornada::cerrar_tarea(&e.almacen, &p.tarea_id, &ahora_iso()).await?;
     if let Some(gh) = &e.github {
         if let Some(n) = tarea.issue_number {
-            let cierre = format!(
-                "Tarea cerrada. Duración medida por el broker: {}s.",
-                tarea.duracion_seg.unwrap_or(0)
-            );
-            if let Err(err) = gh.cerrar_issue(n, Some(&cierre)).await {
-                warn!("GitHub no cerró la issue (no crítico): {err:#}");
+            // Mismo repo dinámico: el de la instancia dueña de la tarea.
+            if let Some((owner, repo)) = repo_de_instancia(&e, &tarea.instancia_id).await {
+                let cierre = format!(
+                    "Tarea cerrada. Duración medida por el broker: {}s.",
+                    tarea.duracion_seg.unwrap_or(0)
+                );
+                if let Err(err) = gh.cerrar_issue(&owner, &repo, n, Some(&cierre)).await {
+                    warn!("GitHub no cerró la issue (no crítico): {err:#}");
+                }
             }
         }
     }
     Ok(Json(RespuestaOk { ok: true }))
+}
+
+/// Resuelve (owner, repo) del repo_github de una instancia. None si la instancia no existe
+/// o no tiene repo_github válido ("owner/repo") → el broker degrada (sin issue).
+async fn repo_de_instancia(e: &Estado, instancia_id: &str) -> Option<(String, String)> {
+    let inst = match e.almacen.instancia_obtener(instancia_id).await {
+        Ok(i) => i?,
+        Err(err) => {
+            warn!("no se pudo leer la instancia {instancia_id} para resolver repo: {err:#}");
+            return None;
+        }
+    };
+    let repo_github = inst.repo_github?;
+    let (owner, repo) = repo_github.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
 }
 
 async fn jornada_consolidada(
@@ -318,12 +354,13 @@ async fn main() -> anyhow::Result<()> {
     // Selección del backend de persistencia. Redis por defecto; SQLite tras feature.
     let almacen: Arc<dyn Almacen> = construir_almacen(&args)?;
 
-    // Cliente GitHub opcional (None si falta GITHUB_TOKEN/GITHUB_REPO → degradación).
+    // Cliente GitHub opcional (None si falta GITHUB_TOKEN → degradación). El repo destino
+    // ya NO es fijo: es dinámico, lo aporta cada peer (su repo_github) al abrir la tarea.
     let github = GitHub::desde_entorno();
     if github.is_some() {
-        info!("integración GitHub Issues ACTIVA");
+        info!("integración GitHub Issues ACTIVA (repo dinámico por peer)");
     } else {
-        info!("integración GitHub Issues inactiva (sin GITHUB_TOKEN/GITHUB_REPO)");
+        info!("integración GitHub Issues inactiva (sin GITHUB_TOKEN)");
     }
 
     // Limpieza inicial de instancias muertas.

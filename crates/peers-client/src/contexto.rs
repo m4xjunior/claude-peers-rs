@@ -16,6 +16,49 @@ pub fn repo_git(directorio: &str) -> Option<String> {
     salida_git(directorio, &["rev-parse", "--show-toplevel"])
 }
 
+/// Repositorio GitHub ("owner/repo") derivado del remote `origin` del git_root.
+///
+/// INTENCIÓN: el client corre EN la máquina del peer, dentro del directorio de trabajo,
+/// con gh/git autenticado — así que resolver el repo aquí es trivial y local. El broker
+/// recibe ya el "owner/repo" y abre la issue en ESE repo (dinámico), sin GITHUB_REPO fijo.
+///
+/// Soporta los dos formatos de remote de GitHub:
+///   - SSH:   git@github.com:owner/repo.git      → owner/repo
+///   - HTTPS: https://github.com/owner/repo(.git) → owner/repo
+/// Devuelve None si no hay remote, no es GitHub, o no se puede parsear (→ degradación).
+pub fn repo_github(directorio: &str) -> Option<String> {
+    let url = salida_git(directorio, &["remote", "get-url", "origin"])?;
+    parsear_repo_github(&url)
+}
+
+/// Extrae "owner/repo" de una URL de remote de GitHub (SSH o HTTPS). None si no aplica.
+/// Función pura (sin git) para poder testearla de forma determinista.
+fn parsear_repo_github(url: &str) -> Option<String> {
+    let url = url.trim();
+    // Solo nos interesa github.com; otros hosts (gitlab, bitbucket) → None.
+    if !url.contains("github.com") {
+        return None;
+    }
+    // Aísla la parte "owner/repo" según el formato del remote.
+    let resto = if let Some(idx) = url.find("github.com:") {
+        // SSH: git@github.com:owner/repo.git
+        &url[idx + "github.com:".len()..]
+    } else if let Some(idx) = url.find("github.com/") {
+        // HTTPS: https://github.com/owner/repo(.git)
+        &url[idx + "github.com/".len()..]
+    } else {
+        return None;
+    };
+    // Quita el sufijo .git y barras sobrantes.
+    let resto = resto.trim_end_matches('/').strip_suffix(".git").unwrap_or(resto.trim_end_matches('/'));
+    let (owner, repo) = resto.split_once('/')?;
+    let repo = repo.split('/').next().unwrap_or(repo);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
 /// Rama git actual, o None. Reservada para enriquecer el resumen en el futuro
 /// (hoy el resumen simplificado no la usa).
 #[allow(dead_code)]
@@ -66,5 +109,55 @@ fn salida_git(directorio: &str, args: &[&str]) -> Option<String> {
         None
     } else {
         Some(texto)
+    }
+}
+
+
+#[cfg(test)]
+mod pruebas {
+    use super::parsear_repo_github;
+
+    #[test]
+    fn ssh_estandar() {
+        assert_eq!(
+            parsear_repo_github("git@github.com:m4xjunior/lexusfx-emissor.git"),
+            Some("m4xjunior/lexusfx-emissor".into())
+        );
+    }
+
+    #[test]
+    fn https_con_git() {
+        assert_eq!(
+            parsear_repo_github("https://github.com/m4xjunior/lexusfx-emissor.git"),
+            Some("m4xjunior/lexusfx-emissor".into())
+        );
+    }
+
+    #[test]
+    fn https_sin_git() {
+        assert_eq!(
+            parsear_repo_github("https://github.com/owner/repo"),
+            Some("owner/repo".into())
+        );
+    }
+
+    #[test]
+    fn https_con_barra_final() {
+        assert_eq!(
+            parsear_repo_github("https://github.com/owner/repo/"),
+            Some("owner/repo".into())
+        );
+    }
+
+    #[test]
+    fn no_github_es_none() {
+        assert_eq!(parsear_repo_github("git@gitlab.com:owner/repo.git"), None);
+        assert_eq!(parsear_repo_github("https://bitbucket.org/owner/repo.git"), None);
+    }
+
+    #[test]
+    fn vacio_o_basura_es_none() {
+        assert_eq!(parsear_repo_github(""), None);
+        assert_eq!(parsear_repo_github("github.com"), None);
     }
 }

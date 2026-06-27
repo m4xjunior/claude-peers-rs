@@ -62,11 +62,11 @@ async fn redis_id_estable_hereda_fila_en_restart() {
     };
     limpiar(&alm, &["it-jefin", "it-claudia"]).await;
 
-    alm.registrar("it-jefin", 1, "/x", None, None, "j", "2026-01-01T00:00:00Z").await.unwrap();
-    alm.registrar("it-claudia", 2, "/y", None, None, "c", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.registrar("it-jefin", 1, "/x", None, None, None, "j", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.registrar("it-claudia", 2, "/y", None, None, None, "c", "2026-01-01T00:00:00Z").await.unwrap();
     alm.encolar_mensaje("it-claudia", "it-jefin", "pre-restart", "2026-01-01T00:00:01Z").await.unwrap();
     // "Restart": re-registro mismo id, pid distinto.
-    alm.registrar("it-jefin", 999, "/x", None, None, "j", "2026-01-01T00:01:00Z").await.unwrap();
+    alm.registrar("it-jefin", 999, "/x", None, None, None, "j", "2026-01-01T00:01:00Z").await.unwrap();
 
     let msgs = alm.recibir_mensajes("it-jefin").await.unwrap();
     assert_eq!(msgs.len(), 1, "el mensaje debe sobrevivir al re-registro");
@@ -162,8 +162,8 @@ async fn redis_listar_filtra_alcance_y_vivos() {
         return;
     };
     limpiar(&alm, &["it-a", "it-b"]).await;
-    alm.registrar("it-a", 1, "/p", Some("/p"), None, "", "2026-06-27T12:00:00Z").await.unwrap();
-    alm.registrar("it-b", 2, "/p", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+    alm.registrar("it-a", 1, "/p", Some("/p"), None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+    alm.registrar("it-b", 2, "/p", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
     // Excluye al solicitante it-a.
     let r = alm.listar(Alcance::Maquina, "/p", None, Some("it-a"), "1970-01-01T00:00:00Z").await.unwrap();
     assert!(r.iter().any(|i| i.id == "it-b"));

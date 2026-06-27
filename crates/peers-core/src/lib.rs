@@ -28,6 +28,11 @@ pub struct Instancia {
     pub pid: i64,
     pub directorio: String,
     pub repo_git: Option<String>,
+    /// Repositorio GitHub donde la instancia trabaja ("owner/repo"), derivado del remote
+    /// origin de su git_root por el CLIENT (que corre en la máquina del peer con gh logado).
+    /// El broker NO lo resuelve: solo usa el valor recibido para abrir issues en ESE repo.
+    /// None si el directorio no es un repo GitHub → degradación (sin issue).
+    pub repo_github: Option<String>,
     pub tty: Option<String>,
     /// Resumen de 1-2 frases de lo que la instancia está haciendo (visible a los demás).
     pub resumen: String,
@@ -59,6 +64,9 @@ pub struct PeticionRegistrar {
     pub pid: i64,
     pub directorio: String,
     pub repo_git: Option<String>,
+    /// "owner/repo" del remote origin del git_root, resuelto por el client. None si no-GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_github: Option<String>,
     pub tty: Option<String>,
     #[serde(default)]
     pub resumen: String,

@@ -25,6 +25,7 @@ pub trait Almacen: Send + Sync {
         pid: i64,
         directorio: &str,
         repo_git: Option<&str>,
+        repo_github: Option<&str>,
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
@@ -35,6 +36,11 @@ pub trait Almacen: Send + Sync {
     async fn salir(&self, id: &str) -> anyhow::Result<()>;
     async fn instancia_existe(&self, id: &str) -> anyhow::Result<bool>;
     async fn contar_instancias(&self) -> anyhow::Result<usize>;
+
+    /// Lee una instancia por id (sin filtro de liveness). None si no existe.
+    /// Lo usa el broker para resolver el repo_github de la instancia dueña de una tarea
+    /// y abrir la issue en ESE repo (dinámico).
+    async fn instancia_obtener(&self, id: &str) -> anyhow::Result<Option<Instancia>>;
 
     async fn listar(
         &self,

@@ -25,7 +25,7 @@ impl AlmacenSqlite {
 
             CREATE TABLE IF NOT EXISTS instancias (
                 id TEXT PRIMARY KEY, pid INTEGER NOT NULL, directorio TEXT NOT NULL,
-                repo_git TEXT, tty TEXT, resumen TEXT NOT NULL DEFAULT '',
+                repo_git TEXT, repo_github TEXT, tty TEXT, resumen TEXT NOT NULL DEFAULT '',
                 registrada_en TEXT NOT NULL, visto_en TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS mensajes (
@@ -65,6 +65,7 @@ impl Almacen for AlmacenSqlite {
         pid: i64,
         directorio: &str,
         repo_git: Option<&str>,
+        repo_github: Option<&str>,
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
@@ -76,14 +77,14 @@ impl Almacen for AlmacenSqlite {
         if existe {
             // Re-registro: UPDATE sin tocar la fila de mensajes ni registrada_en/resumen.
             conexion.execute(
-                "UPDATE instancias SET pid=?2, directorio=?3, repo_git=?4, tty=?5, visto_en=?6 WHERE id=?1",
-                params![id, pid, directorio, repo_git, tty, ahora],
+                "UPDATE instancias SET pid=?2, directorio=?3, repo_git=?4, repo_github=?5, tty=?6, visto_en=?7 WHERE id=?1",
+                params![id, pid, directorio, repo_git, repo_github, tty, ahora],
             )?;
         } else {
             conexion.execute(
-                "INSERT INTO instancias (id,pid,directorio,repo_git,tty,resumen,registrada_en,visto_en)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
-                params![id, pid, directorio, repo_git, tty, resumen, ahora],
+                "INSERT INTO instancias (id,pid,directorio,repo_git,repo_github,tty,resumen,registrada_en,visto_en)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+                params![id, pid, directorio, repo_git, repo_github, tty, resumen, ahora],
             )?;
         }
         Ok(())
@@ -119,6 +120,17 @@ impl Almacen for AlmacenSqlite {
             .bloquear()
             .query_row("SELECT COUNT(*) FROM instancias", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0) as usize)
+    }
+
+    async fn instancia_obtener(&self, id: &str) -> anyhow::Result<Option<Instancia>> {
+        Ok(self
+            .bloquear()
+            .query_row(
+                "SELECT * FROM instancias WHERE id=?1",
+                params![id],
+                fila_a_instancia,
+            )
+            .ok())
     }
 
     async fn listar(
@@ -346,6 +358,7 @@ fn fila_a_instancia(f: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
         pid: f.get("pid")?,
         directorio: f.get("directorio")?,
         repo_git: f.get("repo_git")?,
+        repo_github: f.get("repo_github")?,
         tty: f.get("tty")?,
         resumen: f.get("resumen")?,
         registrada_en: f.get("registrada_en")?,
@@ -377,11 +390,11 @@ mod pruebas {
     #[tokio::test]
     async fn id_estable_reregistro_hereda_la_fila() {
         let b = base();
-        b.registrar("jefin", 111, "/x", None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
-        b.registrar("claudia", 222, "/y", None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("jefin", 111, "/x", None, None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("claudia", 222, "/y", None, None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
         b.encolar_mensaje("claudia", "jefin", "hola pre-restart", "2026-01-01T00:00:01Z").await.unwrap();
         // Restart: re-registro mismo id, pid distinto.
-        b.registrar("jefin", 999, "/x", None, None, "papel", "2026-01-01T00:01:00Z").await.unwrap();
+        b.registrar("jefin", 999, "/x", None, None, None, "papel", "2026-01-01T00:01:00Z").await.unwrap();
         let msgs = b.recibir_mensajes("jefin").await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].texto, "hola pre-restart");
@@ -390,7 +403,7 @@ mod pruebas {
     #[tokio::test]
     async fn recibir_no_duplica() {
         let b = base();
-        b.registrar("a", 1, "/x", None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("a", 1, "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
         b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
         assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 1);
         assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 0);
@@ -399,8 +412,8 @@ mod pruebas {
     #[tokio::test]
     async fn reregistro_conserva_registrada_en_y_resumen() {
         let b = base();
-        b.registrar("x", 1, "/d", None, None, "resumen original", "2026-01-01T00:00:00Z").await.unwrap();
-        b.registrar("x", 2, "/d", None, None, "ignorado", "2026-02-02T00:00:00Z").await.unwrap();
+        b.registrar("x", 1, "/d", None, None, None, "resumen original", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("x", 2, "/d", None, None, None, "ignorado", "2026-02-02T00:00:00Z").await.unwrap();
         let inst = &b.listar(Alcance::Maquina, "/d", None, None, "1970-01-01T00:00:00Z").await.unwrap()[0];
         assert_eq!(inst.resumen, "resumen original");
         assert_eq!(inst.registrada_en, "2026-01-01T00:00:00Z");
@@ -410,8 +423,8 @@ mod pruebas {
     #[tokio::test]
     async fn liveness_filtra_vencidas() {
         let b = base();
-        b.registrar("viva", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
-        b.registrar("muerta", 2, "/d", None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        b.registrar("viva", 1, "/d", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("muerta", 2, "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
         let vivas = b.listar(Alcance::Maquina, "/d", None, None, "2026-06-27T11:59:00Z").await.unwrap();
         assert_eq!(vivas.len(), 1);
         assert_eq!(vivas[0].id, "viva");
@@ -420,7 +433,7 @@ mod pruebas {
     #[tokio::test]
     async fn limpiar_purga_instancia_y_fila() {
         let b = base();
-        b.registrar("zombie", 1, "/d", None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        b.registrar("zombie", 1, "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
         b.encolar_mensaje("otro", "zombie", "x", "2020-01-01T00:00:01Z").await.unwrap();
         assert_eq!(b.limpiar_vencidas("2026-01-01T00:00:00Z").await.unwrap(), 1);
         assert!(!b.instancia_existe("zombie").await.unwrap());
@@ -430,8 +443,8 @@ mod pruebas {
     #[tokio::test]
     async fn listar_excluye_solicitante() {
         let b = base();
-        b.registrar("yo", 1, "/d", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
-        b.registrar("otro", 2, "/d", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("yo", 1, "/d", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("otro", 2, "/d", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
         let r = b.listar(Alcance::Maquina, "/d", None, Some("yo"), "1970-01-01T00:00:00Z").await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].id, "otro");
@@ -440,8 +453,8 @@ mod pruebas {
     #[tokio::test]
     async fn repo_sin_git_cae_a_directorio() {
         let b = base();
-        b.registrar("a", 1, "/proj", Some("/proj"), None, "", "2026-06-27T12:00:00Z").await.unwrap();
-        b.registrar("b", 2, "/proj", None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("a", 1, "/proj", Some("/proj"), None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("b", 2, "/proj", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
         let r = b.listar(Alcance::Repo, "/proj", None, None, "1970-01-01T00:00:00Z").await.unwrap();
         assert_eq!(r.len(), 2);
     }

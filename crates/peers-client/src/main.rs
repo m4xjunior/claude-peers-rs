@@ -46,6 +46,9 @@ struct EstadoCliente {
     broker: ClienteBroker,
     directorio: String,
     repo_git: Option<String>,
+    /// "owner/repo" del remote origin (dinámico). El broker lo usa para abrir issues
+    /// en el repo donde este peer trabaja. None si el dir no es repo GitHub → sin issue.
+    repo_github: Option<String>,
     salida: SalidaMcp,
 }
 
@@ -67,10 +70,14 @@ async fn main() -> Result<()> {
 
     let directorio = contexto::directorio_actual();
     let repo_git = contexto::repo_git(&directorio);
+    // Resuelve "owner/repo" del remote origin AQUÍ (en la máquina del peer, con gh logado).
+    // El broker no lo resuelve: recibe el valor y abre la issue en ESE repo (dinámico).
+    let repo_github = contexto::repo_github(&directorio);
     let tty = contexto::tty();
 
     info!("directorio: {directorio}");
     info!("repo git: {}", repo_git.as_deref().unwrap_or("(ninguno)"));
+    info!("repo github: {}", repo_github.as_deref().unwrap_or("(ninguno)"));
     info!("broker: {url}");
 
     let broker = ClienteBroker::nuevo(url.clone());
@@ -89,6 +96,7 @@ async fn main() -> Result<()> {
             pid: std::process::id() as i64,
             directorio: directorio.clone(),
             repo_git: repo_git.clone(),
+            repo_github: repo_github.clone(),
             tty,
             resumen,
             id_preferido: args.id.clone(),
@@ -110,6 +118,7 @@ async fn main() -> Result<()> {
         broker,
         directorio,
         repo_git,
+        repo_github,
         salida: SalidaMcp::nueva(),
     });
 
@@ -403,6 +412,7 @@ async fn reintentar_registro(estado: &Arc<EstadoCliente>, id_preferido: Option<S
             pid: std::process::id() as i64,
             directorio: estado.directorio.clone(),
             repo_git: estado.repo_git.clone(),
+            repo_github: estado.repo_github.clone(),
             tty: contexto::tty(),
             resumen,
             id_preferido,

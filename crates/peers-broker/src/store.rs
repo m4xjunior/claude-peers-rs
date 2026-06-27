@@ -65,6 +65,7 @@ impl Almacen for AlmacenRedis {
         pid: i64,
         directorio: &str,
         repo_git: Option<&str>,
+        repo_github: Option<&str>,
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
@@ -80,6 +81,7 @@ impl Almacen for AlmacenRedis {
                 .arg("pid").arg(pid)
                 .arg("directorio").arg(directorio)
                 .arg("repo_git").arg(repo_git.unwrap_or(""))
+                .arg("repo_github").arg(repo_github.unwrap_or(""))
                 .arg("tty").arg(tty.unwrap_or(""))
                 .arg("visto_en").arg(ahora)
                 .query_async::<()>(&mut conn)
@@ -91,6 +93,7 @@ impl Almacen for AlmacenRedis {
                 .arg("pid").arg(pid)
                 .arg("directorio").arg(directorio)
                 .arg("repo_git").arg(repo_git.unwrap_or(""))
+                .arg("repo_github").arg(repo_github.unwrap_or(""))
                 .arg("tty").arg(tty.unwrap_or(""))
                 .arg("resumen").arg(resumen)
                 .arg("registrada_en").arg(ahora)
@@ -130,6 +133,11 @@ impl Almacen for AlmacenRedis {
         let mut conn = self.conn().await?;
         let n: usize = conn.scard(format!("{NS}instancias")).await?;
         Ok(n)
+    }
+
+    async fn instancia_obtener(&self, id: &str) -> anyhow::Result<Option<Instancia>> {
+        let mut conn = self.conn().await?;
+        leer_instancia(&mut conn, id).await
     }
 
     async fn listar(
@@ -360,6 +368,7 @@ async fn leer_instancia(
         pid: h.get("pid").and_then(|s| s.parse().ok()).unwrap_or(0),
         directorio: h.get("directorio").cloned().unwrap_or_default(),
         repo_git: opt("repo_git"),
+        repo_github: opt("repo_github"),
         tty: opt("tty"),
         resumen: h.get("resumen").cloned().unwrap_or_default(),
         registrada_en: h.get("registrada_en").cloned().unwrap_or_default(),
