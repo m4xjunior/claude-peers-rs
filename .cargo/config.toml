@@ -1,0 +1,10 @@
+# Configuración de cargo para cross-compilar binarios Linux portables desde el Mac.
+#
+# El target x86_64-unknown-linux-musl produce un binario ESTÁTICO (sin depender de la
+# versión de glibc del servidor): el mismo archivo corre en cualquier Linux x86_64
+# (Ubuntu/Debian/Alpine), que es lo que hace real el "scp y corre" de la distribución.
+#
+# Linker: x86_64-linux-musl-gcc, instalado con `brew install FiloSottile/musl-cross/musl-cross`.
+# Si lo instalas en otra ruta, ajusta el linker aquí.
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
