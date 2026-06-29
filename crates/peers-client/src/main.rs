@@ -38,6 +38,10 @@ struct Args {
     /// Puerto del broker (si no se pasa --broker-url, se compone con localhost).
     #[arg(long, env = "CLAUDE_PEERS_PORT", default_value_t = PUERTO_DEFECTO)]
     puerto: u16,
+
+    /// Token de acceso al broker (debe coincidir con el del broker si éste lo exige).
+    #[arg(long, env = "CLAUDE_PEERS_TOKEN")]
+    token: Option<String>,
 }
 
 /// Estado compartido de la instancia: su id asignado por el broker.
@@ -93,7 +97,7 @@ async fn main() -> Result<()> {
     info!("repo github: {}", repo_github.as_deref().unwrap_or("(ninguno)"));
     info!("broker: {url}");
 
-    let broker = ClienteBroker::nuevo(url.clone());
+    let broker = ClienteBroker::nuevo(url.clone(), args.token.clone());
     if !broker.esta_vivo().await {
         // No abortamos: registramos el aviso y seguimos; el broker puede levantarse luego.
         warn!("el broker no responde en {url} — reintentaré en el próximo latido");

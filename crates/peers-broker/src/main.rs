@@ -37,7 +37,9 @@ use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{error, info, warn};
 
-#[derive(Parser, Debug)]
+// NO derivamos Debug: el campo `token` es secreto y un `{args:?}` accidental (log, panic
+// con backtrace) lo filtraría en claro. Implementamos Debug manual redactando el token.
+#[derive(Parser)]
 #[command(name = "peers-broker", about = "Daemon de la red claude-peers-rs")]
 struct Args {
     #[arg(long, env = "CLAUDE_PEERS_PORT", default_value_t = PUERTO_DEFECTO)]
@@ -53,6 +55,24 @@ struct Args {
     /// Ruta del archivo SQLite (solo con --features sqlite).
     #[arg(long, env = "CLAUDE_PEERS_DB")]
     db: Option<String>,
+
+    /// Token de acceso. Si se setea, el broker exige el header `X-Peers-Token` en todas las
+    /// rutas salvo /salud. Sin token → sin auth (uso local localhost sigue funcionando igual).
+    #[arg(long, env = "CLAUDE_PEERS_TOKEN")]
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for Args {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Args")
+            .field("puerto", &self.puerto)
+            .field("host", &self.host)
+            .field("redis_url", &self.redis_url)
+            .field("db", &self.db)
+            // El token NUNCA se imprime en claro: se redacta a "<presente>"/"<ninguno>".
+            .field("token", &self.token.as_ref().map(|_| "<presente>").unwrap_or("<ninguno>"))
+            .finish()
+    }
 }
 
 /// Estado de la aplicación: el almacén (tras el trait) y el cliente GitHub opcional.
@@ -108,6 +128,43 @@ fn generar_id() -> String {
         id.push(ALFABETO[(x % ALFABETO.len() as u64) as usize] as char);
     }
     id
+}
+
+/// Decide si una petición está autorizada. Pura y testeable.
+/// - Sin token configurado (None) → siempre autorizado (compat local).
+/// - Con token configurado → autorizado solo si el recibido coincide exacto.
+fn token_autorizado(configurado: Option<&str>, recibido: Option<&str>) -> bool {
+    match configurado {
+        None => true,
+        Some(esperado) => recibido == Some(esperado),
+    }
+}
+
+/// ¿El host de escucha es loopback (solo accesible desde la propia máquina)?
+/// Cubre IPv4 (127.0.0.0/8), IPv6 (::1) y el nombre "localhost". Cualquier otro host
+/// implica exposición en red → el caller exige token o avisa. Pura y testeable.
+fn host_es_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host == "::1"
+        || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// Middleware axum: aplica `token_autorizado` usando el header `X-Peers-Token`.
+/// /salud queda exento (se monta fuera de esta capa).
+async fn verificar_token(
+    axum::extract::State(token): axum::extract::State<Option<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let recibido = req
+        .headers()
+        .get("x-peers-token")
+        .and_then(|v| v.to_str().ok());
+    if token_autorizado(token.as_deref(), recibido) {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "token inválido o ausente").into_response()
+    }
 }
 
 // --- Handlers fase 1 ---
@@ -435,8 +492,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let app = Router::new()
-        .route("/salud", get(salud))
+    use axum::middleware::from_fn_with_state;
+
+    // Warning ruidoso si se expone en red sin token (agujero accidental).
+    // Cubre IPv4 e IPv6: cualquier host que NO sea loopback y sin token → aviso.
+    if !host_es_loopback(&args.host) && args.token.is_none() {
+        warn!("broker EXPUESTO en {} SIN token — cualquiera en la red puede conectarse. \
+               Usa --token para protegerlo.", args.host);
+    }
+
+    let rutas_protegidas = Router::new()
         .route("/registrar", post(registrar))
         .route("/latido", post(latido))
         .route("/definir-resumen", post(definir_resumen))
@@ -448,6 +513,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/tarea/reportar", post(tarea_reportar))
         .route("/tarea/cerrar", post(tarea_cerrar))
         .route("/jornada", post(jornada_consolidada))
+        .layer(from_fn_with_state(args.token.clone(), verificar_token));
+
+    let app = Router::new()
+        .route("/salud", get(salud))   // exenta de auth
+        .merge(rutas_protegidas)
         .with_state(estado);
 
     let direccion = format!("{}:{}", args.host, args.puerto);
@@ -481,7 +551,45 @@ fn construir_almacen(args: &Args) -> anyhow::Result<Arc<dyn Almacen>> {
 
 #[cfg(test)]
 mod pruebas {
-    use super::pid_vivo;
+    use super::{host_es_loopback, pid_vivo, token_autorizado, Args};
+
+    #[test]
+    fn token_correcto_pasa_y_ausente_falla() {
+        // Lógica pura de decisión del middleware, sin levantar axum.
+        assert!(token_autorizado(Some("abc"), Some("abc")));   // coincide → pasa
+        assert!(!token_autorizado(Some("abc"), Some("xyz")));  // distinto → falla
+        assert!(!token_autorizado(Some("abc"), None));         // falta → falla
+        assert!(token_autorizado(None, None));                 // sin token configurado → pasa
+        assert!(token_autorizado(None, Some("lo-que-sea")));   // sin config → pasa (ignora)
+    }
+
+    #[test]
+    fn loopback_cubre_ipv4_ipv6_y_localhost() {
+        assert!(host_es_loopback("127.0.0.1"));
+        assert!(host_es_loopback("127.0.0.5"));  // todo 127.0.0.0/8 es loopback
+        assert!(host_es_loopback("::1"));         // IPv6 loopback
+        assert!(host_es_loopback("localhost"));
+        // Expuestos en red → NO loopback (deben disparar el warning sin token):
+        assert!(!host_es_loopback("0.0.0.0"));    // wildcard IPv4
+        assert!(!host_es_loopback("::"));         // wildcard IPv6 (el hueco que se cerró)
+        assert!(!host_es_loopback("10.0.0.67"));  // LAN
+        assert!(!host_es_loopback("192.168.1.5"));
+    }
+
+    #[test]
+    fn debug_de_args_no_filtra_el_token() {
+        // El Debug manual debe REDACTAR el token, nunca imprimirlo en claro.
+        let args = Args {
+            puerto: 7899,
+            host: "0.0.0.0".into(),
+            redis_url: "redis://127.0.0.1:6379".into(),
+            db: None,
+            token: Some("secreto-super-sensible".into()),
+        };
+        let s = format!("{args:?}");
+        assert!(!s.contains("secreto-super-sensible"), "el token NO debe aparecer en claro");
+        assert!(s.contains("<presente>"), "debe indicar que hay token, redactado");
+    }
 
     #[test]
     fn pid_propio_esta_vivo() {

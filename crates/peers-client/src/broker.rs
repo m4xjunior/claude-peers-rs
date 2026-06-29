@@ -9,15 +9,16 @@ use anyhow::{Context, Result};
 use peers_core::*;
 use reqwest::Client;
 
-/// Cliente del broker: guarda la URL base y un cliente HTTP reutilizable.
+/// Cliente del broker: guarda la URL base, el token opcional y un cliente HTTP reutilizable.
 #[derive(Clone)]
 pub struct ClienteBroker {
     http: Client,
     base: String,
+    token: Option<String>,
 }
 
 impl ClienteBroker {
-    pub fn nuevo(base: impl Into<String>) -> Self {
+    pub fn nuevo(base: impl Into<String>, token: Option<String>) -> Self {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -25,6 +26,7 @@ impl ClienteBroker {
         Self {
             http,
             base: base.into(),
+            token,
         }
     }
 
@@ -36,10 +38,11 @@ impl ClienteBroker {
         cuerpo: &B,
     ) -> Result<R> {
         let url = format!("{}{}", self.base, ruta);
-        let resp = self
-            .http
-            .post(&url)
-            .json(cuerpo)
+        let mut req = self.http.post(&url).json(cuerpo);
+        if let Some(t) = &self.token {
+            req = req.header("X-Peers-Token", t);
+        }
+        let resp = req
             .send()
             .await
             .with_context(|| format!("broker no responde en {url} (¿está levantado?)"))?;
@@ -56,7 +59,11 @@ impl ClienteBroker {
     /// Comprueba si el broker está vivo (GET /salud). No lanza: devuelve false si no responde.
     pub async fn esta_vivo(&self) -> bool {
         let url = format!("{}/salud", self.base);
-        match self.http.get(&url).send().await {
+        let mut req = self.http.get(&url);
+        if let Some(t) = &self.token {
+            req = req.header("X-Peers-Token", t);
+        }
+        match req.send().await {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
