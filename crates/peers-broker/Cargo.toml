@@ -32,6 +32,8 @@ deadpool-redis = { workspace = true }
 octocrab = { workspace = true }
 # SQLite solo si se activa la feature.
 rusqlite = { workspace = true, optional = true }
+# Detección de PID vivo (kill(pid,0)) para resolver colisión de id entre peers locales.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }

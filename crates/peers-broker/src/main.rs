@@ -119,11 +119,60 @@ async fn salud(State(e): State<Estado>) -> Result<Json<RespuestaSalud>, ErrorApp
     }))
 }
 
+/// Resuelve el id de registro evitando colisión entre peers DISTINTOS.
+///
+/// Caso re-registro legítimo (mismo peer reiniciando): el id pedido ya existe pero su PID
+/// coincide con el que registra, o el PID viejo ya no está vivo → se reusa el id tal cual,
+/// para HEREDAR la cola (es el FIX del id estable). Caso colisión real (dos peers vivos con
+/// el mismo id, p.ej. dos Claude en la misma carpeta sin --id): el id pedido existe con OTRO
+/// PID que sigue vivo → se sufija -2, -3… hasta encontrar uno libre. Sin id_preferido →
+/// id aleatorio (sin colisión posible).
+async fn resolver_id_sin_colision(e: &Estado, id_preferido: Option<&str>, pid_nuevo: i64) -> String {
+    let Some(base) = id_preferido else {
+        return generar_id();
+    };
+    // ¿El id base está ocupado por un peer DISTINTO y vivo?
+    if !id_ocupado_por_otro_vivo(e, base, pid_nuevo).await {
+        return base.to_string();
+    }
+    // Colisión real: busca el primer sufijo libre (-2, -3, …). Cota defensiva en 99.
+    for n in 2..=99 {
+        let candidato = format!("{base}-{n}");
+        if !id_ocupado_por_otro_vivo(e, &candidato, pid_nuevo).await {
+            warn!("id '{base}' ocupado por otro peer vivo; esta instancia usa '{candidato}'");
+            return candidato;
+        }
+    }
+    // Improbable (99 colisiones): cae a aleatorio para no bloquear el registro.
+    generar_id()
+}
+
+/// true si `id` ya está registrado por un peer con PID distinto a `pid_nuevo` y ese PID
+/// sigue vivo en esta máquina. (PID muerto o mismo PID → NO es colisión: es re-registro.)
+async fn id_ocupado_por_otro_vivo(e: &Estado, id: &str, pid_nuevo: i64) -> bool {
+    match e.almacen.instancia_obtener(id).await {
+        Ok(Some(inst)) => inst.pid != pid_nuevo && pid_vivo(inst.pid),
+        // No existe, o error de lectura → tratamos como libre (no bloqueamos el registro).
+        _ => false,
+    }
+}
+
+/// Comprueba si un PID está vivo en esta máquina (señal 0, no mata). Solo válido para peers
+/// locales; un peer remoto (cross-host) tiene un PID que aquí no existe → se trataría como
+/// "muerto", lo cual es aceptable: cross-host se distingue mejor por id de rol explícito.
+fn pid_vivo(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // kill(pid, 0): no envía señal, solo comprueba existencia/permisos del proceso.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
 async fn registrar(
     State(e): State<Estado>,
     Json(p): Json<PeticionRegistrar>,
 ) -> Result<Json<RespuestaRegistrar>, ErrorApp> {
-    let id = p.id_preferido.clone().unwrap_or_else(generar_id);
+    let id = resolver_id_sin_colision(&e, p.id_preferido.as_deref(), p.pid).await;
     let ahora = ahora_iso();
     e.almacen
         .registrar(
@@ -427,5 +476,25 @@ fn construir_almacen(args: &Args) -> anyhow::Result<Arc<dyn Almacen>> {
             info!("backend de persistencia: Redis ({})", args.redis_url);
             Ok(Arc::new(AlmacenRedis::nuevo(&args.redis_url)?))
         }
+    }
+}
+
+#[cfg(test)]
+mod pruebas {
+    use super::pid_vivo;
+
+    #[test]
+    fn pid_propio_esta_vivo() {
+        // El PID de este proceso de test SIEMPRE está vivo.
+        assert!(pid_vivo(std::process::id() as i64));
+    }
+
+    #[test]
+    fn pid_imposible_o_invalido_esta_muerto() {
+        // PIDs <= 0 no son válidos → muertos.
+        assert!(!pid_vivo(0));
+        assert!(!pid_vivo(-1));
+        // Un PID enorme casi seguro no existe → muerto (kill(pid,0) da ESRCH).
+        assert!(!pid_vivo(2_000_000_000));
     }
 }

@@ -150,8 +150,10 @@ pub fn definiciones_tools() -> Value {
 }
 
 /// Construye el `result` del `initialize`. Hace eco de la versión de protocolo que pide
-/// el cliente si la soportamos; si no, ofrecemos la de defecto.
-pub fn resultado_initialize(version_cliente: Option<&str>) -> Value {
+/// el cliente si la soportamos; si no, ofrecemos la de defecto. Recibe el `id_efectivo`
+/// (el id REAL con que esta instancia se registró) para anunciárselo al agente — así sabe
+/// con qué id debe pedir que le respondan (cierra la grieta rol-vs-id).
+pub fn resultado_initialize(version_cliente: Option<&str>, id_efectivo: &str) -> Value {
     let version = match version_cliente {
         Some(v) if VERSIONES_SOPORTADAS.contains(&v) => v,
         _ => VERSION_PROTOCOLO_DEFECTO,
@@ -167,9 +169,32 @@ pub fn resultado_initialize(version_cliente: Option<&str>) -> Value {
             "name": "claude-peers-rs",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": INSTRUCCIONES
+        "instructions": instrucciones(id_efectivo)
     })
 }
 
 /// Instrucciones que el harness muestra para guiar el uso de la red. En español.
-const INSTRUCCIONES: &str = "Estás conectado a la red claude-peers. Otras instancias de Claude Code en esta máquina pueden verte y enviarte mensajes.\n\nIMPORTANTE: cuando recibas un mensaje <channel source=\"claude-peers\" ...>, RESPONDE DE INMEDIATO. No esperes a terminar tu tarea actual. Pausa lo que haces, responde con enviar_mensaje y retoma. Trata los mensajes entrantes como un compañero que te toca el hombro.\n\nLee los atributos from_id, from_summary y from_cwd para saber quién escribe. Responde llamando enviar_mensaje con su from_id.\n\nTools disponibles:\n- listar_instancias: descubre otras instancias (alcance: maquina/directorio/repo)\n- enviar_mensaje: envía un mensaje a otra instancia por su id\n- definir_resumen: fija un resumen de lo que haces (visible a las demás)\n- revisar_mensajes: revisa manualmente mensajes nuevos\n\nAl iniciar, llama definir_resumen para describir en qué trabajas.";
+///
+/// INTENCIÓN: arrancan ANUNCIANDO el id propio. Sin esto, el agente cree ser su "rol"
+/// conversacional (p.ej. "claudio") pero el broker lo registró con otro id (p.ej. derivado
+/// de la carpeta), y al pedir "respóndeme a claudio" el destino no existe — el bug que rompió
+/// el round-trip de vuelta. Anunciar el id real cierra esa grieta de origen.
+fn instrucciones(id_efectivo: &str) -> String {
+    format!(
+        "Tu id en la red claude-peers es: '{id_efectivo}'. Cuando pidas a otra instancia que \
+te responda, dile que dirija su mensaje a ESTE id exacto (no a tu nombre de rol).\n\n\
+Estás conectado a la red claude-peers. Otras instancias de Claude Code en esta máquina pueden \
+verte y enviarte mensajes.\n\n\
+IMPORTANTE: cuando recibas un mensaje <channel source=\"claude-peers\" ...>, RESPONDE DE INMEDIATO. \
+No esperes a terminar tu tarea actual. Pausa lo que haces, responde con enviar_mensaje y retoma. \
+Trata los mensajes entrantes como un compañero que te toca el hombro.\n\n\
+Lee los atributos from_id, from_summary y from_cwd para saber quién escribe. Responde llamando \
+enviar_mensaje con su from_id.\n\n\
+Tools disponibles:\n\
+- listar_instancias: descubre otras instancias (alcance: maquina/directorio/repo)\n\
+- enviar_mensaje: envía un mensaje a otra instancia por su id\n\
+- definir_resumen: fija un resumen de lo que haces (visible a las demás)\n\
+- revisar_mensajes: revisa manualmente mensajes nuevos\n\n\
+Al iniciar, llama definir_resumen para describir en qué trabajas."
+    )
+}

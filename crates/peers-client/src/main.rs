@@ -43,6 +43,12 @@ struct Args {
 /// Estado compartido de la instancia: su id asignado por el broker.
 struct EstadoCliente {
     id: RwLock<Option<String>>,
+    /// Id que ESTA instancia pidió al broker (derivado de la carpeta o de --id). Se le
+    /// anuncia al agente en el initialize para que sepa con qué id deben responderle.
+    /// OJO: si el broker detectó colisión puede haber asignado un sufijo (-2); el id REAL
+    /// vive en `id` (RwLock). Este campo es el "preferido", suficiente para el anuncio
+    /// inicial; el id real se confirma en la respuesta del registro.
+    id_efectivo: String,
     broker: ClienteBroker,
     directorio: String,
     repo_git: Option<String>,
@@ -121,6 +127,7 @@ async fn main() -> Result<()> {
 
     let estado = Arc::new(EstadoCliente {
         id: RwLock::new(id_asignado),
+        id_efectivo: id_efectivo.clone(),
         broker,
         directorio,
         repo_git,
@@ -184,7 +191,20 @@ async fn despachar(estado: &Arc<EstadoCliente>, msg: Value) {
                 .get("params")
                 .and_then(|p| p.get("protocolVersion"))
                 .and_then(Value::as_str);
-            responder(estado, id, mcp::resultado_initialize(version_cliente)).await;
+            // Anuncia el id REAL (el que asignó el broker, ya con sufijo si hubo colisión);
+            // si aún no hay (broker tardó), cae al id_efectivo preferido.
+            let id_anunciar = estado
+                .id
+                .read()
+                .await
+                .clone()
+                .unwrap_or_else(|| estado.id_efectivo.clone());
+            responder(
+                estado,
+                id,
+                mcp::resultado_initialize(version_cliente, &id_anunciar),
+            )
+            .await;
         }
         "notifications/initialized" => {
             // Notificación del cliente: nada que responder.
