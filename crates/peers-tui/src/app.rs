@@ -206,12 +206,12 @@ pub struct App {
     pub config_campo: usize,
     /// Mensaje efímero de estado (ej. "mensaje enviado", "config guardada").
     pub flash: Option<String>,
-    /// Id del peer cuyo historial se muestra en la pantalla Trazabilidad. Si es `None`,
-    /// se usa el peer seleccionado en la pantalla Peers como foco por defecto. La pantalla
-    /// solo pide `/admin/historial` cuando hay un foco resuelto.
-    pub traza_foco: Option<String>,
     /// Si está abierto el timeline detallado de un mensaje (modal por Enter).
     pub traza_timeline: bool,
+    /// Índice del peer ENFOCADO en las pantallas Jornada/Trazabilidad/Tareas (por las que se
+    /// cicla con `[`/`]`). Independiente de `seleccion` (que ahí indexa filas de datos, no peers).
+    /// Permite ver la jornada/trazabilidad/tareas de CUALQUIER peer, no solo el de Peers.
+    pub peer_foco: usize,
 }
 
 impl App {
@@ -227,19 +227,32 @@ impl App {
             config,
             config_campo: 0,
             flash: None,
-            traza_foco: None,
             traza_timeline: false,
+            peer_foco: 0,
         }
     }
 
-    /// Resuelve qué peer enfoca la pantalla Trazabilidad: el `traza_foco` explícito si lo hay,
-    /// si no el peer seleccionado en la lista de Peers (default razonable al entrar). `None`
-    /// solo si no hay peers en absoluto.
+    /// Resuelve qué peer enfoca las pantallas Jornada/Trazabilidad/Tareas: el peer en `peer_foco`
+    /// (que se cicla con `[`/`]`), acotado a la lista actual. `None` solo si no hay peers.
     pub fn traza_peer_actual(&self) -> Option<String> {
-        if let Some(id) = &self.traza_foco {
-            return Some(id.clone());
+        if self.datos.peers.is_empty() {
+            return None;
         }
-        self.datos.peers.get(self.seleccion).map(|p| p.id.clone())
+        let idx = self.peer_foco.min(self.datos.peers.len() - 1);
+        self.datos.peers.get(idx).map(|p| p.id.clone())
+    }
+
+    /// Cicla el peer enfocado en Jornada/Trazabilidad/Tareas. `dir`: +1 siguiente, -1 anterior.
+    /// Envuelve en los extremos. Resetea la selección de filas (datos del nuevo peer).
+    pub fn ciclar_peer_foco(&mut self, dir: i32) {
+        let n = self.datos.peers.len();
+        if n == 0 {
+            return;
+        }
+        let actual = self.peer_foco.min(n - 1) as i32;
+        let nuevo = (actual + dir).rem_euclid(n as i32) as usize;
+        self.peer_foco = nuevo;
+        self.seleccion = 0; // las filas son del nuevo peer
     }
 
     /// Mensaje seleccionado en la tabla de Trazabilidad (por la fila `seleccion`).
@@ -467,6 +480,27 @@ mod tests {
         assert_eq!(Pantalla::Alertas.siguiente(), Pantalla::Peers); // da la vuelta
         assert_eq!(Pantalla::Peers.anterior(), Pantalla::Alertas);
         assert_eq!(Pantalla::Acceso.anterior(), Pantalla::Peers);
+    }
+
+    #[test]
+    fn ciclar_peer_foco_envuelve_y_resetea_seleccion() {
+        let mut app = App::nueva(crate::config::Config::default());
+        let mk = |id: &str| Instancia {
+            id: id.into(), pid: 1, directorio: "/x".into(), repo_git: None,
+            repo_github: None, tty: None, resumen: String::new(),
+            registrada_en: String::new(), visto_en: String::new(),
+        };
+        app.datos.peers = vec![mk("a"), mk("b"), mk("c")];
+        app.seleccion = 2;
+        assert_eq!(app.traza_peer_actual().as_deref(), Some("a")); // foco inicial = 0
+        app.ciclar_peer_foco(1);
+        assert_eq!(app.traza_peer_actual().as_deref(), Some("b"));
+        assert_eq!(app.seleccion, 0, "cambiar de peer resetea la selección de filas");
+        app.ciclar_peer_foco(1);
+        app.ciclar_peer_foco(1); // c → vuelve a a (envuelve)
+        assert_eq!(app.traza_peer_actual().as_deref(), Some("a"));
+        app.ciclar_peer_foco(-1); // a → c (envuelve hacia atrás)
+        assert_eq!(app.traza_peer_actual().as_deref(), Some("c"));
     }
 
     #[test]

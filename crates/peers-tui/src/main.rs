@@ -327,6 +327,17 @@ async fn manejar_tecla(
                 app.seleccion = 0;
             }
         }
+        // [ / ] ciclan el PEER enfocado en Jornada/Trazabilidad/Tareas (ver la jornada/
+        // trazabilidad/tareas de CUALQUIER peer, no solo el seleccionado en Peers).
+        KeyCode::Char('[') | KeyCode::Char(']')
+            if matches!(
+                app.pantalla,
+                Pantalla::Jornada | Pantalla::Trazabilidad | Pantalla::Tareas
+            ) =>
+        {
+            let dir = if tecla.code == KeyCode::Char(']') { 1 } else { -1 };
+            app.ciclar_peer_foco(dir);
+        }
         KeyCode::Down | KeyCode::Char('j') => match app.pantalla {
             Pantalla::Peers => app.seleccion_abajo(app.datos.peers.len()),
             Pantalla::Redis => {

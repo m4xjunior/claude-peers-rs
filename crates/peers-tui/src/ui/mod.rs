@@ -108,9 +108,9 @@ fn dibujar_ayuda(f: &mut Frame, area: Rect, app: &App) {
         Pantalla::Redis => "↑↓ mover · p purgar cola",
         Pantalla::Broker => "(solo lectura)",
         Pantalla::Config => "e editar campo activo · ↑↓ campo · s guardar",
-        Pantalla::Trazabilidad => "↑↓ mover · Enter timeline · r reenviar",
-        Pantalla::Jornada => "(solo lectura — fichaje del peer seleccionado en Peers)",
-        Pantalla::Tareas => "↑↓ mover · (solo lectura — peer seleccionado en Peers)",
+        Pantalla::Trazabilidad => "[ ] cambiar peer · ↑↓ mover · Enter timeline · r reenviar",
+        Pantalla::Jornada => "[ ] cambiar peer · (solo lectura — fichaje)",
+        Pantalla::Tareas => "[ ] cambiar peer · ↑↓ mover · (estimado vs real)",
         Pantalla::Alertas => "↑↓ mover · (solo lectura)",
     };
     let linea = Line::from(vec![
