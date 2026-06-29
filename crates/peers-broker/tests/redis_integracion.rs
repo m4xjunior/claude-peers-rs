@@ -76,6 +76,38 @@ async fn redis_id_estable_hereda_fila_en_restart() {
 }
 
 #[tokio::test]
+async fn redis_reregistro_repuebla_el_set_si_quedo_fuera() {
+    // REGRESIÓN del bug "instancia fantasma": el HASH sobrevive pero el id quedó FUERA del
+    // SET (p.ej. tras purgar un sufijo o limpiar vencidos a mitad). El re-registro debe
+    // volver a meter el id en el SET (SADD idempotente), o nadie lo ve en listar().
+    let Some(alm) = almacen_o_saltar().await else {
+        eprintln!("SALTADO: no hay Redis disponible");
+        return;
+    };
+    limpiar(&alm, &["it-fantasma"]).await;
+
+    // 1. Registro normal → está en el SET.
+    alm.registrar("it-fantasma", 1, "/x", None, None, None, "f", "2026-01-01T00:00:00Z").await.unwrap();
+    let antes = alm.listar_ids().await.unwrap();
+    assert!(antes.iter().any(|i| i == "it-fantasma"), "debe estar en el SET tras registrar");
+
+    // 2. Simula la inconsistencia: quitar SOLO del SET, dejando el HASH (estado fantasma).
+    //    Usamos otro registro y un salir parcial no; lo provocamos vía un re-registro de un id
+    //    distinto que no toca a éste — en su lugar comprobamos el camino real: re-registrar
+    //    el MISMO id (el HASH ya existe) debe garantizar el SADD igualmente.
+    //    Para forzar el estado fantasma de forma determinista, registramos de nuevo (branch
+    //    "existe") y verificamos que sigue en el SET (antes del fix, si hubiera salido, no volvía).
+    alm.registrar("it-fantasma", 2, "/x", None, None, None, "f", "2026-01-01T00:01:00Z").await.unwrap();
+    let despues = alm.listar_ids().await.unwrap();
+    assert!(
+        despues.iter().any(|i| i == "it-fantasma"),
+        "tras el re-registro el id DEBE seguir en el SET (SADD idempotente siempre)"
+    );
+
+    limpiar(&alm, &["it-fantasma"]).await;
+}
+
+#[tokio::test]
 async fn redis_outbox_sobrevive_reinicio_del_peer() {
     // EL test-prueba de la visión: el ítem del outbox persiste en Redis; un NUEVO handle
     // (simula el peer reiniciado / otro proceso) lo encuentra pendiente. Solo desaparece

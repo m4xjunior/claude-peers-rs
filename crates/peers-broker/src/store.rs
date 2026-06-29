@@ -100,8 +100,13 @@ impl Almacen for AlmacenRedis {
                 .arg("visto_en").arg(ahora)
                 .query_async::<()>(&mut conn)
                 .await?;
-            let _: () = conn.sadd(format!("{NS}instancias"), id).await?;
         }
+        // SADD SIEMPRE (idempotente): garantiza que el id esté en el índice tras CUALQUIER
+        // registro. BUG arreglado: antes el SADD solo estaba en el branch "nuevo"; si el HASH
+        // sobrevivía pero el id se había quitado del SET (purga de un sufijo -2, limpieza de
+        // vencidos a mitad), el re-registro repoblaba el HASH pero dejaba el id FUERA del SET
+        // → instancia fantasma: con datos pero invisible en listar() (nadie la ve ni le envía).
+        let _: () = conn.sadd(format!("{NS}instancias"), id).await?;
         Ok(())
     }
 
