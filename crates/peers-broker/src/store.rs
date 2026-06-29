@@ -135,6 +135,32 @@ impl Almacen for AlmacenRedis {
         Ok(n)
     }
 
+    async fn listar_ids(&self) -> anyhow::Result<Vec<String>> {
+        let mut conn = self.conn().await?;
+        // Estado crudo del almacén (sin filtro de liveness): el panel de admin los quiere
+        // todos. Orden estable para que la TUI no "salte" filas entre refrescos.
+        let mut ids: Vec<String> = conn.smembers(format!("{NS}instancias")).await?;
+        ids.sort();
+        Ok(ids)
+    }
+
+    async fn contar_mensajes_pendientes(&self, id: &str) -> anyhow::Result<usize> {
+        let mut conn = self.conn().await?;
+        // LLEN no drena: solo cuenta. La fila de mensajes es FIFO y todos sus ítems están
+        // pendientes hasta que recibir_mensajes la vacía de golpe.
+        let n: usize = conn.llen(k_mensajes(id)).await?;
+        Ok(n)
+    }
+
+    async fn purgar(&self, id: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn().await?;
+        // DEL es idempotente (borra 0 o más claves). Solo toca las colas de ESTE id; no
+        // da de baja la instancia ni borra su jornada.
+        let _: () = conn.del(k_mensajes(id)).await?;
+        let _: () = conn.del(k_outbox(id)).await?;
+        Ok(())
+    }
+
     async fn instancia_obtener(&self, id: &str) -> anyhow::Result<Option<Instancia>> {
         let mut conn = self.conn().await?;
         leer_instancia(&mut conn, id).await

@@ -28,10 +28,11 @@ use axum::{
 use clap::Parser;
 use github::GitHub;
 use peers_core::{
-    Almacen, PeticionAbrirTarea, PeticionCerrarTarea, PeticionDefinirResumen, PeticionEnviar,
-    PeticionJornada, PeticionLatido, PeticionListar, PeticionRecibir, PeticionRegistrar,
-    PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea, RespuestaEnviar, RespuestaJornada,
-    RespuestaOk, RespuestaRegistrar, RespuestaSalud, PUERTO_DEFECTO, VENCIMIENTO_MS,
+    Almacen, ColaResumen, PeticionAbrirTarea, PeticionCerrarTarea, PeticionDefinirResumen,
+    PeticionEnviar, PeticionJornada, PeticionLatido, PeticionListar, PeticionPurgar,
+    PeticionRecibir, PeticionRegistrar, PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea,
+    RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar, RespuestaJornada, RespuestaOk,
+    RespuestaRegistrar, RespuestaSalud, PUERTO_DEFECTO, VENCIMIENTO_MS,
 };
 use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -75,10 +76,13 @@ impl std::fmt::Debug for Args {
     }
 }
 
-/// Estado de la aplicación: el almacén (tras el trait) y el cliente GitHub opcional.
+/// Estado de la aplicación: el almacén (tras el trait), el cliente GitHub opcional y los
+/// datos de escucha (host/puerto) que el panel de admin reporta en /admin/info.
 struct EstadoApp {
     almacen: Arc<dyn Almacen>,
     github: Option<GitHub>,
+    host: String,
+    puerto: u16,
 }
 
 type Estado = Arc<EstadoApp>;
@@ -446,6 +450,55 @@ async fn jornada_consolidada(
     Ok(Json(jornada::consolidar(&e.almacen, &p.instancia_id).await?))
 }
 
+// --- Handlers de admin (panel TUI: pantallas Peers/Redis/Broker) ---
+//
+// Todos cuelgan de `rutas_protegidas` → exigen el token (X-Peers-Token) igual que el resto;
+// nunca van en /salud. Son introspección de SOLO LECTURA salvo /admin/purgar (mantenimiento
+// explícito). version = la del propio crate del broker en compilación.
+
+/// `GET /admin/info` → { host, puerto, instancias, version }.
+async fn admin_info(State(e): State<Estado>) -> Result<Json<RespuestaAdminInfo>, ErrorApp> {
+    Ok(Json(RespuestaAdminInfo {
+        host: e.host.clone(),
+        puerto: e.puerto,
+        instancias: e.almacen.contar_instancias().await?,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }))
+}
+
+/// `GET /admin/redis` → resumen de colas y outbox por instancia. SOLO LECTURA: usa
+/// `contar_mensajes_pendientes` (LLEN) y `outbox_pendientes(..).len()`, nunca drena.
+async fn admin_redis(State(e): State<Estado>) -> Result<Json<RespuestaAdminRedis>, ErrorApp> {
+    let ids = e.almacen.listar_ids().await?;
+    let mut colas = Vec::with_capacity(ids.len());
+    let mut outbox = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let pendientes_msg = e.almacen.contar_mensajes_pendientes(id).await?;
+        if pendientes_msg > 0 {
+            colas.push(ColaResumen { id: id.clone(), pendientes: pendientes_msg });
+        }
+        let pendientes_ob = e.almacen.outbox_pendientes(id).await?.len();
+        if pendientes_ob > 0 {
+            outbox.push(ColaResumen { id: id.clone(), pendientes: pendientes_ob });
+        }
+    }
+    Ok(Json(RespuestaAdminRedis {
+        total_instancias: ids.len(),
+        colas,
+        outbox,
+    }))
+}
+
+/// `POST /admin/purgar` { id } → borra cola de mensajes + outbox de ese id. Idempotente.
+async fn admin_purgar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionPurgar>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    e.almacen.purgar(&p.id).await?;
+    info!("admin: purgada la cola y outbox de '{}'", p.id);
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -476,7 +529,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let estado: Estado = Arc::new(EstadoApp { almacen, github });
+    let estado: Estado = Arc::new(EstadoApp {
+        almacen,
+        github,
+        host: args.host.clone(),
+        puerto: args.puerto,
+    });
 
     // Limpieza periódica por latido (cada 30s).
     let limpieza = estado.clone();
@@ -513,6 +571,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/tarea/reportar", post(tarea_reportar))
         .route("/tarea/cerrar", post(tarea_cerrar))
         .route("/jornada", post(jornada_consolidada))
+        // Admin (panel TUI): introspección protegida por el mismo token, nunca en /salud.
+        .route("/admin/info", get(admin_info))
+        .route("/admin/redis", get(admin_redis))
+        .route("/admin/purgar", post(admin_purgar))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));
 
     let app = Router::new()

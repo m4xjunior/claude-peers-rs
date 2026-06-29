@@ -122,6 +122,35 @@ impl Almacen for AlmacenSqlite {
             .unwrap_or(0) as usize)
     }
 
+    async fn listar_ids(&self) -> anyhow::Result<Vec<String>> {
+        let conexion = self.bloquear();
+        // Estado crudo (sin liveness): el panel de admin los quiere todos. Orden estable.
+        let mut stmt = conexion.prepare("SELECT id FROM instancias ORDER BY id ASC")?;
+        let filas = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(filas.filter_map(Result::ok).collect())
+    }
+
+    async fn contar_mensajes_pendientes(&self, id: &str) -> anyhow::Result<usize> {
+        // SOLO LECTURA: COUNT no consume (recibir_mensajes sí marca entregado=1).
+        Ok(self
+            .bloquear()
+            .query_row(
+                "SELECT COUNT(*) FROM mensajes WHERE para_id=?1 AND entregado=0",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as usize)
+    }
+
+    async fn purgar(&self, id: &str) -> anyhow::Result<()> {
+        let conexion = self.bloquear();
+        // Borra la cola de mensajes y el outbox de ESTE destinatario. No da de baja la
+        // instancia ni toca su jornada. Idempotente (borra 0 o más filas).
+        conexion.execute("DELETE FROM mensajes WHERE para_id=?1", params![id])?;
+        conexion.execute("DELETE FROM outbox WHERE para_id=?1", params![id])?;
+        Ok(())
+    }
+
     async fn instancia_obtener(&self, id: &str) -> anyhow::Result<Option<Instancia>> {
         Ok(self
             .bloquear()

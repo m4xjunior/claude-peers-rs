@@ -37,6 +37,22 @@ pub trait Almacen: Send + Sync {
     async fn instancia_existe(&self, id: &str) -> anyhow::Result<bool>;
     async fn contar_instancias(&self) -> anyhow::Result<usize>;
 
+    // --- Admin / introspección (SOLO LECTURA salvo `purgar`) ---
+
+    /// Lista TODOS los ids registrados (sin filtro de liveness ni alcance). Lo usa el panel
+    /// de admin (TUI) para enumerar colas y outbox por instancia. A diferencia de `listar`,
+    /// no descarta vencidas: el admin quiere ver el estado crudo del almacén.
+    async fn listar_ids(&self) -> anyhow::Result<Vec<String>>;
+
+    /// Cuenta los mensajes pendientes (fila FIFO) de `id` SIN drenarlos. Es de SOLO LECTURA
+    /// (a diferencia de `recibir_mensajes`, que consume): el panel de admin solo observa.
+    /// Redis: LLEN cprs:mensajes:{id}. SQLite: COUNT(*) WHERE para_id=id AND entregado=0.
+    async fn contar_mensajes_pendientes(&self, id: &str) -> anyhow::Result<usize>;
+
+    /// Purga la fila de mensajes y el outbox de `id` (DEL/DELETE). Operación de admin
+    /// explícita (la TUI la dispara desde la pantalla Redis). Idempotente.
+    async fn purgar(&self, id: &str) -> anyhow::Result<()>;
+
     /// Lee una instancia por id (sin filtro de liveness). None si no existe.
     /// Lo usa el broker para resolver el repo_github de la instancia dueña de una tarea
     /// y abrir la issue en ESE repo (dinámico).

@@ -239,3 +239,43 @@ pub struct RespuestaJornada {
     pub sesiones: Vec<Sesion>,
     pub tareas: Vec<Tarea>,
 }
+
+// ===========================================================================
+// ADMIN — introspección del broker para la TUI (pantallas Peers/Redis/Broker).
+// Todos los endpoints viven bajo el middleware de token (no en /salud).
+// ===========================================================================
+
+/// `GET /admin/info`. Datos de arranque del broker para la pantalla "Broker" de la TUI.
+/// host/puerto vienen de la config del broker; `version` es env!("CARGO_PKG_VERSION").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RespuestaAdminInfo {
+    pub host: String,
+    pub puerto: u16,
+    pub instancias: usize,
+    pub version: String,
+}
+
+/// Una cola (de mensajes o de outbox) con su número de ítems pendientes, por instancia.
+/// Es el item de las listas de `RespuestaAdminRedis`. SOLO LECTURA: nunca drena.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColaResumen {
+    pub id: String,
+    pub pendientes: usize,
+}
+
+/// `GET /admin/redis`. Resumen del estado del almacén para la pantalla "Redis" de la TUI:
+/// total de instancias y, por cada una, cuántos mensajes y cuántos ítems de outbox tiene
+/// pendientes. Construido con métodos de SOLO LECTURA (no consume colas).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RespuestaAdminRedis {
+    pub total_instancias: usize,
+    pub colas: Vec<ColaResumen>,
+    pub outbox: Vec<ColaResumen>,
+}
+
+/// `POST /admin/purgar`. Borra la cola de mensajes y el outbox de `id`. La TUI la dispara
+/// desde la pantalla Redis como acción explícita de mantenimiento.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionPurgar {
+    pub id: String,
+}

@@ -1,0 +1,28 @@
+[package]
+name = "peers-tui"
+version = "0.1.0"
+edition = "2021"
+
+# TUI de control de la red claude-peers. Habla con el broker SOLO por HTTP (reusa el patrón
+# de peers-client/src/broker.rs: un cliente reqwest que inyecta X-Peers-Token). NUNCA toca
+# Redis directo — toda introspección pasa por los endpoints /admin/* del broker.
+
+[[bin]]
+name = "peers-tui"
+path = "src/main.rs"
+
+[dependencies]
+peers-core = { path = "../peers-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# reqwest con rustls (sin OpenSSL nativo) — mismo criterio que peers-client.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# TUI: ratatui + crossterm (versiones fijadas a lo que resuelve Cargo.lock).
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+# Config en ~/.config/claude-peers/config.toml.
+toml = "1"
+# Localización del home/config dir multiplataforma.
+dirs = "6"

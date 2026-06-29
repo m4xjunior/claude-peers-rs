@@ -7,6 +7,7 @@ members = [
     "crates/peers-core",
     "crates/peers-broker",
     "crates/peers-client",
+    "crates/peers-tui",
 ]
 
 # Dependencias compartidas centralizadas — una sola fuente de versiones para los 3 crates.
