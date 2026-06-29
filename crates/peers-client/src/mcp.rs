@@ -39,23 +39,35 @@ impl SalidaMcp {
     }
 
     /// Serializa un valor JSON a una sola línea y lo vuelca a stdout con flush inmediato.
-    pub async fn enviar_json(&self, v: &Value) {
+    ///
+    /// Devuelve `true` solo si la línea completa (incluido el `\n` de framing) llegó a stdout
+    /// y el `flush().await` tuvo éxito real. Antes el flush se ignoraba con `let _`; ahora el
+    /// éxito se propaga para que la confirmación de entrega NO sea fire-and-forget ciega (R1.4):
+    /// si stdout está cerrado o roto, el llamador se entera y NO confirma el mensaje.
+    pub async fn enviar_json(&self, v: &Value) -> bool {
         // serde_json::to_string nunca produce newlines embebidos en strings (los escapa),
         // así que es seguro para el framing por línea del transporte stdio.
         let linea = match serde_json::to_string(v) {
             Ok(s) => s,
             Err(e) => {
                 error!("no se pudo serializar mensaje MCP: {e}");
-                return;
+                return false;
             }
         };
         let mut w = self.writer.lock().await;
         if let Err(e) = w.write_all(linea.as_bytes()).await {
             error!("fallo escribiendo a stdout: {e}");
-            return;
+            return false;
         }
-        let _ = w.write_all(b"\n").await;
-        let _ = w.flush().await;
+        if let Err(e) = w.write_all(b"\n").await {
+            error!("fallo escribiendo el salto de línea a stdout: {e}");
+            return false;
+        }
+        if let Err(e) = w.flush().await {
+            error!("fallo en flush de stdout: {e}");
+            return false;
+        }
+        true
     }
 
     /// Empuja un mensaje entrante a la sesión como notificación de canal.
@@ -65,6 +77,9 @@ impl SalidaMcp {
     /// bloque <channel source=...> son fijas y en inglés: from_id, from_summary, from_cwd,
     /// sent_at. El `content` lleva el texto plano del mensaje. Todo lo demás del proyecto
     /// es español; estas 4 claves son la interfaz con el harness y se respetan tal cual.
+    ///
+    /// Devuelve `true` si el push llegó a stdout (flush real OK). El llamador usa ese booleano
+    /// para decidir si confirma la entrega al broker (R1.4): solo se confirma si el flush triunfó.
     pub async fn empujar_canal(
         &self,
         texto: &str,
@@ -72,7 +87,7 @@ impl SalidaMcp {
         de_resumen: &str,
         de_directorio: &str,
         enviado_en: &str,
-    ) {
+    ) -> bool {
         let notif = json!({
             "jsonrpc": "2.0",
             "method": "notifications/claude/channel",
@@ -86,7 +101,7 @@ impl SalidaMcp {
                 }
             }
         });
-        self.enviar_json(&notif).await;
+        self.enviar_json(&notif).await
     }
 }
 

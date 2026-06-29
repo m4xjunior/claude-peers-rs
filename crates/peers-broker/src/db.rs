@@ -6,9 +6,56 @@
 //! `Mutex` (bloqueo breve, sin pool). Es la opción para "1 binario y corre, sin Redis".
 
 use async_trait::async_trait;
-use peers_core::{Alcance, Almacen, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
+use peers_core::{Alcance, Almacen, EstadoMensaje, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
+
+/// Serializa un `EstadoMensaje` a su forma textual (lowercase) para la columna `estado`.
+fn estado_a_texto(e: EstadoMensaje) -> &'static str {
+    match e {
+        EstadoMensaje::Enviado => "enviado",
+        EstadoMensaje::Entregado => "entregado",
+        EstadoMensaje::Leido => "leido",
+        EstadoMensaje::Procesado => "procesado",
+        EstadoMensaje::Fallido => "fallido",
+        EstadoMensaje::DeadLetter => "deadletter",
+    }
+}
+
+/// Parsea la columna `estado` a `EstadoMensaje` (cae a `Enviado` si es desconocida).
+fn texto_a_estado(s: &str) -> EstadoMensaje {
+    match s {
+        "entregado" => EstadoMensaje::Entregado,
+        "leido" => EstadoMensaje::Leido,
+        "procesado" => EstadoMensaje::Procesado,
+        "fallido" => EstadoMensaje::Fallido,
+        "deadletter" => EstadoMensaje::DeadLetter,
+        _ => EstadoMensaje::Enviado,
+    }
+}
+
+/// Reconstruye un Mensaje desde una fila con el orden de columnas:
+/// id, de_id, para_id, texto, enviado_en, estado, entregado_en, leido_en, procesado_en,
+/// intentos, reenviado_de, reenvios.
+fn fila_a_mensaje(f: &rusqlite::Row<'_>) -> rusqlite::Result<Mensaje> {
+    Ok(Mensaje {
+        id: f.get(0)?,
+        de_id: f.get(1)?,
+        para_id: f.get(2)?,
+        texto: f.get(3)?,
+        enviado_en: f.get(4)?,
+        estado: texto_a_estado(&f.get::<_, String>(5)?),
+        entregado_en: f.get(6)?,
+        leido_en: f.get(7)?,
+        procesado_en: f.get(8)?,
+        intentos: f.get::<_, i64>(9)? as u32,
+        reenviado_de: f.get::<_, Option<i64>>(10)?,
+        reenvios: f.get::<_, i64>(11)? as u32,
+    })
+}
+
+/// Columnas del SELECT de mensajes en el orden que espera `fila_a_mensaje`.
+const COLS_MSG: &str = "id,de_id,para_id,texto,enviado_en,estado,entregado_en,leido_en,procesado_en,intentos,reenviado_de,reenvios";
 
 pub struct AlmacenSqlite {
     conexion: Mutex<Connection>,
@@ -30,8 +77,13 @@ impl AlmacenSqlite {
             );
             CREATE TABLE IF NOT EXISTS mensajes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, de_id TEXT NOT NULL, para_id TEXT NOT NULL,
-                texto TEXT NOT NULL, enviado_en TEXT NOT NULL, entregado INTEGER NOT NULL DEFAULT 0
+                texto TEXT NOT NULL, enviado_en TEXT NOT NULL,
+                estado TEXT NOT NULL DEFAULT 'enviado',
+                entregado_en TEXT, leido_en TEXT, procesado_en TEXT,
+                intentos INTEGER NOT NULL DEFAULT 0,
+                reenviado_de INTEGER, reenvios INTEGER NOT NULL DEFAULT 0
             );
+            CREATE INDEX IF NOT EXISTS idx_mensajes_para ON mensajes(para_id, id);
             CREATE TABLE IF NOT EXISTS outbox (
                 id TEXT PRIMARY KEY, para_id TEXT NOT NULL, texto TEXT NOT NULL,
                 creado_en TEXT NOT NULL, confirmado INTEGER NOT NULL DEFAULT 0
@@ -131,11 +183,12 @@ impl Almacen for AlmacenSqlite {
     }
 
     async fn contar_mensajes_pendientes(&self, id: &str) -> anyhow::Result<usize> {
-        // SOLO LECTURA: COUNT no consume (recibir_mensajes sí marca entregado=1).
+        // SOLO LECTURA: cuenta la bandeja ACTIVA (estado no terminal). Los Procesado/DeadLetter
+        // siguen en la tabla (historial durable) pero ya NO están activos.
         Ok(self
             .bloquear()
             .query_row(
-                "SELECT COUNT(*) FROM mensajes WHERE para_id=?1 AND entregado=0",
+                "SELECT COUNT(*) FROM mensajes WHERE para_id=?1 AND estado NOT IN ('procesado','deadletter')",
                 params![id],
                 |r| r.get::<_, i64>(0),
             )
@@ -144,8 +197,8 @@ impl Almacen for AlmacenSqlite {
 
     async fn purgar(&self, id: &str) -> anyhow::Result<()> {
         let conexion = self.bloquear();
-        // Borra la cola de mensajes y el outbox de ESTE destinatario. No da de baja la
-        // instancia ni toca su jornada. Idempotente (borra 0 o más filas).
+        // Borra los mensajes (bandeja + historial, misma tabla) y el outbox de ESTE
+        // destinatario. No da de baja la instancia ni toca su jornada. Idempotente.
         conexion.execute("DELETE FROM mensajes WHERE para_id=?1", params![id])?;
         conexion.execute("DELETE FROM outbox WHERE para_id=?1", params![id])?;
         Ok(())
@@ -208,40 +261,140 @@ impl Almacen for AlmacenSqlite {
         ahora: &str,
     ) -> anyhow::Result<()> {
         self.bloquear().execute(
-            "INSERT INTO mensajes (de_id,para_id,texto,enviado_en,entregado) VALUES (?1,?2,?3,?4,0)",
+            "INSERT INTO mensajes (de_id,para_id,texto,enviado_en,estado) VALUES (?1,?2,?3,?4,'enviado')",
             params![de_id, para_id, texto, ahora],
         )?;
         Ok(())
     }
 
     async fn recibir_mensajes(&self, id: &str) -> anyhow::Result<Vec<Mensaje>> {
-        let mut conexion = self.bloquear();
-        let tx = conexion.transaction()?;
-        let mut msgs = Vec::new();
-        {
-            let mut stmt = tx.prepare(
-                "SELECT id,de_id,para_id,texto,enviado_en,entregado FROM mensajes
-                 WHERE para_id=?1 AND entregado=0 ORDER BY enviado_en ASC, id ASC",
-            )?;
-            let filas = stmt.query_map(params![id], |f| {
-                Ok(Mensaje {
-                    id: f.get(0)?,
-                    de_id: f.get(1)?,
-                    para_id: f.get(2)?,
-                    texto: f.get(3)?,
-                    enviado_en: f.get(4)?,
-                    entregado: f.get::<_, i64>(5)? != 0,
-                })
-            })?;
-            for m in filas {
-                msgs.push(m?);
+        // PEEK no-destructivo (R1.1): la bandeja ACTIVA son los mensajes no terminales.
+        // NO se marca ni se borra nada aquí; las transiciones las hace transicionar_mensaje.
+        let conexion = self.bloquear();
+        let sql = format!(
+            "SELECT {COLS_MSG} FROM mensajes
+             WHERE para_id=?1 AND estado NOT IN ('procesado','deadletter')
+             ORDER BY id ASC"
+        );
+        let mut stmt = conexion.prepare(&sql)?;
+        let filas = stmt.query_map(params![id], fila_a_mensaje)?;
+        Ok(filas.filter_map(Result::ok).collect())
+    }
+
+    async fn transicionar_mensaje(
+        &self,
+        msg_id: i64,
+        nuevo: EstadoMensaje,
+        ahora: &str,
+    ) -> anyhow::Result<bool> {
+        let conexion = self.bloquear();
+        // Estado actual (None si no existe el mensaje → no-op).
+        let actual: Option<String> = conexion
+            .query_row("SELECT estado FROM mensajes WHERE id=?1", params![msg_id], |r| r.get(0))
+            .ok();
+        let Some(actual) = actual else {
+            return Ok(false);
+        };
+        let actual = texto_a_estado(&actual);
+        // Monótona: solo avanza si el rango nuevo es estrictamente mayor (idempotente si no).
+        if nuevo.rango() <= actual.rango() {
+            return Ok(false);
+        }
+        // Timbra el campo de tiempo SOLO la primera vez (COALESCE = el HSETNX de SQLite, R1.3).
+        let col_tiempo = match nuevo {
+            EstadoMensaje::Entregado => Some("entregado_en"),
+            EstadoMensaje::Leido => Some("leido_en"),
+            EstadoMensaje::Procesado => Some("procesado_en"),
+            _ => None,
+        };
+        let estado_txt = estado_a_texto(nuevo);
+        match col_tiempo {
+            Some(col) => {
+                // COALESCE preserva el primer timbre si ya existía (idempotencia del tiempo).
+                let sql = format!(
+                    "UPDATE mensajes SET estado=?2, {col}=COALESCE({col}, ?3) WHERE id=?1"
+                );
+                conexion.execute(&sql, params![msg_id, estado_txt, ahora])?;
             }
-            for m in &msgs {
-                tx.execute("UPDATE mensajes SET entregado=1 WHERE id=?1", params![m.id])?;
+            None => {
+                conexion.execute(
+                    "UPDATE mensajes SET estado=?2 WHERE id=?1",
+                    params![msg_id, estado_txt],
+                )?;
             }
         }
-        tx.commit()?;
-        Ok(msgs)
+        Ok(true)
+    }
+
+    async fn historial(
+        &self,
+        id: &str,
+        desde: Option<i64>,
+        estado: Option<EstadoMensaje>,
+    ) -> anyhow::Result<Vec<Mensaje>> {
+        let conexion = self.bloquear();
+        // Historial durable = TODAS las filas de la cola (no se borran al procesar). Filtros
+        // opcionales por cursor (id > desde) y por estado. Vincula los binds dinámicamente.
+        let mut sql = format!("SELECT {COLS_MSG} FROM mensajes WHERE para_id=?1");
+        if desde.is_some() {
+            sql.push_str(" AND id > ?2");
+        }
+        let estado_txt = estado.map(estado_a_texto);
+        if estado_txt.is_some() {
+            // El índice del bind depende de si hubo `desde`.
+            sql.push_str(if desde.is_some() { " AND estado = ?3" } else { " AND estado = ?2" });
+        }
+        sql.push_str(" ORDER BY id ASC");
+        let mut stmt = conexion.prepare(&sql)?;
+        // Construye los binds en orden.
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(id.to_string())];
+        if let Some(d) = desde {
+            binds.push(Box::new(d));
+        }
+        if let Some(e) = estado_txt {
+            binds.push(Box::new(e.to_string()));
+        }
+        let filas = stmt.query_map(rusqlite::params_from_iter(binds.iter()), fila_a_mensaje)?;
+        Ok(filas.filter_map(Result::ok).collect())
+    }
+
+    async fn mensaje_obtener(&self, msg_id: i64) -> anyhow::Result<Option<Mensaje>> {
+        let conexion = self.bloquear();
+        let sql = format!("SELECT {COLS_MSG} FROM mensajes WHERE id=?1");
+        Ok(conexion.query_row(&sql, params![msg_id], fila_a_mensaje).ok())
+    }
+
+    async fn encolar_reenvio(&self, original: &Mensaje, ahora: &str) -> anyhow::Result<i64> {
+        // Fila NUEVA (id autoincrement fresco) con estado 'enviado' y la traza de reenvío (R2.3).
+        // La bandeja activa y el historial son la misma tabla; al nacer 'enviado' entra a ambas.
+        let reenvios = original.reenvios + 1;
+        let conexion = self.bloquear();
+        conexion.execute(
+            "INSERT INTO mensajes (de_id,para_id,texto,enviado_en,estado,intentos,reenviado_de,reenvios)
+             VALUES (?1,?2,?3,?4,'enviado',0,?5,?6)",
+            params![original.de_id, original.para_id, original.texto, ahora, original.id, reenvios],
+        )?;
+        Ok(conexion.last_insert_rowid())
+    }
+
+    async fn podar_historial(&self, retener: usize) -> anyhow::Result<()> {
+        if retener == 0 {
+            return Ok(());
+        }
+        let conexion = self.bloquear();
+        // Por cada cola (para_id), borra todo lo que NO esté entre los últimos `retener` por id.
+        // Subconsulta: los ids a CONSERVAR son los `retener` más recientes de cada para_id.
+        conexion.execute(
+            "DELETE FROM mensajes WHERE id IN (
+                SELECT id FROM mensajes m
+                WHERE (
+                    SELECT COUNT(*) FROM mensajes m2
+                    WHERE m2.para_id = m.para_id AND m2.id > m.id
+                ) >= ?1
+            )",
+            params![retener as i64],
+        )?;
+        Ok(())
     }
 
     async fn limpiar_vencidas(&self, vencidas_antes: &str) -> anyhow::Result<usize> {
@@ -253,8 +406,12 @@ impl Almacen for AlmacenSqlite {
         };
         for id in &muertas {
             conexion.execute("DELETE FROM instancias WHERE id=?1", params![id])?;
+            // Saca de la bandeja ACTIVA los mensajes aún no procesados de la instancia muerta
+            // (→ deadletter) pero los CONSERVA en la tabla = historial durable (R2.1), en vez
+            // de borrarlos. La poda por retención se ocupa luego del recorte.
             conexion.execute(
-                "DELETE FROM mensajes WHERE para_id=?1 AND entregado=0",
+                "UPDATE mensajes SET estado='deadletter'
+                 WHERE para_id=?1 AND estado NOT IN ('procesado','deadletter')",
                 params![id],
             )?;
         }
@@ -430,12 +587,64 @@ mod pruebas {
     }
 
     #[tokio::test]
-    async fn recibir_no_duplica() {
+    async fn recibir_es_peek_no_destructivo() {
+        // R1.1: recibir NO borra. Dos peeks seguidos devuelven el mismo mensaje. Solo sale de
+        // la bandeja activa al transicionar a Procesado (R1.5), pero queda en historial (R2.1).
         let b = base();
         b.registrar("a", 1, "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
         b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
-        assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 1);
-        assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 0);
+        let primera = b.recibir_mensajes("a").await.unwrap();
+        assert_eq!(primera.len(), 1);
+        assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 1, "peek no consume");
+        let mid = primera[0].id;
+        // Procesado → sale de la bandeja activa.
+        assert!(b.transicionar_mensaje(mid, EstadoMensaje::Procesado, "2026-01-01T00:00:05Z").await.unwrap());
+        assert_eq!(b.recibir_mensajes("a").await.unwrap().len(), 0, "tras Procesado sale de la bandeja");
+        // Pero sigue en el historial durable.
+        let h = b.historial("a", None, None).await.unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].estado, EstadoMensaje::Procesado);
+    }
+
+    #[tokio::test]
+    async fn transicion_idempotente_y_monotona() {
+        // R1.2/R1.3: el timbre del tiempo es solo la primera vez; no retrocede.
+        let b = base();
+        b.registrar("a", 1, "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
+        let mid = b.recibir_mensajes("a").await.unwrap()[0].id;
+        // Primera transición a Entregado → true, timbra entregado_en.
+        assert!(b.transicionar_mensaje(mid, EstadoMensaje::Entregado, "2026-01-01T00:00:02Z").await.unwrap());
+        let m1 = b.mensaje_obtener(mid).await.unwrap().unwrap();
+        assert_eq!(m1.entregado_en.as_deref(), Some("2026-01-01T00:00:02Z"));
+        // Segunda a Entregado → false (idempotente), no re-timbra.
+        assert!(!b.transicionar_mensaje(mid, EstadoMensaje::Entregado, "2026-01-01T09:99:99Z").await.unwrap());
+        let m2 = b.mensaje_obtener(mid).await.unwrap().unwrap();
+        assert_eq!(m2.entregado_en.as_deref(), Some("2026-01-01T00:00:02Z"), "el timbre no cambia");
+        // Retroceder a Enviado → false (no retrocede).
+        assert!(!b.transicionar_mensaje(mid, EstadoMensaje::Enviado, "2026-01-01T00:00:03Z").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn historial_filtra_y_retencion_recorta() {
+        let b = base();
+        b.registrar("a", 1, "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        for i in 0..5 {
+            b.encolar_mensaje("b", "a", &format!("m{i}"), "2026-01-01T00:00:01Z").await.unwrap();
+        }
+        assert_eq!(b.historial("a", None, None).await.unwrap().len(), 5);
+        // Retención a 3 → recorta a los 3 más recientes.
+        b.podar_historial(3).await.unwrap();
+        let h = b.historial("a", None, None).await.unwrap();
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0].texto, "m2");
+        assert_eq!(h[2].texto, "m4");
+        // Filtro por estado.
+        let mid = h[0].id;
+        b.transicionar_mensaje(mid, EstadoMensaje::Procesado, "2026-01-01T00:00:09Z").await.unwrap();
+        let procesados = b.historial("a", None, Some(EstadoMensaje::Procesado)).await.unwrap();
+        assert_eq!(procesados.len(), 1);
+        assert_eq!(procesados[0].id, mid);
     }
 
     #[tokio::test]

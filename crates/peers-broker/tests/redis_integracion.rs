@@ -7,7 +7,7 @@
 //! Se saltan limpiamente si no hay Redis disponible (CLAUDE_PEERS_TEST_REDIS o el local),
 //! para no romper entornos sin Redis.
 
-use peers_core::{Alcance, Almacen, ItemOutbox};
+use peers_core::{Alcance, Almacen, EstadoMensaje, ItemOutbox};
 
 // El módulo store vive en el binario; lo incluimos directamente para testearlo aislado.
 #[path = "../src/store.rs"]
@@ -48,8 +48,11 @@ async fn almacen_o_saltar() -> Option<AlmacenRedis> {
 }
 
 /// Limpia las claves que estos tests usan (ids con prefijo it- para no pisar datos reales).
+/// Da de baja la instancia (DEL+SREM) Y purga su bandeja/historial/outbox para no arrastrar
+/// estado entre corridas (los msg_id van por el contador global cprs:msgseq).
 async fn limpiar(alm: &AlmacenRedis, ids: &[&str]) {
     for id in ids {
+        let _ = alm.purgar(id).await;
         let _ = alm.salir(id).await;
     }
 }
@@ -186,6 +189,72 @@ async fn redis_jornada_timbrada() {
     let (_, tareas) = alm.jornada("it-jor").await.unwrap();
     let t1 = tareas.iter().find(|x| x.id == "it-t1").unwrap();
     assert_eq!(t1.duracion_seg, Some(90), "duración MEDIDA por el broker, no estimada");
+}
+
+#[tokio::test]
+async fn redis_recibir_es_peek_no_destructivo() {
+    // R1.1/AC1: encolar 2, recibir dos veces → ambas devuelven los 2 (no se borran). Tras
+    // transicionar a Procesado, salen de la bandeja activa pero quedan en el historial (R2.1).
+    let Some(alm) = almacen_o_saltar().await else {
+        eprintln!("SALTADO: no hay Redis disponible");
+        return;
+    };
+    limpiar(&alm, &["it-peek", "it-emisor"]).await;
+    alm.registrar("it-peek", 1, "/x", None, None, None, "p", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.encolar_mensaje("it-emisor", "it-peek", "uno", "2026-01-01T00:00:01Z").await.unwrap();
+    alm.encolar_mensaje("it-emisor", "it-peek", "dos", "2026-01-01T00:00:02Z").await.unwrap();
+
+    let p1 = alm.recibir_mensajes("it-peek").await.unwrap();
+    assert_eq!(p1.len(), 2, "primer peek devuelve los 2");
+    let p2 = alm.recibir_mensajes("it-peek").await.unwrap();
+    assert_eq!(p2.len(), 2, "segundo peek NO consume → siguen los 2");
+
+    // Procesa el primero → sale de la bandeja activa, queda en historial.
+    let mid = p1[0].id;
+    assert!(alm.transicionar_mensaje(mid, EstadoMensaje::Procesado, "2026-01-01T00:00:09Z").await.unwrap());
+    assert_eq!(alm.recibir_mensajes("it-peek").await.unwrap().len(), 1, "tras Procesado queda 1 activo");
+    let h = alm.historial("it-peek", None, None).await.unwrap();
+    assert_eq!(h.len(), 2, "el historial retiene ambos aunque uno ya esté Procesado");
+    assert!(h.iter().any(|m| m.id == mid && m.estado == EstadoMensaje::Procesado));
+
+    limpiar(&alm, &["it-peek", "it-emisor"]).await;
+}
+
+#[tokio::test]
+async fn redis_transicion_idempotente_timbra_una_vez() {
+    // R1.3/AC2: transicionar a Entregado dos veces → 2ª devuelve false y entregado_en no cambia.
+    let Some(alm) = almacen_o_saltar().await else {
+        eprintln!("SALTADO: no hay Redis disponible");
+        return;
+    };
+    limpiar(&alm, &["it-idem", "it-emisor"]).await;
+    alm.registrar("it-idem", 1, "/x", None, None, None, "i", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.encolar_mensaje("it-emisor", "it-idem", "uno", "2026-01-01T00:00:01Z").await.unwrap();
+    let mid = alm.recibir_mensajes("it-idem").await.unwrap()[0].id;
+
+    assert!(alm.transicionar_mensaje(mid, EstadoMensaje::Entregado, "2026-01-01T00:00:02Z").await.unwrap());
+    let m1 = alm.mensaje_obtener(mid).await.unwrap().unwrap();
+    assert_eq!(m1.entregado_en.as_deref(), Some("2026-01-01T00:00:02Z"));
+    // Segunda vez → no-op, el timbre se mantiene.
+    assert!(!alm.transicionar_mensaje(mid, EstadoMensaje::Entregado, "2099-01-01T00:00:00Z").await.unwrap());
+    let m2 = alm.mensaje_obtener(mid).await.unwrap().unwrap();
+    assert_eq!(m2.entregado_en.as_deref(), Some("2026-01-01T00:00:02Z"), "el timbre NO se re-escribe");
+    // Avanza a Leido (rango mayor) → true.
+    assert!(alm.transicionar_mensaje(mid, EstadoMensaje::Leido, "2026-01-01T00:00:03Z").await.unwrap());
+    // Retroceder a Enviado → false.
+    assert!(!alm.transicionar_mensaje(mid, EstadoMensaje::Enviado, "2026-01-01T00:00:04Z").await.unwrap());
+
+    limpiar(&alm, &["it-idem", "it-emisor"]).await;
+}
+
+#[tokio::test]
+async fn redis_sin_keys_en_el_store() {
+    // R1.6/AC4: ningún `KEYS` ni `.keys(` debe quedar en el código de producción del store.
+    let fuente = include_str!("../src/store.rs");
+    assert!(
+        !fuente.contains("\"KEYS\"") && !fuente.contains(".keys("),
+        "el store de producción NO debe usar KEYS (O(n) sobre el keyspace)"
+    );
 }
 
 #[tokio::test]

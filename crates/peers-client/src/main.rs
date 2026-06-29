@@ -460,9 +460,19 @@ async fn reintentar_registro(estado: &Arc<EstadoCliente>, id_preferido: Option<S
     }
 }
 
-/// Lanza la tarea de recepción: cada 1s pide mensajes y los empuja como canal.
+/// Lanza la tarea de recepción: cada 1s pide mensajes (peek no-destructivo) y los empuja
+/// como canal UNA sola vez.
+///
+/// INTENCIÓN (R1.3/R1.4): la bandeja del broker ahora es no-destructiva (peek), así que el
+/// mismo `msg_id` reaparece en cada ciclo hasta que se confirma `Procesado`. Para no
+/// re-empujar el mismo mensaje a la sesión en bucle, mantenemos un `HashSet<i64>` de ids ya
+/// empujados (ventana ~RETENCION_HISTORIAL). Solo confirmamos `Leido` al broker si el flush
+/// del push a stdout tuvo éxito real (`empujar_canal == true`); si falló, NO confirmamos y NO
+/// añadimos al set → se reintenta en el próximo ciclo (entrega durable, no fire-and-forget).
 fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
     tokio::spawn(async move {
+        // Ventana de idempotencia en memoria: ids ya empujados a la sesión.
+        let mut empujados: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut intervalo = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             intervalo.tick().await;
@@ -490,16 +500,50 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
                 .unwrap_or_default();
 
             for m in resp.mensajes {
+                // Idempotencia cliente: si ya lo empujamos en esta sesión, lo saltamos
+                // (el peek lo seguirá devolviendo hasta que el broker lo dé por Procesado).
+                if empujados.contains(&m.id) {
+                    continue;
+                }
                 let emisor = instancias.iter().find(|i| i.id == m.de_id);
                 let (resumen, dir) = match emisor {
                     Some(e) => (e.resumen.as_str(), e.directorio.as_str()),
                     None => ("", ""),
                 };
-                estado
+                let ok = estado
                     .salida
                     .empujar_canal(&m.texto, &m.de_id, resumen, dir, &m.enviado_en)
                     .await;
+                if !ok {
+                    // El flush a stdout falló: NO confirmamos ni marcamos como empujado.
+                    // Se reintentará en el próximo ciclo (R1.4).
+                    warn!("flush del push falló para el mensaje {}; se reintentará", m.id);
+                    continue;
+                }
+                empujados.insert(m.id);
                 info!("empujado mensaje de {}: {}", m.de_id, recorte(&m.texto, 80));
+
+                // Confirmamos la cadena completa de estados al broker (cada uno lo timbra con SU
+                // reloj; transicionar_mensaje es monótono e idempotente):
+                //  - Entregado: el flush a stdout tuvo éxito → el mensaje llegó al harness.
+                //  - Leido: la notificación de canal se inyectó → el <channel> se renderizó.
+                // Mandar ambos en orden timbra entregado_en Y leido_en (antes solo se confirmaba
+                // Leido y entregado_en quedaba siempre vacío en el timeline de la TUI).
+                if let Err(e) = estado
+                    .broker
+                    .confirmar(&[m.id], EstadoMensaje::Entregado)
+                    .await
+                {
+                    warn!("no se pudo confirmar Entregado del mensaje {}: {e:#}", m.id);
+                }
+                if let Err(e) = estado.broker.confirmar(&[m.id], EstadoMensaje::Leido).await {
+                    warn!("no se pudo confirmar Leido del mensaje {}: {e:#}", m.id);
+                }
+            }
+
+            // Acotamos la ventana de idempotencia para no crecer sin límite en sesiones largas.
+            if empujados.len() > RETENCION_HISTORIAL {
+                empujados.clear();
             }
         }
     });

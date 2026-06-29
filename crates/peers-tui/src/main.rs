@@ -155,6 +155,32 @@ async fn refrescar(cliente: &ClienteAdmin, app: &mut App) {
                 app.datos.salud = Some(s);
             }
         }
+        Pantalla::Trazabilidad => {
+            // El foco necesita la lista de peers (para resolver el peer seleccionado por
+            // defecto). Pedimos peers primero (barato) y luego el historial del foco.
+            let lp = cliente.listar().await;
+            if let Ok(peers) = &lp {
+                app.datos.peers = peers.clone();
+            }
+            match app.traza_peer_actual() {
+                Some(id) => {
+                    let r = cliente.historial(&id).await;
+                    app.marcar_resultado(&r);
+                    if let Ok(h) = r {
+                        let n = h.len();
+                        app.datos.historial = h;
+                        if app.seleccion >= n {
+                            app.seleccion = n.saturating_sub(1);
+                        }
+                    }
+                }
+                None => {
+                    // Sin peers: el banner refleja el resultado del listar; historial vacío.
+                    app.marcar_resultado(&lp);
+                    app.datos.historial.clear();
+                }
+            }
+        }
         // Acceso y Config son locales (no piden red); aun así verificamos vida del broker
         // para que el banner siga reflejando el estado real.
         Pantalla::Acceso | Pantalla::Config => {
@@ -180,6 +206,17 @@ async fn manejar_tecla(
         return;
     }
 
+    // Con el timeline de Trazabilidad abierto, Esc/Enter solo lo cierran (no salen de la app);
+    // 'r' reenvía el mensaje del timeline; el resto de teclas se ignora hasta cerrarlo.
+    if app.pantalla == Pantalla::Trazabilidad && app.traza_timeline {
+        match tecla.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.traza_timeline = false,
+            KeyCode::Char('r') => reenviar_seleccionado(cliente, app, flash_desde).await,
+            _ => {}
+        }
+        return;
+    }
+
     match tecla.code {
         KeyCode::Char('q') | KeyCode::Esc => app.salir = true,
         KeyCode::Tab => {
@@ -190,7 +227,7 @@ async fn manejar_tecla(
             app.pantalla = app.pantalla.anterior();
             app.seleccion = 0;
         }
-        KeyCode::Char(c @ '1'..='5') => {
+        KeyCode::Char(c @ '1'..='6') => {
             if let Some(p) = Pantalla::desde_tecla(c) {
                 app.pantalla = p;
                 app.seleccion = 0;
@@ -202,6 +239,7 @@ async fn manejar_tecla(
                 let n = app.datos.redis.as_ref().map(|r| r.colas.len()).unwrap_or(0);
                 app.seleccion_abajo(n);
             }
+            Pantalla::Trazabilidad => app.seleccion_abajo(app.datos.historial.len()),
             Pantalla::Config => {
                 app.config_campo = (app.config_campo + 1).min(2);
             }
@@ -275,7 +313,44 @@ async fn manejar_accion(
             Ok(()) => poner_flash(app, flash_desde, "config guardada".to_string()),
             Err(e) => poner_flash(app, flash_desde, format!("error al guardar: {e}")),
         },
+        // --- Trazabilidad ---
+        (Pantalla::Trazabilidad, KeyCode::Enter) => {
+            // Abre el timeline del mensaje seleccionado (si hay alguno).
+            if app.traza_mensaje_seleccionado().is_some() {
+                app.traza_timeline = true;
+            }
+        }
+        (Pantalla::Trazabilidad, KeyCode::Char('r')) => {
+            reenviar_seleccionado(cliente, app, flash_desde).await;
+        }
         _ => {}
+    }
+}
+
+/// Reenvía el mensaje seleccionado en la pantalla Trazabilidad vía `POST /admin/reenviar`.
+/// Maneja los tres desenlaces sin crashear: reenviado (flash con el nuevo id), no-existe
+/// (flash con el motivo), o error de red/401 (banner vía `marcar_resultado`).
+async fn reenviar_seleccionado(
+    cliente: &ClienteAdmin,
+    app: &mut App,
+    flash_desde: &mut Option<Instant>,
+) {
+    let Some(msg_id) = app.traza_mensaje_seleccionado().map(|m| m.id) else {
+        return;
+    };
+    let r = cliente.reenviar(msg_id).await;
+    app.marcar_resultado(&r);
+    match r {
+        Ok(resp) if resp.ok => {
+            let nuevo = resp.msg_id.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
+            poner_flash(app, flash_desde, format!("msg #{msg_id} reenviado → #{nuevo}"));
+        }
+        Ok(resp) => {
+            let motivo = resp.error.unwrap_or_else(|| "no se pudo reenviar".to_string());
+            poner_flash(app, flash_desde, motivo);
+        }
+        // Err ya quedó reflejado en el banner por `marcar_resultado`.
+        Err(_) => {}
     }
 }
 

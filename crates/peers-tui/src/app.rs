@@ -3,9 +3,11 @@
 //! navegación de selección) — testeable sin terminal ni red.
 
 use crate::cliente::ErrorBroker;
-use peers_core::{Instancia, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaSalud};
+use peers_core::{
+    EstadoMensaje, Instancia, Mensaje, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaSalud,
+};
 
-/// Las 5 pantallas del panel, conmutables con Tab o las teclas 1-5.
+/// Las 6 pantallas del panel, conmutables con Tab o las teclas 1-6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pantalla {
     Peers,
@@ -13,16 +15,18 @@ pub enum Pantalla {
     Redis,
     Broker,
     Config,
+    Trazabilidad,
 }
 
 impl Pantalla {
     /// Orden de ciclo para Tab (y Shift-Tab al revés).
-    pub const TODAS: [Pantalla; 5] = [
+    pub const TODAS: [Pantalla; 6] = [
         Pantalla::Peers,
         Pantalla::Acceso,
         Pantalla::Redis,
         Pantalla::Broker,
         Pantalla::Config,
+        Pantalla::Trazabilidad,
     ];
 
     pub fn titulo(self) -> &'static str {
@@ -32,6 +36,7 @@ impl Pantalla {
             Pantalla::Redis => "3 Redis",
             Pantalla::Broker => "4 Broker",
             Pantalla::Config => "5 Config",
+            Pantalla::Trazabilidad => "6 Trazabilidad",
         }
     }
 
@@ -61,6 +66,7 @@ impl Pantalla {
             '3' => Some(Pantalla::Redis),
             '4' => Some(Pantalla::Broker),
             '5' => Some(Pantalla::Config),
+            '6' => Some(Pantalla::Trazabilidad),
             _ => None,
         }
     }
@@ -121,6 +127,10 @@ pub struct Datos {
     pub redis: Option<RespuestaAdminRedis>,
     pub info: Option<RespuestaAdminInfo>,
     pub salud: Option<RespuestaSalud>,
+    /// Historial durable del peer enfocado en la pantalla Trazabilidad (orden cronológico
+    /// ascendente, tal como lo devuelve `GET /admin/historial`). Vacío si no hay foco o si
+    /// el peer no tiene mensajes.
+    pub historial: Vec<Mensaje>,
 }
 
 /// Estado completo de la aplicación.
@@ -141,6 +151,12 @@ pub struct App {
     pub config_campo: usize,
     /// Mensaje efímero de estado (ej. "mensaje enviado", "config guardada").
     pub flash: Option<String>,
+    /// Id del peer cuyo historial se muestra en la pantalla Trazabilidad. Si es `None`,
+    /// se usa el peer seleccionado en la pantalla Peers como foco por defecto. La pantalla
+    /// solo pide `/admin/historial` cuando hay un foco resuelto.
+    pub traza_foco: Option<String>,
+    /// Si está abierto el timeline detallado de un mensaje (modal por Enter).
+    pub traza_timeline: bool,
 }
 
 impl App {
@@ -156,7 +172,24 @@ impl App {
             config,
             config_campo: 0,
             flash: None,
+            traza_foco: None,
+            traza_timeline: false,
         }
+    }
+
+    /// Resuelve qué peer enfoca la pantalla Trazabilidad: el `traza_foco` explícito si lo hay,
+    /// si no el peer seleccionado en la lista de Peers (default razonable al entrar). `None`
+    /// solo si no hay peers en absoluto.
+    pub fn traza_peer_actual(&self) -> Option<String> {
+        if let Some(id) = &self.traza_foco {
+            return Some(id.clone());
+        }
+        self.datos.peers.get(self.seleccion).map(|p| p.id.clone())
+    }
+
+    /// Mensaje seleccionado en la tabla de Trazabilidad (por la fila `seleccion`).
+    pub fn traza_mensaje_seleccionado(&self) -> Option<&Mensaje> {
+        self.datos.historial.get(self.seleccion)
     }
 
     /// Aplica el resultado de la última petición al estado de red (banner).
@@ -240,6 +273,33 @@ pub fn hora_iso(iso: &str) -> String {
     iso.to_string()
 }
 
+/// Símbolo + color de un estado para la columna "estado" de la pantalla Trazabilidad.
+/// Mapeo (spec R2.4): ○ enviado/gris, ◑ entregado-leído/amarillo, ● procesado/verde,
+/// ✕ fallido-deadletter/rojo. Función pura — testeada.
+pub fn estilo_estado(estado: EstadoMensaje) -> (&'static str, ratatui::style::Color) {
+    use ratatui::style::Color;
+    match estado {
+        EstadoMensaje::Enviado => ("○ enviado", Color::Gray),
+        EstadoMensaje::Entregado => ("◑ entregado", Color::Yellow),
+        EstadoMensaje::Leido => ("◑ leído", Color::Yellow),
+        EstadoMensaje::Procesado => ("● procesado", Color::Green),
+        EstadoMensaje::Fallido => ("✕ fallido", Color::Red),
+        EstadoMensaje::DeadLetter => ("✕ dead-letter", Color::Red),
+    }
+}
+
+/// Construye las 4 celdas de una fila de la tabla Trazabilidad: `id` (msg), `de_id`,
+/// texto recortado y hora ISO del envío. El estado se pinta aparte (coloreado) con
+/// `estilo_estado`. Función pura — testeada.
+pub fn fila_traza(m: &Mensaje) -> [String; 4] {
+    [
+        m.id.to_string(),
+        recortar(&m.de_id, 14),
+        recortar(&m.texto, 40),
+        hora_iso(&m.enviado_en),
+    ]
+}
+
 /// Construye las 4 celdas (id, dir, resumen, visto) de una fila de la tabla Peers, ya recortadas
 /// a anchos sensatos. Función pura — testeada (formato de filas).
 pub fn fila_peer(i: &Instancia) -> [String; 4] {
@@ -258,8 +318,9 @@ mod tests {
     #[test]
     fn ciclo_de_pantallas_tab() {
         assert_eq!(Pantalla::Peers.siguiente(), Pantalla::Acceso);
-        assert_eq!(Pantalla::Config.siguiente(), Pantalla::Peers); // da la vuelta
-        assert_eq!(Pantalla::Peers.anterior(), Pantalla::Config);
+        assert_eq!(Pantalla::Config.siguiente(), Pantalla::Trazabilidad);
+        assert_eq!(Pantalla::Trazabilidad.siguiente(), Pantalla::Peers); // da la vuelta
+        assert_eq!(Pantalla::Peers.anterior(), Pantalla::Trazabilidad);
         assert_eq!(Pantalla::Acceso.anterior(), Pantalla::Peers);
     }
 
@@ -267,7 +328,63 @@ mod tests {
     fn teclas_numericas() {
         assert_eq!(Pantalla::desde_tecla('3'), Some(Pantalla::Redis));
         assert_eq!(Pantalla::desde_tecla('5'), Some(Pantalla::Config));
+        assert_eq!(Pantalla::desde_tecla('6'), Some(Pantalla::Trazabilidad));
         assert_eq!(Pantalla::desde_tecla('9'), None);
+    }
+
+    #[test]
+    fn estilo_estado_mapea_simbolo_y_color() {
+        use ratatui::style::Color;
+        assert_eq!(estilo_estado(EstadoMensaje::Enviado), ("○ enviado", Color::Gray));
+        assert_eq!(estilo_estado(EstadoMensaje::Entregado).1, Color::Yellow);
+        assert_eq!(estilo_estado(EstadoMensaje::Leido).1, Color::Yellow);
+        assert_eq!(estilo_estado(EstadoMensaje::Procesado), ("● procesado", Color::Green));
+        assert_eq!(estilo_estado(EstadoMensaje::Fallido).1, Color::Red);
+        assert_eq!(estilo_estado(EstadoMensaje::DeadLetter).1, Color::Red);
+    }
+
+    #[test]
+    fn fila_traza_formatea_4_celdas() {
+        let m = Mensaje {
+            id: 42,
+            de_id: "claudia".to_string(),
+            para_id: "max".to_string(),
+            texto: "hola que tal".to_string(),
+            enviado_en: "2026-06-29T12:34:56.000Z".to_string(),
+            estado: EstadoMensaje::Procesado,
+            entregado_en: None,
+            leido_en: None,
+            procesado_en: None,
+            intentos: 0,
+            reenviado_de: None,
+            reenvios: 0,
+        };
+        let fila = fila_traza(&m);
+        assert_eq!(fila[0], "42");
+        assert_eq!(fila[1], "claudia");
+        assert_eq!(fila[2], "hola que tal");
+        assert_eq!(fila[3], "12:34:56");
+    }
+
+    #[test]
+    fn fila_traza_recorta_texto_largo() {
+        let m = Mensaje {
+            id: 1,
+            de_id: "p".to_string(),
+            para_id: "q".to_string(),
+            texto: "x".repeat(100),
+            enviado_en: String::new(),
+            estado: EstadoMensaje::Enviado,
+            entregado_en: None,
+            leido_en: None,
+            procesado_en: None,
+            intentos: 0,
+            reenviado_de: None,
+            reenvios: 0,
+        };
+        let fila = fila_traza(&m);
+        assert_eq!(fila[2].chars().count(), 40);
+        assert!(fila[2].ends_with('…'));
     }
 
     #[test]

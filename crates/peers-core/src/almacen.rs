@@ -8,7 +8,7 @@
 //! Todos los métodos son async (Redis lo es) y devuelven `anyhow::Result` — nada entra
 //! en pánico; el handler traduce el error a un 500 con JSON.
 
-use crate::{Alcance, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
+use crate::{Alcance, EstadoMensaje, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
 use async_trait::async_trait;
 
 /// Alcance de listado, reexportado para que las firmas no dependan del módulo concreto.
@@ -44,9 +44,9 @@ pub trait Almacen: Send + Sync {
     /// no descarta vencidas: el admin quiere ver el estado crudo del almacén.
     async fn listar_ids(&self) -> anyhow::Result<Vec<String>>;
 
-    /// Cuenta los mensajes pendientes (fila FIFO) de `id` SIN drenarlos. Es de SOLO LECTURA
-    /// (a diferencia de `recibir_mensajes`, que consume): el panel de admin solo observa.
-    /// Redis: LLEN cprs:mensajes:{id}. SQLite: COUNT(*) WHERE para_id=id AND entregado=0.
+    /// Cuenta los mensajes de la bandeja activa de `id` SIN drenarlos. SOLO LECTURA: el panel
+    /// de admin solo observa. Redis: ZCARD cprs:bandeja:{id}. SQLite: COUNT(*) en bandeja activa
+    /// (estado != 'procesado'/'fallido'/'deadletter').
     async fn contar_mensajes_pendientes(&self, id: &str) -> anyhow::Result<usize>;
 
     /// Purga la fila de mensajes y el outbox de `id` (DEL/DELETE). Operación de admin
@@ -77,9 +77,50 @@ pub trait Almacen: Send + Sync {
         ahora: &str,
     ) -> anyhow::Result<()>;
 
+    /// PEEK no-destructivo (R1.1): devuelve los mensajes de la bandeja activa de `id` que
+    /// aún NO están `Procesado` (es decir, en `Enviado`/`Entregado`/`Leido`), SIN borrar nada.
+    /// El borrado de la bandeja activa solo ocurre al confirmar `Procesado` (R1.5). Idempotente:
+    /// `recibir` repetido devuelve los mismos mensajes hasta que se procesen.
     async fn recibir_mensajes(&self, id: &str) -> anyhow::Result<Vec<Mensaje>>;
 
+    /// Transiciona un mensaje a `nuevo` estado timbrando el tiempo con `ahora` (R1.2/R1.3).
+    /// Idempotente y monótona: solo avanza si el nuevo rango es mayor que el actual (ver
+    /// `EstadoMensaje::rango`); el timbre del campo de tiempo (`entregado_en`/`leido_en`/
+    /// `procesado_en`) es "solo la primera vez" (HSETNX / COALESCE). Al llegar a `Procesado`
+    /// el mensaje sale de la bandeja activa (R1.5) pero persiste en el historial (R2.1).
+    /// Devuelve `true` si transicionó, `false` si fue no-op (idempotente o ya en estado igual/mayor).
+    async fn transicionar_mensaje(
+        &self,
+        msg_id: i64,
+        nuevo: EstadoMensaje,
+        ahora: &str,
+    ) -> anyhow::Result<bool>;
+
+    /// Historial durable de la cola `id` (R2.1/R2.2): mensajes con su estado final aunque ya
+    /// se procesaran. `desde` filtra por cursor (msg_id > desde); `estado` filtra por estado.
+    async fn historial(
+        &self,
+        id: &str,
+        desde: Option<i64>,
+        estado: Option<EstadoMensaje>,
+    ) -> anyhow::Result<Vec<Mensaje>>;
+
+    /// Lee un mensaje por su id (de cualquier bandeja/historial). None si no existe.
+    /// Lo usa `/admin/reenviar` para clonar el mensaje original (R2.3).
+    async fn mensaje_obtener(&self, msg_id: i64) -> anyhow::Result<Option<Mensaje>>;
+
+    /// Re-encola un mensaje a partir de `original` (R2.3): crea uno NUEVO con `msgseq`/id
+    /// fresco, estado `Enviado`, `reenviado_de = Some(original.id)` y `reenvios =
+    /// original.reenvios + 1`. Reusa `de_id`/`para_id`/`texto` del original y lo deposita en
+    /// la bandeja activa + historial del `para_id` original. `ahora` es el `enviado_en`
+    /// timbrado por el broker. Devuelve el `msg_id` del nuevo mensaje.
+    async fn encolar_reenvio(&self, original: &Mensaje, ahora: &str) -> anyhow::Result<i64>;
+
     async fn limpiar_vencidas(&self, vencidas_antes: &str) -> anyhow::Result<usize>;
+
+    /// Aplica la retención del historial (R2.1): recorta cada cola a los últimos N mensajes
+    /// (`RETENCION_HISTORIAL`). Se llama desde la limpieza periódica de 30s del broker.
+    async fn podar_historial(&self, retener: usize) -> anyhow::Result<()>;
 
     // --- Outbox durable con ACK (fase 2) ---
 

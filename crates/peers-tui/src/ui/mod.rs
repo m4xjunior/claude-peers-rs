@@ -9,6 +9,7 @@ mod broker;
 mod config;
 mod peers;
 mod redis;
+mod trazabilidad;
 
 use crate::app::{App, EstadoRed, Pantalla};
 use ratatui::{
@@ -88,6 +89,7 @@ fn dibujar_cuerpo(f: &mut Frame, area: Rect, app: &App) {
         Pantalla::Redis => redis::dibujar(f, area, app),
         Pantalla::Broker => broker::dibujar(f, area, app),
         Pantalla::Config => config::dibujar(f, area, app),
+        Pantalla::Trazabilidad => trazabilidad::dibujar(f, area, app),
     }
 }
 
@@ -100,6 +102,7 @@ fn dibujar_ayuda(f: &mut Frame, area: Rect, app: &App) {
         Pantalla::Redis => "↑↓ mover · p purgar cola",
         Pantalla::Broker => "(solo lectura)",
         Pantalla::Config => "e editar campo activo · ↑↓ campo · s guardar",
+        Pantalla::Trazabilidad => "↑↓ mover · Enter timeline · r reenviar",
     };
     let linea = Line::from(vec![
         Span::styled(format!(" {especifico}"), Style::default().fg(Color::Cyan)),

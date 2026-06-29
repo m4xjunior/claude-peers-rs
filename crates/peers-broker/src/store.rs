@@ -7,17 +7,24 @@
 //! Claves:
 //!   cprs:instancia:{id}     HASH con los campos de la instancia
 //!   cprs:instancias         SET con los ids registrados
-//!   cprs:mensajes:{para_id} LIST (JSON de Mensaje) — fila FIFO por destinatario
+//!   cprs:bandeja:{para_id}  ZSET (score=msgseq, member=msg_id) — bandeja ACTIVA por destinatario
+//!   cprs:historial:{para_id} ZSET (score=msgseq, member=msg_id) — historial DURABLE (R2.1)
+//!   cprs:msg:{msg_id}       HASH con el JSON del mensaje + estado + timestamps (fuente de verdad)
 //!   cprs:msgseq             contador para asignar id incremental a mensajes
 //!   cprs:outbox:{para_id}   LIST (JSON de ItemOutbox) — durable con ACK
 //!   cprs:sesiones:{inst}    LIST (JSON de Sesion)
 //!   cprs:tareas:{inst}      LIST (JSON de Tarea)  — fuente de la jornada
 //!   cprs:tarea:{id}         STRING (JSON de Tarea) — índice directo por id de tarea
+//!
+//! DISEÑO bandeja/historial: el ZSET solo guarda `msg_id` (member) ordenado por `msgseq`
+//! (score); el detalle del mensaje (JSON, estado, timestamps) vive en el HASH `cprs:msg:{id}`,
+//! única fuente de verdad. Así `ZREM` por id y la actualización de estado son O(log n) y no
+//! hay que reescribir el JSON dentro del ZSET (que exigiría conocer el valor exacto del member).
 
 use async_trait::async_trait;
 use deadpool_redis::redis::{cmd, AsyncCommands};
 use deadpool_redis::{Config, Pool, Runtime};
-use peers_core::{Alcance, Almacen, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
+use peers_core::{Alcance, Almacen, EstadoMensaje, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
 
 const NS: &str = "cprs:";
 
@@ -41,8 +48,14 @@ impl AlmacenRedis {
 fn k_instancia(id: &str) -> String {
     format!("{NS}instancia:{id}")
 }
-fn k_mensajes(para_id: &str) -> String {
-    format!("{NS}mensajes:{para_id}")
+fn k_bandeja(para_id: &str) -> String {
+    format!("{NS}bandeja:{para_id}")
+}
+fn k_historial(para_id: &str) -> String {
+    format!("{NS}historial:{para_id}")
+}
+fn k_msg(msg_id: i64) -> String {
+    format!("{NS}msg:{msg_id}")
 }
 fn k_outbox(para_id: &str) -> String {
     format!("{NS}outbox:{para_id}")
@@ -151,18 +164,21 @@ impl Almacen for AlmacenRedis {
 
     async fn contar_mensajes_pendientes(&self, id: &str) -> anyhow::Result<usize> {
         let mut conn = self.conn().await?;
-        // LLEN no drena: solo cuenta. La fila de mensajes es FIFO y todos sus ítems están
-        // pendientes hasta que recibir_mensajes la vacía de golpe.
-        let n: usize = conn.llen(k_mensajes(id)).await?;
+        // ZCARD no drena: solo cuenta la bandeja ACTIVA (los Procesado ya salieron via ZREM).
+        let n: usize = conn.zcard(k_bandeja(id)).await?;
         Ok(n)
     }
 
     async fn purgar(&self, id: &str) -> anyhow::Result<()> {
         let mut conn = self.conn().await?;
-        // DEL es idempotente (borra 0 o más claves). Solo toca las colas de ESTE id; no
-        // da de baja la instancia ni borra su jornada.
-        let _: () = conn.del(k_mensajes(id)).await?;
+        // DEL es idempotente (borra 0 o más claves). Borra la bandeja activa, el historial y
+        // el outbox de ESTE id; no da de baja la instancia ni borra su jornada. Los HASH
+        // cprs:msg:{id} sueltos (sin índice) caducan al podarse el historial, pero aquí
+        // mantenemos la purga simple (DEL de las colas) como mantenimiento explícito.
+        let _: () = conn.del(k_bandeja(id)).await?;
+        let _: () = conn.del(k_historial(id)).await?;
         let _: () = conn.del(k_outbox(id)).await?;
+        let _: () = conn.srem(format!("{NS}outbox_indice"), id).await?;
         Ok(())
     }
 
@@ -225,31 +241,159 @@ impl Almacen for AlmacenRedis {
             para_id: para_id.to_string(),
             texto: texto.to_string(),
             enviado_en: ahora.to_string(),
-            entregado: false,
+            estado: EstadoMensaje::Enviado,
+            entregado_en: None,
+            leido_en: None,
+            procesado_en: None,
+            intentos: 0,
+            reenviado_de: None,
+            reenvios: 0,
         };
-        let _: () = conn
-            .rpush(k_mensajes(para_id), serde_json::to_string(&msg)?)
-            .await?;
+        // Fuente de verdad del mensaje (HASH). El ZSET de bandeja e historial solo indexan
+        // el msg_id por msgseq (score) → ZADD/ZREM O(log n) sin tocar el JSON dentro del set.
+        guardar_msg(&mut conn, &msg).await?;
+        let _: () = conn.zadd(k_bandeja(para_id), id, id as f64).await?;
+        let _: () = conn.zadd(k_historial(para_id), id, id as f64).await?;
         Ok(())
     }
 
     async fn recibir_mensajes(&self, id: &str) -> anyhow::Result<Vec<Mensaje>> {
         let mut conn = self.conn().await?;
-        // Drena la lista entera de forma atómica: LRANGE + DEL en pipeline.
-        let clave = k_mensajes(id);
-        let crudos: Vec<String> = conn.lrange(&clave, 0, -1).await?;
-        if crudos.is_empty() {
+        // PEEK no-destructivo (R1.1): leemos los ids de la bandeja activa por score (msgseq).
+        // NO borramos nada: el borrado solo ocurre al confirmar `Procesado` (R1.5, transición).
+        let clave = k_bandeja(id);
+        let ids: Vec<i64> = conn.zrangebyscore(&clave, "-inf", "+inf").await?;
+        if ids.is_empty() {
             return Ok(vec![]);
         }
-        let _: () = conn.del(&clave).await?;
-        let mut msgs = Vec::with_capacity(crudos.len());
-        for c in crudos {
-            if let Ok(mut m) = serde_json::from_str::<Mensaje>(&c) {
-                m.entregado = true;
-                msgs.push(m);
+        let mut msgs = Vec::with_capacity(ids.len());
+        for mid in ids {
+            if let Some(m) = leer_msg(&mut conn, mid).await? {
+                // La bandeja activa contiene Enviado/Entregado/Leido (no Procesado, que sale al
+                // transicionar). Defensa: descartamos cualquier terminal que se hubiera colado.
+                if m.estado != EstadoMensaje::Procesado
+                    && m.estado != EstadoMensaje::DeadLetter
+                {
+                    msgs.push(m);
+                }
             }
         }
         Ok(msgs)
+    }
+
+    async fn transicionar_mensaje(
+        &self,
+        msg_id: i64,
+        nuevo: EstadoMensaje,
+        ahora: &str,
+    ) -> anyhow::Result<bool> {
+        let mut conn = self.conn().await?;
+        let clave = k_msg(msg_id);
+        // Estado actual (fuente de verdad = HASH). Si no existe el mensaje, no-op.
+        let estado_crudo: Option<String> = conn.hget(&clave, "estado").await?;
+        let Some(estado_crudo) = estado_crudo else {
+            return Ok(false);
+        };
+        let actual: EstadoMensaje = serde_json::from_str(&format!("\"{estado_crudo}\""))
+            .unwrap_or(EstadoMensaje::Enviado);
+        // Monótona: solo avanza si el nuevo rango es estrictamente mayor (idempotente si igual
+        // o si retrocede). Fallido/DeadLetter tienen rango alto → siempre se aceptan.
+        if nuevo.rango() <= actual.rango() {
+            return Ok(false);
+        }
+        // Timbra el campo de tiempo SOLO la primera vez (HSETNX = el "COALESCE" de Redis, R1.3).
+        let campo_tiempo = match nuevo {
+            EstadoMensaje::Entregado => Some("entregado_en"),
+            EstadoMensaje::Leido => Some("leido_en"),
+            EstadoMensaje::Procesado => Some("procesado_en"),
+            _ => None, // Fallido/DeadLetter no timbran campo dedicado (intentos/DLQ en fases futuras)
+        };
+        if let Some(campo) = campo_tiempo {
+            let _: bool = conn.hset_nx(&clave, campo, ahora).await?;
+        }
+        // Estado avanza en el HASH (fuente de verdad).
+        let nuevo_crudo = serde_json::to_string(&nuevo)?;
+        let nuevo_crudo = nuevo_crudo.trim_matches('"');
+        let _: () = conn.hset(&clave, "estado", nuevo_crudo).await?;
+        // Al llegar a Procesado sale de la bandeja activa (R1.5); el HASH + historial persisten.
+        if nuevo == EstadoMensaje::Procesado {
+            if let Some(para_id) = conn.hget::<_, _, Option<String>>(&clave, "para_id").await? {
+                let _: () = conn.zrem(k_bandeja(&para_id), msg_id).await?;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn historial(
+        &self,
+        id: &str,
+        desde: Option<i64>,
+        estado: Option<EstadoMensaje>,
+    ) -> anyhow::Result<Vec<Mensaje>> {
+        let mut conn = self.conn().await?;
+        // Cursor por score (msgseq == msg_id): desde exclusivo "(desde", o -inf si no hay.
+        let min = match desde {
+            Some(d) => format!("({d}"),
+            None => "-inf".to_string(),
+        };
+        let ids: Vec<i64> = conn.zrangebyscore(k_historial(id), min, "+inf").await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for mid in ids {
+            if let Some(m) = leer_msg(&mut conn, mid).await? {
+                if estado.is_none_or(|e| m.estado == e) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn mensaje_obtener(&self, msg_id: i64) -> anyhow::Result<Option<Mensaje>> {
+        let mut conn = self.conn().await?;
+        leer_msg(&mut conn, msg_id).await
+    }
+
+    async fn encolar_reenvio(&self, original: &Mensaje, ahora: &str) -> anyhow::Result<i64> {
+        let mut conn = self.conn().await?;
+        // msgseq fresco: el reenvío es un mensaje NUEVO (id propio), no una mutación del original.
+        let id: i64 = conn.incr(format!("{NS}msgseq"), 1).await?;
+        let nuevo = Mensaje {
+            id,
+            de_id: original.de_id.clone(),
+            para_id: original.para_id.clone(),
+            texto: original.texto.clone(),
+            enviado_en: ahora.to_string(),
+            estado: EstadoMensaje::Enviado,
+            entregado_en: None,
+            leido_en: None,
+            procesado_en: None,
+            intentos: 0,
+            reenviado_de: Some(original.id),
+            reenvios: original.reenvios + 1,
+        };
+        // Mismo patrón que `encolar_mensaje`: HASH fuente de verdad + ZADD a bandeja e historial
+        // del `para_id` original (R2.3).
+        guardar_msg(&mut conn, &nuevo).await?;
+        let _: () = conn.zadd(k_bandeja(&nuevo.para_id), id, id as f64).await?;
+        let _: () = conn.zadd(k_historial(&nuevo.para_id), id, id as f64).await?;
+        Ok(id)
+    }
+
+    async fn podar_historial(&self, retener: usize) -> anyhow::Result<()> {
+        let mut conn = self.conn().await?;
+        // Recorta cada historial conocido a los últimos `retener` (R2.1). ZREMRANGEBYRANK
+        // 0 -(N+1) elimina los más antiguos (rangos bajos) dejando los N de mayor score.
+        let ids: Vec<String> = conn.smembers(format!("{NS}instancias")).await?;
+        if retener == 0 {
+            return Ok(());
+        }
+        let tope: isize = -(retener as isize) - 1;
+        for id in ids {
+            let _: () = conn
+                .zremrangebyrank(k_historial(&id), 0, tope)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn limpiar_vencidas(&self, vencidas_antes: &str) -> anyhow::Result<usize> {
@@ -264,8 +408,9 @@ impl Almacen for AlmacenRedis {
             if inst.visto_en.as_str() < vencidas_antes {
                 let _: () = conn.del(k_instancia(&id)).await?;
                 let _: () = conn.srem(format!("{NS}instancias"), &id).await?;
-                // Purga su fila de mensajes pendientes (no su outbox durable).
-                let _: () = conn.del(k_mensajes(&id)).await?;
+                // Purga su bandeja ACTIVA (no el historial durable ni el outbox): si vuelve,
+                // los mensajes ya entregados se mantienen trazables en el historial (R2.1).
+                let _: () = conn.del(k_bandeja(&id)).await?;
                 n += 1;
             }
         }
@@ -279,6 +424,10 @@ impl Almacen for AlmacenRedis {
         let _: () = conn
             .rpush(k_outbox(&item.para_id), serde_json::to_string(item)?)
             .await?;
+        // Índice de para_id con outbox: permite a `outbox_confirmar` localizar la lista sin
+        // un KEYS O(n) (R1.6). El destinatario puede no estar registrado como instancia, así
+        // que NO basta el SET cprs:instancias: este índice es la fuente para iterar outboxes.
+        let _: () = conn.sadd(format!("{NS}outbox_indice"), &item.para_id).await?;
         Ok(())
     }
 
@@ -293,10 +442,12 @@ impl Almacen for AlmacenRedis {
     }
 
     async fn outbox_confirmar(&self, item_id: &str) -> anyhow::Result<()> {
-        // El ACK reescribe el ítem como confirmado dentro de su lista. Recorremos las
-        // listas de outbox; como el id es único, basta encontrarlo y marcarlo.
+        // El ACK reescribe el ítem como confirmado dentro de su lista. Recorremos las listas
+        // de outbox indexadas en cprs:outbox_indice (poblado en outbox_encolar) en vez de un
+        // KEYS O(n) sobre todo el keyspace (R1.6/AC4): grep KEYS debe quedar vacío en el store.
         let mut conn = self.conn().await?;
-        let claves: Vec<String> = conn.keys(format!("{NS}outbox:*")).await?;
+        let ids: Vec<String> = conn.smembers(format!("{NS}outbox_indice")).await?;
+        let claves: Vec<String> = ids.iter().map(|id| k_outbox(id)).collect();
         for clave in claves {
             let crudos: Vec<String> = conn.lrange(&clave, 0, -1).await?;
             for (idx, c) in crudos.iter().enumerate() {
@@ -381,6 +532,72 @@ impl Almacen for AlmacenRedis {
         }
         Ok((sesiones, tareas))
     }
+}
+
+/// Guarda el mensaje completo en su HASH `cprs:msg:{id}` (fuente de verdad). Los campos van
+/// como columnas del HASH para que `transicionar_mensaje` actualice `estado`/`*_en` con HSET/
+/// HSETNX sin reescribir el blob entero. `leer_msg` lo reconstruye.
+async fn guardar_msg(
+    conn: &mut deadpool_redis::Connection,
+    msg: &Mensaje,
+) -> anyhow::Result<()> {
+    let estado = serde_json::to_string(&msg.estado)?;
+    let estado = estado.trim_matches('"');
+    let mut c = cmd("HSET");
+    c.arg(k_msg(msg.id))
+        .arg("id").arg(msg.id)
+        .arg("de_id").arg(&msg.de_id)
+        .arg("para_id").arg(&msg.para_id)
+        .arg("texto").arg(&msg.texto)
+        .arg("enviado_en").arg(&msg.enviado_en)
+        .arg("estado").arg(estado)
+        .arg("intentos").arg(msg.intentos)
+        .arg("reenvios").arg(msg.reenvios);
+    if let Some(v) = &msg.entregado_en {
+        c.arg("entregado_en").arg(v);
+    }
+    if let Some(v) = &msg.leido_en {
+        c.arg("leido_en").arg(v);
+    }
+    if let Some(v) = &msg.procesado_en {
+        c.arg("procesado_en").arg(v);
+    }
+    if let Some(v) = msg.reenviado_de {
+        c.arg("reenviado_de").arg(v);
+    }
+    c.query_async::<()>(conn).await?;
+    Ok(())
+}
+
+/// Reconstruye un Mensaje desde su HASH. None si la clave no existe.
+async fn leer_msg(
+    conn: &mut deadpool_redis::Connection,
+    msg_id: i64,
+) -> anyhow::Result<Option<Mensaje>> {
+    use std::collections::HashMap;
+    let h: HashMap<String, String> = conn.hgetall(k_msg(msg_id)).await?;
+    if h.is_empty() {
+        return Ok(None);
+    }
+    let estado = h
+        .get("estado")
+        .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+        .unwrap_or(EstadoMensaje::Enviado);
+    let opt = |k: &str| h.get(k).filter(|s| !s.is_empty()).cloned();
+    Ok(Some(Mensaje {
+        id: h.get("id").and_then(|s| s.parse().ok()).unwrap_or(msg_id),
+        de_id: h.get("de_id").cloned().unwrap_or_default(),
+        para_id: h.get("para_id").cloned().unwrap_or_default(),
+        texto: h.get("texto").cloned().unwrap_or_default(),
+        enviado_en: h.get("enviado_en").cloned().unwrap_or_default(),
+        estado,
+        entregado_en: opt("entregado_en"),
+        leido_en: opt("leido_en"),
+        procesado_en: opt("procesado_en"),
+        intentos: h.get("intentos").and_then(|s| s.parse().ok()).unwrap_or(0),
+        reenviado_de: h.get("reenviado_de").and_then(|s| s.parse().ok()),
+        reenvios: h.get("reenvios").and_then(|s| s.parse().ok()).unwrap_or(0),
+    }))
 }
 
 /// Lee una instancia del HASH y la reconstruye. None si la clave no existe.

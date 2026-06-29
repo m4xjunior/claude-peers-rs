@@ -28,11 +28,12 @@ use axum::{
 use clap::Parser;
 use github::GitHub;
 use peers_core::{
-    Almacen, ColaResumen, PeticionAbrirTarea, PeticionCerrarTarea, PeticionDefinirResumen,
-    PeticionEnviar, PeticionJornada, PeticionLatido, PeticionListar, PeticionPurgar,
-    PeticionRecibir, PeticionRegistrar, PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea,
-    RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar, RespuestaJornada, RespuestaOk,
-    RespuestaRegistrar, RespuestaSalud, PUERTO_DEFECTO, VENCIMIENTO_MS,
+    Almacen, ColaResumen, Mensaje, PeticionAbrirTarea, PeticionCerrarTarea, PeticionConfirmar,
+    PeticionDefinirResumen, PeticionEnviar, PeticionHistorial, PeticionJornada, PeticionLatido,
+    PeticionListar, PeticionPurgar, PeticionRecibir, PeticionRegistrar, PeticionReenviar,
+    PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea, RespuestaAdminInfo,
+    RespuestaAdminRedis, RespuestaEnviar, RespuestaJornada, RespuestaOk, RespuestaRegistrar,
+    RespuestaSalud, PUERTO_DEFECTO, VENCIMIENTO_MS,
 };
 use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -499,6 +500,58 @@ async fn admin_purgar(
     Ok(Json(RespuestaOk { ok: true }))
 }
 
+// --- Handlers de entrega durable + trazabilidad (fase 1/2) ---
+
+/// `POST /confirmar` { ids, estado } → el cliente confirma el avance de estado de los
+/// mensajes que recibió. El broker timbra el tiempo con SU reloj (R1.2/R1.4). Idempotente:
+/// `transicionar_mensaje` solo avanza si el rango sube; los ids inexistentes son no-op.
+/// `recibir` NO transiciona: la confirmación es explícita y separada (R1.4). Va en
+/// `rutas_protegidas` (token), NUNCA en /salud.
+async fn confirmar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionConfirmar>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    let ahora = ahora_iso();
+    for id in &p.ids {
+        // El timbre lo pone el broker (nunca la IA). Idempotente por id.
+        e.almacen.transicionar_mensaje(*id, p.estado, &ahora).await?;
+    }
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+/// `GET /admin/historial?id=&desde=&estado=` → historial durable de la cola (R2.2). Lo
+/// consume la TUI (pantalla Trazabilidad). SOLO LECTURA. Va en `rutas_protegidas` (token).
+/// `desde` = cursor exclusivo (msg_id > desde); `estado` = filtro opcional.
+async fn admin_historial(
+    State(e): State<Estado>,
+    axum::extract::Query(p): axum::extract::Query<PeticionHistorial>,
+) -> Result<Json<Vec<Mensaje>>, ErrorApp> {
+    let msgs = e.almacen.historial(&p.id, p.desde, p.estado).await?;
+    Ok(Json(msgs))
+}
+
+/// `POST /admin/reenviar` { msg_id } → re-encola un mensaje del historial como uno NUEVO
+/// (msgseq fresco, estado `Enviado`, `reenviado_de = msg_id`, `reenvios + 1`) en la bandeja
+/// del `para_id` original (R2.3). Devuelve el `msg_id` del nuevo. Va en `rutas_protegidas`.
+async fn admin_reenviar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionReenviar>,
+) -> Result<Json<serde_json::Value>, ErrorApp> {
+    let Some(original) = e.almacen.mensaje_obtener(p.msg_id).await? else {
+        // Mensaje inexistente: no es un 500, es una petición sin efecto. ok=false explícito.
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "error": format!("El mensaje {} no existe en el historial", p.msg_id),
+        })));
+    };
+    let nuevo_id = e.almacen.encolar_reenvio(&original, &ahora_iso()).await?;
+    info!(
+        "admin: reenviado msg {} → nuevo msg {} (para '{}')",
+        p.msg_id, nuevo_id, original.para_id
+    );
+    Ok(Json(serde_json::json!({ "ok": true, "msg_id": nuevo_id })))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -547,6 +600,14 @@ async fn main() -> anyhow::Result<()> {
                 Ok(_) => {}
                 Err(e) => error!("fallo en limpieza periódica: {e:#}"),
             }
+            // Retención del historial durable (R2.1): recorta cada cola a los últimos N.
+            if let Err(e) = limpieza
+                .almacen
+                .podar_historial(peers_core::RETENCION_HISTORIAL)
+                .await
+            {
+                error!("fallo al podar historial: {e:#}");
+            }
         }
     });
 
@@ -566,6 +627,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/listar", post(listar))
         .route("/enviar", post(enviar))
         .route("/recibir", post(recibir))
+        .route("/confirmar", post(confirmar))
         .route("/salir", post(salir))
         .route("/tarea/abrir", post(tarea_abrir))
         .route("/tarea/reportar", post(tarea_reportar))
@@ -575,6 +637,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/info", get(admin_info))
         .route("/admin/redis", get(admin_redis))
         .route("/admin/purgar", post(admin_purgar))
+        .route("/admin/historial", get(admin_historial))
+        .route("/admin/reenviar", post(admin_reenviar))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));
 
     let app = Router::new()

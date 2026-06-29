@@ -35,6 +35,18 @@ impl std::fmt::Display for ErrorBroker {
 /// Resultado de una llamada al broker. Alias para legibilidad en las firmas.
 pub type ResultadoBroker<T> = Result<T, ErrorBroker>;
 
+/// Respuesta de `POST /admin/reenviar`. El broker responde con un JSON ad-hoc:
+/// `{ "ok": true, "msg_id": <i64> }` si reenvió, o `{ "ok": false, "error": "..." }` si el
+/// mensaje no existía. Lo modelamos tipado para que la TUI ramifique sin tocar `serde_json`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RespuestaReenviar {
+    pub ok: bool,
+    #[serde(default)]
+    pub msg_id: Option<i64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// Cliente del broker para la TUI: URL base, token opcional y cliente HTTP reutilizable.
 #[derive(Clone)]
 pub struct ClienteAdmin {
@@ -70,6 +82,22 @@ impl ClienteAdmin {
     async fn get<R: serde::de::DeserializeOwned>(&self, ruta: &str) -> ResultadoBroker<R> {
         let url = format!("{}{}", self.base, ruta);
         let mut req = self.http.get(&url);
+        if let Some(t) = &self.token {
+            req = req.header("X-Peers-Token", t);
+        }
+        let resp = req.send().await.map_err(Self::offline)?;
+        self.deserializar(resp, ruta).await
+    }
+
+    /// GET con query string serializada desde `q` (usa el `Serialize` del tipo). Reqwest
+    /// codifica los pares; los `Option` con `skip_serializing_if` no aparecen si son `None`.
+    async fn get_con_query<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        ruta: &str,
+        q: &Q,
+    ) -> ResultadoBroker<R> {
+        let url = format!("{}{}", self.base, ruta);
+        let mut req = self.http.get(&url).query(q);
         if let Some(t) = &self.token {
             req = req.header("X-Peers-Token", t);
         }
@@ -168,5 +196,24 @@ impl ClienteAdmin {
             resumen: resumen.to_string(),
         };
         self.post("/definir-resumen", &p).await
+    }
+
+    /// `GET /admin/historial?id=…` → historial durable de la cola de un peer (orden
+    /// cronológico). Pantalla Trazabilidad. Pedimos sin `desde`/`estado` (vista completa);
+    /// el filtrado por estado se hace en cliente sobre la lista cacheada.
+    pub async fn historial(&self, id: &str) -> ResultadoBroker<Vec<Mensaje>> {
+        let q = PeticionHistorial {
+            id: id.to_string(),
+            desde: None,
+            estado: None,
+        };
+        self.get_con_query("/admin/historial", &q).await
+    }
+
+    /// `POST /admin/reenviar {msg_id}` → re-encola un mensaje del historial como uno nuevo
+    /// (R2.3). Tecla `r` en la pantalla Trazabilidad. Devuelve la respuesta tipada para que
+    /// la UI distinga el caso "reenviado" (ok=true) del "no existe" (ok=false).
+    pub async fn reenviar(&self, msg_id: i64) -> ResultadoBroker<RespuestaReenviar> {
+        self.post("/admin/reenviar", &PeticionReenviar { msg_id }).await
     }
 }

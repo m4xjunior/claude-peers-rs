@@ -103,4 +103,17 @@ impl ClienteBroker {
     pub async fn salir(&self, id: &str) -> Result<RespuestaOk> {
         self.post("/salir", &PeticionSalir { id: id.to_string() }).await
     }
+
+    /// Confirma al broker la transición de estado de uno o más mensajes (R1.4).
+    /// El broker timbra el estado con SU reloj (idempotente y monótono). Ruta protegida (token).
+    pub async fn confirmar(&self, ids: &[i64], estado: EstadoMensaje) -> Result<RespuestaOk> {
+        self.post(
+            "/confirmar",
+            &PeticionConfirmar {
+                ids: ids.to_vec(),
+                estado,
+            },
+        )
+        .await
+    }
 }

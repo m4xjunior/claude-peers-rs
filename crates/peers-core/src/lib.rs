@@ -40,7 +40,58 @@ pub struct Instancia {
     pub visto_en: String,      // ISO 8601 — base de la liveness por latido
 }
 
+/// Cuántos mensajes retiene el historial durable por cola (los más recientes).
+/// Usado por la limpieza periódica del broker (ZREMRANGEBYRANK). Ver R2.1.
+pub const RETENCION_HISTORIAL: usize = 500;
+
+/// Estado de un mensaje en su ciclo de vida. Máquina de estados timbrada por el broker
+/// (nunca por la IA). El avance natural es `Enviado → Entregado → Leido → Procesado`;
+/// `Fallido` y `DeadLetter` son terminales alternativos (R1.2).
+///
+/// INTENCIÓN: que el orden de las variantes refleje el avance monótono, para que una
+/// transición que "retrocede" sea detectable comparando el rango (ver `rango`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EstadoMensaje {
+    /// Encolado en la bandeja del destino; aún no entregado.
+    Enviado,
+    /// El cliente del destino confirmó que lo empujó al canal (flush OK).
+    Entregado,
+    /// El destinatario lo leyó (lo vio en su <channel>).
+    Leido,
+    /// El destinatario terminó de actuar sobre él; sale de la bandeja activa (R1.5).
+    Procesado,
+    /// La entrega falló de forma recuperable; candidato a reintento.
+    Fallido,
+    /// La entrega falló de forma definitiva; va a la cola de mensajes muertos.
+    DeadLetter,
+}
+
+impl EstadoMensaje {
+    /// Rango monótono del avance natural. `Enviado < Entregado < Leido < Procesado`.
+    /// `Fallido`/`DeadLetter` son terminales y no encajan en el orden lineal: se les
+    /// asigna un rango alto para que una transición hacia ellos siempre se acepte.
+    /// INTENCIÓN: que `transicionar` decida "avanza o no" comparando rangos, no con
+    /// una tabla de pares válidos que habría que mantener.
+    #[must_use]
+    pub fn rango(self) -> u8 {
+        match self {
+            EstadoMensaje::Enviado => 0,
+            EstadoMensaje::Entregado => 1,
+            EstadoMensaje::Leido => 2,
+            EstadoMensaje::Procesado => 3,
+            EstadoMensaje::Fallido => 4,
+            EstadoMensaje::DeadLetter => 5,
+        }
+    }
+}
+
 /// Un mensaje encolado entre instancias. Espejo de la tabla `mensajes`.
+///
+/// COMPAT: los campos nuevos (estado + timestamps + contadores + traza de reenvío)
+/// llevan `#[serde(default)]` para que un JSON viejo (con `entregado:true` y sin estos
+/// campos) deserialice sin romper. `entregado` desaparece del struct, pero un JSON que
+/// lo traiga simplemente lo ignora serde (campo desconocido = no error por defecto).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mensaje {
     pub id: i64,
@@ -48,7 +99,32 @@ pub struct Mensaje {
     pub para_id: String,
     pub texto: String,
     pub enviado_en: String, // ISO 8601
-    pub entregado: bool,
+    /// Estado actual de la máquina. Si falta en el JSON (mensaje viejo), nace `Enviado`.
+    #[serde(default = "estado_por_defecto")]
+    pub estado: EstadoMensaje,
+    /// Timestamp ISO timbrado por el broker al pasar a `Entregado` (HSETNX = solo la 1ª vez).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entregado_en: Option<String>,
+    /// Timestamp ISO al pasar a `Leido`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leido_en: Option<String>,
+    /// Timestamp ISO al pasar a `Procesado`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procesado_en: Option<String>,
+    /// Nº de intentos de entrega (para reintento/DLQ en fases futuras).
+    #[serde(default)]
+    pub intentos: u32,
+    /// Si este mensaje es un reenvío, el `id` del mensaje original (R2.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reenviado_de: Option<i64>,
+    /// Nº de veces que se reenvió la cadena de este mensaje.
+    #[serde(default)]
+    pub reenvios: u32,
+}
+
+/// Estado por defecto al deserializar un mensaje sin campo `estado` (mensaje viejo).
+fn estado_por_defecto() -> EstadoMensaje {
+    EstadoMensaje::Enviado
 }
 
 // --- Cuerpos de petición/respuesta del broker (protocolo en español) ---
@@ -278,4 +354,111 @@ pub struct RespuestaAdminRedis {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeticionPurgar {
     pub id: String,
+}
+
+// ===========================================================================
+// ENTREGA DURABLE + TRAZABILIDAD — peticiones de confirmación/reenvío/historial.
+// ===========================================================================
+
+/// `POST /confirmar` (bajo token). El cliente confirma el avance de estado de uno o más
+/// mensajes que recibió. El broker timbra el estado con SU reloj (R1.2/R1.4). Permite
+/// confirmar en lote para no hacer un round-trip por mensaje.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionConfirmar {
+    pub ids: Vec<i64>,
+    pub estado: EstadoMensaje,
+}
+
+/// `POST /admin/reenviar` (bajo token). Re-encola un mensaje del historial con un
+/// `msgseq` fresco, estado `Enviado` y traza `reenviado_de`/`reenvios` (R2.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionReenviar {
+    pub msg_id: i64,
+}
+
+/// `GET /admin/historial` (bajo token). Lista el historial durable de una cola, con
+/// filtros opcionales por cursor (`desde`) y por `estado` (R2.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionHistorial {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desde: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estado: Option<EstadoMensaje>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R1.2/AC2: un Mensaje con estado Procesado y todos los campos timbrados debe
+    /// serializar y deserializar sin pérdida (roundtrip).
+    #[test]
+    fn mensaje_procesado_roundtrip() {
+        let original = Mensaje {
+            id: 42,
+            de_id: "claudia".into(),
+            para_id: "max".into(),
+            texto: "hola".into(),
+            enviado_en: "2026-06-29T10:00:00Z".into(),
+            estado: EstadoMensaje::Procesado,
+            entregado_en: Some("2026-06-29T10:00:01Z".into()),
+            leido_en: Some("2026-06-29T10:00:02Z".into()),
+            procesado_en: Some("2026-06-29T10:00:03Z".into()),
+            intentos: 1,
+            reenviado_de: Some(7),
+            reenvios: 2,
+        };
+        let json = serde_json::to_string(&original).expect("serializar");
+        let vuelta: Mensaje = serde_json::from_str(&json).expect("deserializar");
+        assert_eq!(vuelta.id, original.id);
+        assert_eq!(vuelta.estado, EstadoMensaje::Procesado);
+        assert_eq!(vuelta.entregado_en.as_deref(), Some("2026-06-29T10:00:01Z"));
+        assert_eq!(vuelta.leido_en.as_deref(), Some("2026-06-29T10:00:02Z"));
+        assert_eq!(vuelta.procesado_en.as_deref(), Some("2026-06-29T10:00:03Z"));
+        assert_eq!(vuelta.intentos, 1);
+        assert_eq!(vuelta.reenviado_de, Some(7));
+        assert_eq!(vuelta.reenvios, 2);
+    }
+
+    /// COMPAT: un JSON de un peer viejo (con `entregado:true`, sin los campos nuevos)
+    /// debe deserializar sin romper. `estado` cae a `Enviado` por defecto, los Option a
+    /// None, los contadores a 0, y `entregado` (campo desconocido) se ignora.
+    #[test]
+    fn mensaje_viejo_deserializa_con_defaults() {
+        let json_viejo = r#"{
+            "id": 1,
+            "de_id": "a",
+            "para_id": "b",
+            "texto": "viejo",
+            "enviado_en": "2026-01-01T00:00:00Z",
+            "entregado": true
+        }"#;
+        let m: Mensaje = serde_json::from_str(json_viejo).expect("deser JSON viejo");
+        assert_eq!(m.id, 1);
+        assert_eq!(m.estado, EstadoMensaje::Enviado);
+        assert!(m.entregado_en.is_none());
+        assert!(m.leido_en.is_none());
+        assert!(m.procesado_en.is_none());
+        assert_eq!(m.intentos, 0);
+        assert!(m.reenviado_de.is_none());
+        assert_eq!(m.reenvios, 0);
+    }
+
+    /// El enum serializa en minúsculas (rename_all = "lowercase").
+    #[test]
+    fn estado_serializa_lowercase() {
+        let j = serde_json::to_string(&EstadoMensaje::DeadLetter).expect("serializar");
+        assert_eq!(j, "\"deadletter\"");
+        let e: EstadoMensaje = serde_json::from_str("\"procesado\"").expect("deser");
+        assert_eq!(e, EstadoMensaje::Procesado);
+    }
+
+    /// El rango refleja el avance monótono natural.
+    #[test]
+    fn rango_es_monotono() {
+        assert!(EstadoMensaje::Enviado.rango() < EstadoMensaje::Entregado.rango());
+        assert!(EstadoMensaje::Entregado.rango() < EstadoMensaje::Leido.rango());
+        assert!(EstadoMensaje::Leido.rango() < EstadoMensaje::Procesado.rango());
+    }
 }
