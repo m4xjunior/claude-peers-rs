@@ -4,7 +4,8 @@
 
 use crate::cliente::ErrorBroker;
 use peers_core::{
-    EstadoMensaje, Instancia, Mensaje, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaSalud,
+    EstadoMensaje, FactorEstimacion, Instancia, Mensaje, RespuestaAdminInfo, RespuestaAdminRedis,
+    RespuestaSalud,
 };
 
 /// Las 6 pantallas del panel, conmutables con Tab o las teclas 1-6.
@@ -127,6 +128,9 @@ pub struct Datos {
     pub redis: Option<RespuestaAdminRedis>,
     pub info: Option<RespuestaAdminInfo>,
     pub salud: Option<RespuestaSalud>,
+    /// Factor de corrección de estimación aprendido por el broker (GET /factor-estimacion).
+    /// Mostrado en la pantalla Broker. `None` hasta la primera respuesta exitosa.
+    pub factor: Option<FactorEstimacion>,
     /// Historial durable del peer enfocado en la pantalla Trazabilidad (orden cronológico
     /// ascendente, tal como lo devuelve `GET /admin/historial`). Vacío si no hay foco o si
     /// el peer no tiene mensajes.

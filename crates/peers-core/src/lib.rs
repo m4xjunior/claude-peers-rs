@@ -257,6 +257,11 @@ pub struct Tarea {
     pub inicio: String,
     pub fin: Option<String>,
     pub duracion_seg: Option<i64>,
+    /// Lo que la IA estimó al abrir la tarea (segundos). El real lo timbra el broker
+    /// (`duracion_seg`); este es el "ingenuo" que se compara contra el real para aprender
+    /// el factor de corrección (ADR-002). `#[serde(default)]` para compat con tareas viejas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimado_seg: Option<i64>,
     /// Número de la issue de GitHub espejo, si la integración está activa.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_number: Option<u64>,
@@ -284,6 +289,9 @@ pub struct PeticionAbrirTarea {
     /// Área/etiqueta opcional para clasificar (se usa como label en la issue).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub area: Option<String>,
+    /// Estimado ingenuo de la IA en segundos. None = la IA no estimó (no contamina el factor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimado_seg: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +299,14 @@ pub struct RespuestaAbrirTarea {
     pub tarea_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_number: Option<u64>,
+    /// Estimado ya corregido por el factor aprendido (`estimado_seg / factor`), si la IA
+    /// envió un estimado. None si no estimó. Es lo que el peer usa para reajustar su plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimado_corregido_seg: Option<i64>,
+    /// El factor vigente en el momento de abrir (cuánto infla la IA históricamente).
+    pub factor: f64,
+    /// Nº de muestras que sostienen ese factor (poca confianza si es bajo).
+    pub muestras: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +330,63 @@ pub struct PeticionJornada {
 pub struct RespuestaJornada {
     pub sesiones: Vec<Sesion>,
     pub tareas: Vec<Tarea>,
+}
+
+// ===========================================================================
+// APRENDIZAJE DE ESTIMACIÓN — factor de corrección global por media móvil (ADR-002).
+// ===========================================================================
+
+/// Peso de la media móvil exponencial (EMA): cuánto pesa el ratio RECIENTE frente al
+/// histórico al actualizar el factor. 0.3 = el nuevo dato mueve el factor un 30% hacia él.
+pub const FACTOR_ALPHA: f64 = 0.3;
+
+/// Cota inferior del factor: la IA nunca "subestima" tanto como para corregir por debajo
+/// de 0.5x (un outlier en esa dirección no hunde el factor).
+pub const FACTOR_MIN: f64 = 0.5;
+
+/// Cota superior del factor: un único outlier monstruoso (ratio 120) no enloquece el factor;
+/// se clampa a 50x. Es el techo del "cuánto infla" que el sistema acepta aprender.
+pub const FACTOR_MAX: f64 = 50.0;
+
+/// Factor de corrección global aprendido de la diferencia estimado/real (ADR-002).
+///
+/// `factor` = cuánto INFLA la IA: `real ≈ estimado / factor`. Nace en 1.0 (sin corrección)
+/// con 0 muestras; cada tarea cerrada con estimado y real válidos lo mueve por media móvil.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactorEstimacion {
+    /// Cuántas tareas (con estimado + real válidos) contribuyeron al factor.
+    pub muestras: u32,
+    /// El factor actual. `real ≈ estimado / factor`. Clamp a [FACTOR_MIN, FACTOR_MAX].
+    pub factor: f64,
+    /// ISO 8601 de la última actualización, timbrado por el broker.
+    pub actualizado_en: String,
+}
+
+/// Aplica un paso de media móvil exponencial al factor con el ratio de UNA tarea, y clampa.
+///
+/// INTENCIÓN: función PURA y testeable (sin reloj ni I/O) que encapsula EXACTAMENTE el núcleo
+/// del aprendizaje: `nuevo = factor + ALPHA*(ratio - factor)`, recortado a [MIN, MAX]. El broker
+/// la llama dentro de `actualizar_factor`; el reloj y la persistencia quedan fuera, aquí no.
+#[must_use]
+pub fn aplicar_media_movil(factor_actual: f64, ratio: f64) -> f64 {
+    let nuevo = factor_actual + FACTOR_ALPHA * (ratio - factor_actual);
+    nuevo.clamp(FACTOR_MIN, FACTOR_MAX)
+}
+
+/// Corrige un estimado ingenuo (segundos) dividiéndolo por el factor aprendido.
+///
+/// Es lo que se devuelve a la IA al crear una tarea: "dijiste 5d; según tu historial ~6h".
+/// Redondea al entero más cercano y nunca devuelve menos de 1s (un estimado positivo no
+/// colapsa a 0 por un factor alto). Factor <= 0 se trata como 1.0 (sin corrección) por
+/// seguridad — no debería ocurrir por el clamp, pero evita división por cero/negativos.
+#[must_use]
+pub fn corregir_estimado(estimado_seg: i64, factor: f64) -> i64 {
+    if estimado_seg <= 0 {
+        return estimado_seg;
+    }
+    let f = if factor > 0.0 { factor } else { 1.0 };
+    let corregido = (estimado_seg as f64 / f).round() as i64;
+    corregido.max(1)
 }
 
 // ===========================================================================
@@ -460,5 +533,87 @@ mod tests {
         assert!(EstadoMensaje::Enviado.rango() < EstadoMensaje::Entregado.rango());
         assert!(EstadoMensaje::Entregado.rango() < EstadoMensaje::Leido.rango());
         assert!(EstadoMensaje::Leido.rango() < EstadoMensaje::Procesado.rango());
+    }
+
+    // --- Aprendizaje de estimación (fórmula pura) ---
+
+    /// AC4: un ratio extremo (120) con factor 1 NO enloquece el factor: el paso de media móvil
+    /// daría 1 + 0.3*(120-1) = 36.7, que está dentro de [0.5,50] → 36.7. Un ratio aún mayor
+    /// sí debe clampar al techo 50.
+    #[test]
+    fn ratio_extremo_se_clampa_al_techo() {
+        // 1 + 0.3*(120-1) = 36.7 (todavía bajo el techo)
+        let f1 = aplicar_media_movil(1.0, 120.0);
+        assert!((f1 - 36.7).abs() < 1e-9, "esperaba 36.7, fue {f1}");
+        // Desde un factor ya alto, un ratio enorme empuja por encima de 50 → clamp a 50.
+        let f2 = aplicar_media_movil(45.0, 200.0); // 45 + 0.3*(200-45) = 91.5 → clamp 50
+        assert!((f2 - FACTOR_MAX).abs() < 1e-9, "esperaba 50, fue {f2}");
+    }
+
+    /// El clamp inferior protege contra ratios diminutos: nunca baja de FACTOR_MIN.
+    #[test]
+    fn ratio_diminuto_se_clampa_al_piso() {
+        // Desde 0.6, un ratio 0.1 baja a 0.6 + 0.3*(0.1-0.6)=0.45 → clamp 0.5.
+        let f = aplicar_media_movil(0.6, 0.1);
+        assert!((f - FACTOR_MIN).abs() < 1e-9, "esperaba 0.5, fue {f}");
+    }
+
+    /// AC1: una secuencia de ratios consistentes (la IA infla ~6x siempre) converge hacia 6.
+    #[test]
+    fn secuencia_converge_al_ratio_estable() {
+        let mut factor = 1.0_f64;
+        for _ in 0..50 {
+            factor = aplicar_media_movil(factor, 6.0);
+        }
+        assert!((factor - 6.0).abs() < 0.01, "no convergió a 6: {factor}");
+    }
+
+    /// corregir_estimado: 5 días (432000s) con factor 6.2 ≈ 19h35m (~69677s). Coherente.
+    #[test]
+    fn corregir_estimado_es_coherente() {
+        let corregido = corregir_estimado(432_000, 6.2);
+        // 432000 / 6.2 = 69677.4 → 69677
+        assert_eq!(corregido, 69_677);
+        // Más infla el factor, más pequeño el corregido (monotonía).
+        assert!(corregir_estimado(432_000, 50.0) < corregido);
+        // Estimado 0 o negativo se devuelve tal cual (sin dividir).
+        assert_eq!(corregir_estimado(0, 6.2), 0);
+        // Factor <= 0 se trata como 1.0 (sin corrección), nunca panic por div/0.
+        assert_eq!(corregir_estimado(100, 0.0), 100);
+        // Nunca colapsa a 0 con estimado positivo y factor alto.
+        assert!(corregir_estimado(10, 50.0) >= 1);
+    }
+
+    /// AC5/compat: una Tarea vieja (JSON sin `estimado_seg`) deserializa OK → None.
+    #[test]
+    fn tarea_vieja_sin_estimado_deserializa() {
+        let json_viejo = r#"{
+            "id": "tar-1",
+            "instancia_id": "claudio",
+            "sesion_id": "ses-1",
+            "descripcion": "feature vieja",
+            "inicio": "2026-01-01T00:00:00Z",
+            "fin": null,
+            "duracion_seg": null
+        }"#;
+        let t: Tarea = serde_json::from_str(json_viejo).expect("deser Tarea vieja");
+        assert_eq!(t.id, "tar-1");
+        assert!(t.estimado_seg.is_none());
+        assert!(t.issue_number.is_none());
+    }
+
+    /// Roundtrip de FactorEstimacion: serializa y vuelve sin pérdida.
+    #[test]
+    fn factor_estimacion_roundtrip() {
+        let original = FactorEstimacion {
+            muestras: 23,
+            factor: 6.2,
+            actualizado_en: "2026-06-29T10:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&original).expect("serializar");
+        let vuelta: FactorEstimacion = serde_json::from_str(&json).expect("deserializar");
+        assert_eq!(vuelta.muestras, 23);
+        assert!((vuelta.factor - 6.2).abs() < 1e-9);
+        assert_eq!(vuelta.actualizado_en, "2026-06-29T10:00:00Z");
     }
 }

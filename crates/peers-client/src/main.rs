@@ -248,6 +248,11 @@ async fn ejecutar_tool(estado: &Arc<EstadoCliente>, params: Option<&Value>) -> V
         "enviar_mensaje" => tool_enviar(estado, &args).await,
         "definir_resumen" => tool_definir_resumen(estado, &args).await,
         "revisar_mensajes" => tool_revisar(estado).await,
+        "crear_tarea" => tool_crear_tarea(estado, &args).await,
+        "reportar_tarea" => tool_reportar_tarea(estado, &args).await,
+        "cerrar_tarea" => tool_cerrar_tarea(estado, &args).await,
+        "listar_tareas" => tool_listar_tareas(estado).await,
+        "revisar_tareas" => tool_revisar_tareas(estado).await,
         otro => Err(format!("tool desconocida: {otro}")),
     };
 
@@ -388,6 +393,193 @@ async fn tool_revisar(estado: &Arc<EstadoCliente>) -> Result<String, String> {
         resp.mensajes.len(),
         bloques.join("\n\n---\n\n")
     ))
+}
+
+/// Crea una tarea con el estimado de la IA. Devuelve al agente el estimado corregido por su
+/// historial, en lenguaje humano ("dijiste Xs; según tu historial ~Ys, factor Nx de M muestras").
+/// Degrada: si el broker no responde, el error es claro y el agente sigue trabajando igual.
+async fn tool_crear_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+    let descripcion = args
+        .get("descripcion")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'descripcion'")?;
+    // estimado_seg es opcional; acepta entero. Si no vino, no se aprende (no contamina el factor).
+    let estimado_seg = args.get("estimado_seg").and_then(Value::as_i64);
+
+    let mi_id = estado
+        .id
+        .read()
+        .await
+        .clone()
+        .ok_or("Aún no registrado en el broker")?;
+
+    let r = estado
+        .broker
+        .crear_tarea(&mi_id, descripcion, estimado_seg)
+        .await
+        .map_err(|e| format!("Error al crear la tarea: {e}"))?;
+
+    let mut texto = format!("Tarea creada: {} (id: {})", descripcion, r.tarea_id);
+    if let Some(n) = r.issue_number {
+        texto.push_str(&format!("\nIssue GitHub espejo: #{n}"));
+    }
+    match (estimado_seg, r.estimado_corregido_seg) {
+        (Some(est), Some(corr)) => {
+            texto.push_str(&format!(
+                "\nDijiste {}; según tu historial ~{}, factor {:.1}x de {} muestra(s).",
+                formatear_duracion(est),
+                formatear_duracion(corr),
+                r.factor,
+                r.muestras
+            ));
+        }
+        _ => {
+            texto.push_str(&format!(
+                "\nSin estimado: no se corrige. Factor vigente {:.1}x de {} muestra(s).",
+                r.factor, r.muestras
+            ));
+        }
+    }
+    texto.push_str("\nCierra la tarea con cerrar_tarea al terminar para que el broker mida tu tiempo real.");
+    Ok(texto)
+}
+
+/// Añade una nota de progreso a una tarea abierta.
+async fn tool_reportar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+    let tarea_id = args
+        .get("tarea_id")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'tarea_id'")?;
+    let texto = args
+        .get("texto")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'texto'")?;
+    estado
+        .broker
+        .reportar_tarea(tarea_id, texto)
+        .await
+        .map_err(|e| format!("Error al reportar la tarea: {e}"))?;
+    Ok(format!("Progreso registrado en la tarea {tarea_id}."))
+}
+
+/// Cierra una tarea: el broker mide el tiempo real y aprende el factor si había estimado.
+async fn tool_cerrar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+    let tarea_id = args
+        .get("tarea_id")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'tarea_id'")?;
+    estado
+        .broker
+        .cerrar_tarea(tarea_id)
+        .await
+        .map_err(|e| format!("Error al cerrar la tarea: {e}"))?;
+    Ok(format!(
+        "Tarea {tarea_id} cerrada. El broker midió tu tiempo real y actualizó el aprendizaje."
+    ))
+}
+
+/// Lista todas las tareas de esta instancia con sus tiempos.
+async fn tool_listar_tareas(estado: &Arc<EstadoCliente>) -> Result<String, String> {
+    let mi_id = estado
+        .id
+        .read()
+        .await
+        .clone()
+        .ok_or("Aún no registrado en el broker")?;
+    let tareas = estado
+        .broker
+        .listar_tareas(&mi_id)
+        .await
+        .map_err(|e| format!("Error al listar las tareas: {e}"))?;
+    if tareas.is_empty() {
+        return Ok("No tienes tareas registradas.".into());
+    }
+    Ok(format!(
+        "{} tarea(s):\n\n{}",
+        tareas.len(),
+        tareas
+            .iter()
+            .map(formatear_tarea)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    ))
+}
+
+/// Resumen rápido de las tareas abiertas (sin `fin`): recuerda al agente qué le falta cerrar.
+async fn tool_revisar_tareas(estado: &Arc<EstadoCliente>) -> Result<String, String> {
+    let mi_id = estado
+        .id
+        .read()
+        .await
+        .clone()
+        .ok_or("Aún no registrado en el broker")?;
+    let tareas = estado
+        .broker
+        .listar_tareas(&mi_id)
+        .await
+        .map_err(|e| format!("Error al revisar las tareas: {e}"))?;
+    let abiertas: Vec<&Tarea> = tareas.iter().filter(|t| t.fin.is_none()).collect();
+    if abiertas.is_empty() {
+        return Ok("No tienes tareas abiertas. Todo cerrado.".into());
+    }
+    Ok(format!(
+        "{} tarea(s) ABIERTA(s) (recuerda cerrarlas):\n\n{}",
+        abiertas.len(),
+        abiertas
+            .iter()
+            .map(|t| formatear_tarea(t))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    ))
+}
+
+/// Formatea una tarea para mostrarla al agente (id, descripción, estado y tiempos).
+fn formatear_tarea(t: &Tarea) -> String {
+    let mut partes = vec![
+        format!("ID: {}", t.id),
+        format!("Descripción: {}", t.descripcion),
+        format!("Inicio: {}", t.inicio),
+    ];
+    match &t.fin {
+        Some(fin) => partes.push(format!("Fin: {fin} (cerrada)")),
+        None => partes.push("Estado: ABIERTA".to_string()),
+    }
+    if let Some(est) = t.estimado_seg {
+        partes.push(format!("Estimado: {}", formatear_duracion(est)));
+    }
+    if let Some(real) = t.duracion_seg {
+        partes.push(format!("Real: {}", formatear_duracion(real)));
+    }
+    partes.join("\n  ")
+}
+
+/// Convierte segundos a una cadena humana ("45s", "12min", "3h 20min", "2d 4h").
+/// Solo presentación: el tiempo real lo timbra SIEMPRE el broker, esto solo lo formatea.
+fn formatear_duracion(seg: i64) -> String {
+    if seg < 0 {
+        return format!("{seg}s");
+    }
+    if seg < 60 {
+        return format!("{seg}s");
+    }
+    if seg < 3600 {
+        return format!("{}min", seg / 60);
+    }
+    if seg < 86_400 {
+        let h = seg / 3600;
+        let m = (seg % 3600) / 60;
+        if m == 0 {
+            return format!("{h}h");
+        }
+        return format!("{h}h {m}min");
+    }
+    let d = seg / 86_400;
+    let h = (seg % 86_400) / 3600;
+    if h == 0 {
+        format!("{d}d")
+    } else {
+        format!("{d}d {h}h")
+    }
 }
 
 /// Envía una respuesta JSON-RPC exitosa a una petición con `id`.

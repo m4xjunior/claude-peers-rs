@@ -6,7 +6,10 @@
 //! `Mutex` (bloqueo breve, sin pool). Es la opción para "1 binario y corre, sin Redis".
 
 use async_trait::async_trait;
-use peers_core::{Alcance, Almacen, EstadoMensaje, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
+use peers_core::{
+    aplicar_media_movil, Alcance, Almacen, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox,
+    Mensaje, Sesion, Tarea,
+};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
@@ -95,7 +98,13 @@ impl AlmacenSqlite {
             CREATE TABLE IF NOT EXISTS tareas (
                 id TEXT PRIMARY KEY, instancia_id TEXT NOT NULL, sesion_id TEXT NOT NULL,
                 descripcion TEXT NOT NULL, inicio TEXT NOT NULL, fin TEXT,
-                duracion_seg INTEGER, issue_number INTEGER
+                duracion_seg INTEGER, issue_number INTEGER, estimado_seg INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS factor_estimacion (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                muestras INTEGER NOT NULL DEFAULT 0,
+                factor REAL NOT NULL DEFAULT 1.0,
+                actualizado_en TEXT NOT NULL DEFAULT ''
             );
             "#,
         )?;
@@ -488,11 +497,11 @@ impl Almacen for AlmacenSqlite {
     async fn tarea_guardar(&self, t: &Tarea) -> anyhow::Result<()> {
         self.bloquear().execute(
             "INSERT OR REPLACE INTO tareas
-             (id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+             (id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 t.id, t.instancia_id, t.sesion_id, t.descripcion, t.inicio, t.fin,
-                t.duracion_seg, t.issue_number.map(|n| n as i64)
+                t.duracion_seg, t.issue_number.map(|n| n as i64), t.estimado_seg
             ],
         )?;
         Ok(())
@@ -502,7 +511,7 @@ impl Almacen for AlmacenSqlite {
         let conexion = self.bloquear();
         Ok(conexion
             .query_row(
-                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg
                  FROM tareas WHERE id=?1",
                 params![tarea_id],
                 fila_a_tarea,
@@ -528,13 +537,56 @@ impl Almacen for AlmacenSqlite {
         };
         let tareas = {
             let mut stmt = conexion.prepare(
-                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg
                  FROM tareas WHERE instancia_id=?1 ORDER BY inicio ASC",
             )?;
             let filas = stmt.query_map(params![instancia_id], fila_a_tarea)?;
             filas.filter_map(Result::ok).collect()
         };
         Ok((sesiones, tareas))
+    }
+
+    async fn factor_estimacion(&self) -> anyhow::Result<FactorEstimacion> {
+        let conexion = self.bloquear();
+        let fila: Option<(i64, f64, String)> = conexion
+            .query_row(
+                "SELECT muestras,factor,actualizado_en FROM factor_estimacion WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        Ok(match fila {
+            Some((muestras, factor, actualizado_en)) => FactorEstimacion {
+                muestras: muestras.max(0) as u32,
+                factor,
+                actualizado_en,
+            },
+            // Default neutro: sin corrección, 0 muestras.
+            None => FactorEstimacion {
+                muestras: 0,
+                factor: 1.0,
+                actualizado_en: String::new(),
+            },
+        })
+    }
+
+    async fn actualizar_factor(&self, ratio: f64, ahora: &str) -> anyhow::Result<FactorEstimacion> {
+        let actual = self.factor_estimacion().await?;
+        let nuevo = FactorEstimacion {
+            muestras: actual.muestras.saturating_add(1),
+            factor: aplicar_media_movil(actual.factor, ratio),
+            actualizado_en: ahora.to_string(),
+        };
+        // UPSERT sobre la fila única id=1 (el reloj lo pone el broker).
+        self.bloquear().execute(
+            "INSERT INTO factor_estimacion (id,muestras,factor,actualizado_en)
+             VALUES (1,?1,?2,?3)
+             ON CONFLICT(id) DO UPDATE SET
+               muestras=excluded.muestras, factor=excluded.factor,
+               actualizado_en=excluded.actualizado_en",
+            params![nuevo.muestras as i64, nuevo.factor, nuevo.actualizado_en],
+        )?;
+        Ok(nuevo)
     }
 }
 
@@ -562,6 +614,7 @@ fn fila_a_tarea(f: &rusqlite::Row<'_>) -> rusqlite::Result<Tarea> {
         fin: f.get(5)?,
         duracion_seg: f.get(6)?,
         issue_number: f.get::<_, Option<i64>>(7)?.map(|n| n as u64),
+        estimado_seg: f.get::<_, Option<i64>>(8)?,
     })
 }
 
@@ -737,6 +790,7 @@ mod pruebas {
             fin: None,
             duracion_seg: None,
             issue_number: None,
+            estimado_seg: None,
         };
         b.tarea_guardar(&t).await.unwrap();
         // Cierre con tiempo del "broker": 90s después.
@@ -747,5 +801,59 @@ mod pruebas {
         let (_, tareas) = b.jornada("jefin").await.unwrap();
         assert_eq!(tareas.len(), 1);
         assert_eq!(tareas[0].duracion_seg, Some(90)); // MEDIDO, no estimado
+    }
+
+    #[tokio::test]
+    async fn factor_default_aprende_clampa_y_upsert() {
+        // R2/R3/R4 + AC1/AC4 sobre SQLite: default neutro → un paso desde 1.0 con ratio 120 da
+        // 36.7 (un solo paso no llega al techo, fórmula real); un segundo ratio enorme (200)
+        // empuja por encima de 50 → clamp; un ratio 2 mueve por media móvil. UPSERT id=1.
+        let b = base();
+        let f0 = b.factor_estimacion().await.unwrap();
+        assert_eq!(f0.muestras, 0);
+        assert_eq!(f0.factor, 1.0);
+        assert_eq!(f0.actualizado_en, "");
+
+        // Paso 1: 1 + 0.3*(120-1) = 36.7. muestras=1.
+        let f1 = b.actualizar_factor(120.0, "2026-01-01T00:00:00Z").await.unwrap();
+        assert_eq!(f1.muestras, 1);
+        assert!((f1.factor - 36.7).abs() < 1e-9, "1 + 0.3*(120-1) = 36.7, fue {}", f1.factor);
+        assert_eq!(f1.actualizado_en, "2026-01-01T00:00:00Z");
+
+        // Paso 2: 36.7 + 0.3*(200-36.7) = 85.69 → clamp al techo 50. muestras=2.
+        let f2 = b.actualizar_factor(200.0, "2026-01-01T00:00:15Z").await.unwrap();
+        assert_eq!(f2.muestras, 2);
+        assert_eq!(f2.factor, 50.0, "ratio extremo desde factor alto se clampa al techo");
+
+        // Paso 3: media móvil hacia abajo: 50 + 0.3*(2-50) = 35.6. muestras=3.
+        let f3 = b.actualizar_factor(2.0, "2026-01-01T00:00:30Z").await.unwrap();
+        assert_eq!(f3.muestras, 3);
+        assert!((f3.factor - 35.6).abs() < 1e-9, "50 + 0.3*(2-50) = 35.6, fue {}", f3.factor);
+
+        // Relee de la base (no del valor devuelto): la fila persiste vía UPSERT.
+        let leido = b.factor_estimacion().await.unwrap();
+        assert_eq!(leido.muestras, 3);
+        assert!((leido.factor - 35.6).abs() < 1e-9);
+        assert_eq!(leido.actualizado_en, "2026-01-01T00:00:30Z");
+    }
+
+    #[tokio::test]
+    async fn tarea_roundtrip_conserva_estimado_seg() {
+        // R1 en SQLite: el estimado se persiste y se relee (la columna nueva no se pierde).
+        let b = base();
+        let t = Tarea {
+            id: "te".into(),
+            instancia_id: "jefin".into(),
+            sesion_id: "s1".into(),
+            descripcion: "con estimado".into(),
+            inicio: "2026-01-01T00:00:00Z".into(),
+            fin: None,
+            duracion_seg: None,
+            issue_number: None,
+            estimado_seg: Some(432000),
+        };
+        b.tarea_guardar(&t).await.unwrap();
+        let leida = b.tarea_obtener("te").await.unwrap().unwrap();
+        assert_eq!(leida.estimado_seg, Some(432000));
     }
 }

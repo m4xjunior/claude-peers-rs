@@ -55,6 +55,9 @@ pub async fn abrir_tarea(
         fin: None,
         duracion_seg: None,
         issue_number: None,
+        // El estimado lo wirea el handler /crear-tarea (Fase 3); aquí queda neutro para no
+        // alterar el comportamiento del fichaje existente.
+        estimado_seg: None,
     };
     almacen.tarea_guardar(&tarea).await?;
     Ok(tarea)

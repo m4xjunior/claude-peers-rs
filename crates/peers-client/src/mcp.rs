@@ -160,6 +160,66 @@ pub fn definiciones_tools() -> Value {
             "name": "revisar_mensajes",
             "description": "Revisa manualmente si hay mensajes nuevos de otras instancias. Normalmente llegan solos por notificación de canal; esto es un respaldo.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "crear_tarea",
+            "description": "Crea una tarea de trabajo con tu estimación de duración. El broker mide tu tiempo REAL (tú nunca timbras el tiempo) y te devuelve el estimado ya corregido según tu historial. Llámala ANTES de empezar trabajo sustancial; guarda el tarea_id para cerrarla al terminar.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "descripcion": {
+                        "type": "string",
+                        "description": "Qué vas a hacer en esta tarea (1 frase)."
+                    },
+                    "estimado_seg": {
+                        "type": "integer",
+                        "description": "Tu estimación de cuánto tardará, en segundos. Opcional pero recomendado: sin estimado no se aprende a corregir."
+                    }
+                },
+                "required": ["descripcion"]
+            }
+        },
+        {
+            "name": "reportar_tarea",
+            "description": "Añade una nota de progreso a una tarea abierta. No cierra la tarea ni mide tiempo; solo registra avance.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tarea_id": {
+                        "type": "string",
+                        "description": "El id de la tarea (devuelto por crear_tarea)."
+                    },
+                    "texto": {
+                        "type": "string",
+                        "description": "Nota de progreso a registrar."
+                    }
+                },
+                "required": ["tarea_id", "texto"]
+            }
+        },
+        {
+            "name": "cerrar_tarea",
+            "description": "Cierra una tarea al terminarla. El broker timbra el fin con SU reloj, mide el tiempo real y, si la tarea tenía estimado, aprende a corregir tus estimaciones futuras.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tarea_id": {
+                        "type": "string",
+                        "description": "El id de la tarea a cerrar (devuelto por crear_tarea)."
+                    }
+                },
+                "required": ["tarea_id"]
+            }
+        },
+        {
+            "name": "listar_tareas",
+            "description": "Lista tus tareas con sus tiempos (estimado, real y duración). Útil para ver qué tienes abierto y revisar tu historial.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "revisar_tareas",
+            "description": "Resumen rápido de tus tareas abiertas (sin cerrar). Recordatorio de qué te falta cerrar para que el broker cierre el bucle de aprendizaje.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ])
 }
@@ -214,7 +274,14 @@ Tools disponibles:\n\
 - listar_instancias: descubre otras instancias (alcance: maquina/directorio/repo)\n\
 - enviar_mensaje: envía un mensaje a otra instancia por su id\n\
 - definir_resumen: fija un resumen de lo que haces (visible a las demás)\n\
-- revisar_mensajes: revisa manualmente mensajes nuevos\n\n\
+- revisar_mensajes: revisa manualmente mensajes nuevos\n\
+- crear_tarea: crea una tarea con tu estimado de duración\n\
+- reportar_tarea: añade una nota de progreso a una tarea\n\
+- cerrar_tarea: cierra una tarea al terminarla\n\
+- listar_tareas: lista tus tareas con sus tiempos\n\
+- revisar_tareas: resumen de tus tareas abiertas\n\n\
+Antes de trabajo sustancial, crea una tarea con tu estimado (crear_tarea); al terminar, ciérrala (cerrar_tarea). \
+El broker mide tu tiempo real y aprende a corregir estimaciones.\n\n\
 Al iniciar, llama definir_resumen para describir en qué trabajas."
     )
 }

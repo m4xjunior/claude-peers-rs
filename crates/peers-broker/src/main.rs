@@ -28,12 +28,13 @@ use axum::{
 use clap::Parser;
 use github::GitHub;
 use peers_core::{
-    Almacen, ColaResumen, Mensaje, PeticionAbrirTarea, PeticionCerrarTarea, PeticionConfirmar,
-    PeticionDefinirResumen, PeticionEnviar, PeticionHistorial, PeticionJornada, PeticionLatido,
-    PeticionListar, PeticionPurgar, PeticionRecibir, PeticionRegistrar, PeticionReenviar,
-    PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea, RespuestaAdminInfo,
-    RespuestaAdminRedis, RespuestaEnviar, RespuestaJornada, RespuestaOk, RespuestaRegistrar,
-    RespuestaSalud, PUERTO_DEFECTO, VENCIMIENTO_MS,
+    corregir_estimado, Almacen, ColaResumen, FactorEstimacion, Mensaje, PeticionAbrirTarea,
+    PeticionCerrarTarea, PeticionConfirmar, PeticionDefinirResumen, PeticionEnviar,
+    PeticionHistorial, PeticionJornada, PeticionLatido, PeticionListar, PeticionPurgar,
+    PeticionRecibir, PeticionRegistrar, PeticionReenviar, PeticionReportarTarea, PeticionSalir,
+    RespuestaAbrirTarea, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar,
+    RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, PUERTO_DEFECTO,
+    VENCIMIENTO_MS,
 };
 use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -324,11 +325,16 @@ async fn salir(
 
 // --- Handlers de jornada (fase 2) ---
 
-async fn tarea_abrir(
-    State(e): State<Estado>,
-    Json(p): Json<PeticionAbrirTarea>,
-) -> Result<Json<RespuestaAbrirTarea>, ErrorApp> {
-    let ahora = ahora_iso();
+/// Abre una tarea timbrada por el broker, persistiendo el `estimado_seg` (si vino) y, si la
+/// integración GitHub está activa, cosiendo la issue espejo en el repo dinámico del peer.
+/// Devuelve `(tarea, issue_number)`. Lógica compartida por `/tarea/abrir` y `/crear-tarea`
+/// (no se duplica). Degradación graciosa: si GitHub falla o el peer no tiene repo, la tarea
+/// sigue local. El estimado NO se corrige aquí (eso lo decide cada handler con el factor).
+async fn abrir_tarea_con_estimado(
+    e: &Estado,
+    p: &PeticionAbrirTarea,
+    ahora: &str,
+) -> Result<(Tarea, Option<u64>), ErrorApp> {
     let tarea_id = format!("tar-{}-{ahora}", p.instancia_id);
     // La sesión activa es la abierta más reciente de la instancia.
     let (sesiones, _) = e.almacen.jornada(&p.instancia_id).await?;
@@ -345,9 +351,16 @@ async fn tarea_abrir(
         &p.instancia_id,
         &sesion_id,
         &p.descripcion,
-        &ahora,
+        ahora,
     )
     .await?;
+
+    // Persiste el estimado ingenuo de la IA en la tarea (R1). Tarea sin estimado → None (no
+    // contamina el factor al cerrar). Re-guarda solo si vino estimado.
+    if p.estimado_seg.is_some() {
+        tarea.estimado_seg = p.estimado_seg;
+        e.almacen.tarea_guardar(&tarea).await?;
+    }
 
     // Integración GitHub: cose el issue_number en la tarea (mi fatia, no la de Aluísio).
     // Degradación graciosa: si GH no está o falla, la tarea sigue local.
@@ -356,7 +369,7 @@ async fn tarea_abrir(
         // Repo DINÁMICO: el owner/repo sale del repo_github de la instancia DUEÑA de la tarea
         // (el repo donde ese peer trabaja). Si la instancia no tiene repo_github → degradación:
         // no creamos issue, la tarea sigue local.
-        match repo_de_instancia(&e, &p.instancia_id).await {
+        match repo_de_instancia(e, &p.instancia_id).await {
             Some((owner, repo)) => {
                 let labels = match &p.area {
                     Some(a) => vec![p.instancia_id.clone(), a.clone()],
@@ -381,7 +394,25 @@ async fn tarea_abrir(
         }
     }
 
-    Ok(Json(RespuestaAbrirTarea { tarea_id, issue_number }))
+    Ok((tarea, issue_number))
+}
+
+async fn tarea_abrir(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionAbrirTarea>,
+) -> Result<Json<RespuestaAbrirTarea>, ErrorApp> {
+    let ahora = ahora_iso();
+    let (tarea, issue_number) = abrir_tarea_con_estimado(&e, &p, &ahora).await?;
+
+    // El estimado corregido + factor/muestras se calculan en `/crear-tarea` (el endpoint de las
+    // tools MCP). `/tarea/abrir` es el legacy y devuelve neutros para no cambiar su contrato.
+    Ok(Json(RespuestaAbrirTarea {
+        tarea_id: tarea.id,
+        issue_number,
+        estimado_corregido_seg: None,
+        factor: 1.0,
+        muestras: 0,
+    }))
 }
 
 async fn tarea_reportar(
@@ -404,15 +435,35 @@ async fn tarea_reportar(
     Ok(Json(RespuestaOk { ok: true }))
 }
 
-async fn tarea_cerrar(
-    State(e): State<Estado>,
-    Json(p): Json<PeticionCerrarTarea>,
-) -> Result<Json<RespuestaOk>, ErrorApp> {
-    let tarea = jornada::cerrar_tarea(&e.almacen, &p.tarea_id, &ahora_iso()).await?;
+/// Cierra una tarea (el broker mide el real con SU reloj), aprende el factor si la tarea tenía
+/// estimado y real > 0, y cierra la issue espejo en GitHub si procede. Lógica compartida por
+/// `/tarea/cerrar` y `/cerrar-tarea` (no se duplica). Devuelve la tarea ya cerrada.
+///
+/// Aprendizaje (R3): `ratio = estimado_seg / real_seg`; `actualizar_factor(ratio, ahora)`. Una
+/// tarea SIN estimado o con `real <= 0` NO toca el factor (no lo contamina). El real lo timbra
+/// SIEMPRE el broker (regla sagrada): aquí se lee de `tarea.duracion_seg`, nunca del cliente.
+async fn cerrar_tarea_y_aprender(e: &Estado, tarea_id: &str, ahora: &str) -> Result<Tarea, ErrorApp> {
+    let tarea = jornada::cerrar_tarea(&e.almacen, tarea_id, ahora).await?;
+
+    // Aprendizaje del factor: solo con estimado presente y real > 0 (R3/AC4).
+    if let (Some(estimado), Some(real)) = (tarea.estimado_seg, tarea.duracion_seg) {
+        if estimado > 0 && real > 0 {
+            let ratio = estimado as f64 / real as f64;
+            match e.almacen.actualizar_factor(ratio, ahora).await {
+                Ok(f) => info!(
+                    "factor aprendido: tarea {} ratio {:.2} → factor {:.2} ({} muestras)",
+                    tarea_id, ratio, f.factor, f.muestras
+                ),
+                // Degradación: si el almacén falla al aprender, la tarea queda cerrada igual.
+                Err(err) => warn!("no se pudo actualizar el factor (tarea cerrada igual): {err:#}"),
+            }
+        }
+    }
+
     if let Some(gh) = &e.github {
         if let Some(n) = tarea.issue_number {
             // Mismo repo dinámico: el de la instancia dueña de la tarea.
-            if let Some((owner, repo)) = repo_de_instancia(&e, &tarea.instancia_id).await {
+            if let Some((owner, repo)) = repo_de_instancia(e, &tarea.instancia_id).await {
                 let cierre = format!(
                     "Tarea cerrada. Duración medida por el broker: {}s.",
                     tarea.duracion_seg.unwrap_or(0)
@@ -423,7 +474,76 @@ async fn tarea_cerrar(
             }
         }
     }
+    Ok(tarea)
+}
+
+async fn tarea_cerrar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionCerrarTarea>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    cerrar_tarea_y_aprender(&e, &p.tarea_id, &ahora_iso()).await?;
     Ok(Json(RespuestaOk { ok: true }))
+}
+
+// --- Handlers de tareas autogestionadas + aprendizaje (los que usan las tools MCP) ---
+//
+// `/crear-tarea`, `/cerrar-tarea`, `/listar-tareas`, `/factor-estimacion`. Reutilizan la
+// jornada/fichaje existente (abrir_tarea_con_estimado / cerrar_tarea_y_aprender) y el factor
+// del almacén. Degradan: si algo falla, devuelven error 500 JSON, nunca panic.
+
+/// `POST /crear-tarea` { instancia_id, descripcion, area?, estimado_seg? }. Abre la tarea
+/// (reusa la jornada), persiste el estimado, lee el factor vigente y devuelve el estimado YA
+/// corregido (`estimado / factor`) + factor + muestras, para que el peer reajuste su plan en
+/// vivo (R6/R8/AC2). Si no vino estimado, `estimado_corregido_seg` es None.
+async fn crear_tarea(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionAbrirTarea>,
+) -> Result<Json<RespuestaAbrirTarea>, ErrorApp> {
+    let ahora = ahora_iso();
+    let (tarea, issue_number) = abrir_tarea_con_estimado(&e, &p, &ahora).await?;
+
+    // Lee el factor vigente para corregir el estimado (R4). Default neutro (factor 1.0, 0
+    // muestras) si el almacén aún no tiene la clave — nunca panic.
+    let factor = e.almacen.factor_estimacion().await?;
+    let estimado_corregido_seg = p
+        .estimado_seg
+        .map(|estimado| corregir_estimado(estimado, factor.factor));
+
+    Ok(Json(RespuestaAbrirTarea {
+        tarea_id: tarea.id,
+        issue_number,
+        estimado_corregido_seg,
+        factor: factor.factor,
+        muestras: factor.muestras,
+    }))
+}
+
+/// `POST /cerrar-tarea` { tarea_id }. Cierra la tarea (el broker mide el real), aprende el
+/// factor si procede (R3/R9) y cierra la issue espejo. Idempotencia: si la tarea no existe,
+/// `cerrar_tarea` devuelve error → 500 JSON (el cliente degrada).
+async fn cerrar_tarea(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionCerrarTarea>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    cerrar_tarea_y_aprender(&e, &p.tarea_id, &ahora_iso()).await?;
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+/// `POST /listar-tareas` { instancia_id } → las tareas de la jornada de esa instancia (R10).
+async fn listar_tareas(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionJornada>,
+) -> Result<Json<Vec<Tarea>>, ErrorApp> {
+    let (_sesiones, tareas) = e.almacen.jornada(&p.instancia_id).await?;
+    Ok(Json(tareas))
+}
+
+/// `GET /factor-estimacion` → el factor de corrección global aprendido (R4/R10/R11). Lo
+/// consume la TUI (pantalla Broker). Default neutro si aún no hay muestras.
+async fn factor_estimacion(
+    State(e): State<Estado>,
+) -> Result<Json<FactorEstimacion>, ErrorApp> {
+    Ok(Json(e.almacen.factor_estimacion().await?))
 }
 
 /// Resuelve (owner, repo) del repo_github de una instancia. None si la instancia no existe
@@ -633,6 +753,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/tarea/reportar", post(tarea_reportar))
         .route("/tarea/cerrar", post(tarea_cerrar))
         .route("/jornada", post(jornada_consolidada))
+        // Tareas autogestionadas + aprendizaje (las que usan las tools MCP del peers-client).
+        .route("/crear-tarea", post(crear_tarea))
+        .route("/cerrar-tarea", post(cerrar_tarea))
+        .route("/listar-tareas", post(listar_tareas))
+        .route("/factor-estimacion", get(factor_estimacion))
         // Admin (panel TUI): introspección protegida por el mismo token, nunca en /salud.
         .route("/admin/info", get(admin_info))
         .route("/admin/redis", get(admin_redis))

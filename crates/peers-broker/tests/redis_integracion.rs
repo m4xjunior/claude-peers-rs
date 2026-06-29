@@ -179,6 +179,7 @@ async fn redis_jornada_timbrada() {
         fin: None,
         duracion_seg: None,
         issue_number: None,
+        estimado_seg: None,
     };
     alm.tarea_guardar(&t).await.unwrap();
     // Cierre timbrado 90s después.
@@ -245,6 +246,76 @@ async fn redis_transicion_idempotente_timbra_una_vez() {
     assert!(!alm.transicionar_mensaje(mid, EstadoMensaje::Enviado, "2026-01-01T00:00:04Z").await.unwrap());
 
     limpiar(&alm, &["it-idem", "it-emisor"]).await;
+}
+
+#[tokio::test]
+async fn redis_factor_aprende_clampa_y_persiste() {
+    // R2/R3/R4 + AC1/AC4 sobre Redis: empezando del default (factor 1.0, 0 muestras), un ratio
+    // extremo (120) clampa el factor a 50 con muestras=1; una segunda llamada con ratio 2 lo
+    // mueve por media móvil; el factor persiste (lo lee un handle nuevo al mismo Redis).
+    let url = match url_redis() {
+        Some(u) => u,
+        None => return,
+    };
+    let Some(alm) = almacen_o_saltar().await else {
+        eprintln!("SALTADO: no hay Redis disponible");
+        return;
+    };
+    // Reset determinista de la clave global (DEL directo: factor es estado compartido).
+    {
+        use deadpool_redis::redis::cmd;
+        use deadpool_redis::{Config, Runtime};
+        let pool = Config::from_url(&url)
+            .create_pool(Some(Runtime::Tokio1))
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let _: () = cmd("DEL")
+            .arg("cprs:factor_estimacion")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // Default neutro tras el reset.
+    let f0 = alm.factor_estimacion().await.unwrap();
+    assert_eq!(f0.muestras, 0);
+    assert_eq!(f0.factor, 1.0);
+
+    // Paso 1: 1 + 0.3*(120-1) = 36.7 (un solo paso no llega al techo). muestras=1.
+    let f1 = alm.actualizar_factor(120.0, "2026-01-01T00:00:00Z").await.unwrap();
+    assert_eq!(f1.muestras, 1);
+    assert!((f1.factor - 36.7).abs() < 1e-9, "1 + 0.3*(120-1) = 36.7, fue {}", f1.factor);
+    assert_eq!(f1.actualizado_en, "2026-01-01T00:00:00Z");
+
+    // Paso 2: 36.7 + 0.3*(200-36.7) = 85.69 → clamp al techo 50. muestras=2.
+    let f2 = alm.actualizar_factor(200.0, "2026-01-01T00:00:15Z").await.unwrap();
+    assert_eq!(f2.muestras, 2);
+    assert_eq!(f2.factor, 50.0, "ratio extremo desde factor alto se clampa al techo");
+
+    // Paso 3: media móvil hacia abajo: 50 + 0.3*(2-50) = 35.6. muestras=3.
+    let f3 = alm.actualizar_factor(2.0, "2026-01-01T00:00:30Z").await.unwrap();
+    assert_eq!(f3.muestras, 3);
+    assert!((f3.factor - 35.6).abs() < 1e-9, "50 + 0.3*(2-50) = 35.6, fue {}", f3.factor);
+
+    // Persiste: un handle NUEVO al mismo Redis lee el mismo factor.
+    let alm2 = AlmacenRedis::nuevo(&url).unwrap();
+    let leido = alm2.factor_estimacion().await.unwrap();
+    assert_eq!(leido.muestras, 3);
+    assert!((leido.factor - 35.6).abs() < 1e-9);
+    assert_eq!(leido.actualizado_en, "2026-01-01T00:00:30Z");
+
+    // Limpieza.
+    use deadpool_redis::redis::cmd;
+    use deadpool_redis::{Config, Runtime};
+    let pool = Config::from_url(&url)
+        .create_pool(Some(Runtime::Tokio1))
+        .unwrap();
+    let mut conn = pool.get().await.unwrap();
+    let _: () = cmd("DEL")
+        .arg("cprs:factor_estimacion")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

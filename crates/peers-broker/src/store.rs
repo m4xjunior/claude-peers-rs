@@ -15,6 +15,7 @@
 //!   cprs:sesiones:{inst}    LIST (JSON de Sesion)
 //!   cprs:tareas:{inst}      LIST (JSON de Tarea)  — fuente de la jornada
 //!   cprs:tarea:{id}         STRING (JSON de Tarea) — índice directo por id de tarea
+//!   cprs:factor_estimacion  HASH {muestras, factor, actualizado_en} — factor de corrección global
 //!
 //! DISEÑO bandeja/historial: el ZSET solo guarda `msg_id` (member) ordenado por `msgseq`
 //! (score); el detalle del mensaje (JSON, estado, timestamps) vive en el HASH `cprs:msg:{id}`,
@@ -24,7 +25,10 @@
 use async_trait::async_trait;
 use deadpool_redis::redis::{cmd, AsyncCommands};
 use deadpool_redis::{Config, Pool, Runtime};
-use peers_core::{Alcance, Almacen, EstadoMensaje, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
+use peers_core::{
+    aplicar_media_movil, Alcance, Almacen, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox,
+    Mensaje, Sesion, Tarea,
+};
 
 const NS: &str = "cprs:";
 
@@ -68,6 +72,9 @@ fn k_tareas(inst: &str) -> String {
 }
 fn k_tarea(id: &str) -> String {
     format!("{NS}tarea:{id}")
+}
+fn k_factor() -> String {
+    format!("{NS}factor_estimacion")
 }
 
 #[async_trait]
@@ -531,6 +538,49 @@ impl Almacen for AlmacenRedis {
             }
         }
         Ok((sesiones, tareas))
+    }
+
+    async fn factor_estimacion(&self) -> anyhow::Result<FactorEstimacion> {
+        let mut conn = self.conn().await?;
+        let clave = k_factor();
+        let existe: bool = conn.exists(&clave).await?;
+        if !existe {
+            // Default neutro: sin corrección, 0 muestras.
+            return Ok(FactorEstimacion {
+                muestras: 0,
+                factor: 1.0,
+                actualizado_en: String::new(),
+            });
+        }
+        let muestras: Option<u32> = conn.hget(&clave, "muestras").await?;
+        let factor: Option<f64> = conn.hget(&clave, "factor").await?;
+        let actualizado_en: Option<String> = conn.hget(&clave, "actualizado_en").await?;
+        Ok(FactorEstimacion {
+            muestras: muestras.unwrap_or(0),
+            factor: factor.unwrap_or(1.0),
+            actualizado_en: actualizado_en.unwrap_or_default(),
+        })
+    }
+
+    async fn actualizar_factor(&self, ratio: f64, ahora: &str) -> anyhow::Result<FactorEstimacion> {
+        // Lee el actual, aplica la media móvil pura (clamp incluido), incrementa muestras y
+        // persiste con el timbre del broker. El factor NUEVO se devuelve para que el handler
+        // lo informe.
+        let actual = self.factor_estimacion().await?;
+        let nuevo = FactorEstimacion {
+            muestras: actual.muestras.saturating_add(1),
+            factor: aplicar_media_movil(actual.factor, ratio),
+            actualizado_en: ahora.to_string(),
+        };
+        let mut conn = self.conn().await?;
+        cmd("HSET")
+            .arg(k_factor())
+            .arg("muestras").arg(nuevo.muestras)
+            .arg("factor").arg(nuevo.factor)
+            .arg("actualizado_en").arg(&nuevo.actualizado_en)
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(nuevo)
     }
 }
 

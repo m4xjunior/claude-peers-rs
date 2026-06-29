@@ -8,7 +8,7 @@
 //! Todos los métodos son async (Redis lo es) y devuelven `anyhow::Result` — nada entra
 //! en pánico; el handler traduce el error a un 500 con JSON.
 
-use crate::{Alcance, EstadoMensaje, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
+use crate::{Alcance, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
 use async_trait::async_trait;
 
 /// Alcance de listado, reexportado para que las firmas no dependan del módulo concreto.
@@ -140,4 +140,17 @@ pub trait Almacen: Send + Sync {
     async fn tarea_guardar(&self, tarea: &Tarea) -> anyhow::Result<()>;
     async fn tarea_obtener(&self, tarea_id: &str) -> anyhow::Result<Option<Tarea>>;
     async fn jornada(&self, instancia_id: &str) -> anyhow::Result<(Vec<Sesion>, Vec<Tarea>)>;
+
+    // --- Aprendizaje de estimación (factor global) ---
+
+    /// Lee el factor de corrección global (R2/R4). Si nunca se ha actualizado, devuelve el
+    /// default neutro `{ muestras: 0, factor: 1.0, actualizado_en: "" }` (sin corrección).
+    /// Redis: HASH `cprs:factor_estimacion`. SQLite: tabla `factor_estimacion(id=1)`.
+    async fn factor_estimacion(&self) -> anyhow::Result<FactorEstimacion>;
+
+    /// Aprende de UNA tarea cerrada con estimado+real válidos (R3): lee el factor actual,
+    /// aplica la media móvil exponencial (`peers_core::aplicar_media_movil`) con `ratio`,
+    /// incrementa `muestras`, timbra `actualizado_en = ahora` (el reloj lo pone el broker,
+    /// nunca la IA) y persiste. Devuelve el factor ya actualizado.
+    async fn actualizar_factor(&self, ratio: f64, ahora: &str) -> anyhow::Result<FactorEstimacion>;
 }

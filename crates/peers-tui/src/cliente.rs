@@ -151,6 +151,13 @@ impl ClienteAdmin {
         self.get("/admin/info").await
     }
 
+    /// `GET /factor-estimacion` → el factor de corrección global aprendido + nº de muestras
+    /// (R10/R11). Lo muestra la pantalla Broker. Degrada como el resto: si falla, el banner
+    /// lo refleja y la pantalla conserva el último factor bueno (o muestra "(sin datos)").
+    pub async fn factor_estimacion(&self) -> ResultadoBroker<FactorEstimacion> {
+        self.get("/factor-estimacion").await
+    }
+
     /// `GET /admin/redis` → colas y outbox pendientes por peer. Pantalla Redis.
     pub async fn admin_redis(&self) -> ResultadoBroker<RespuestaAdminRedis> {
         self.get("/admin/redis").await

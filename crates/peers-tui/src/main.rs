@@ -154,6 +154,15 @@ async fn refrescar(cliente: &ClienteAdmin, app: &mut App) {
             if let Ok(s) = salud {
                 app.datos.salud = Some(s);
             }
+            // Factor aprendido: degrada igual que el resto. Si falla, no subimos el banner a
+            // Ok; conservamos el último factor bueno. Si va bien, refrescamos.
+            let factor = cliente.factor_estimacion().await;
+            if factor.is_ok() {
+                app.marcar_resultado(&factor);
+            }
+            if let Ok(fe) = factor {
+                app.datos.factor = Some(fe);
+            }
         }
         Pantalla::Trazabilidad => {
             // El foco necesita la lista de peers (para resolver el peer seleccionado por

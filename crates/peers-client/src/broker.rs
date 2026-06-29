@@ -116,4 +116,60 @@ impl ClienteBroker {
         )
         .await
     }
+
+    /// Crea una tarea con el estimado ingenuo de la IA. El broker timbra el inicio con SU
+    /// reloj (regla sagrada: la IA nunca timbra el tiempo) y devuelve el estimado ya corregido
+    /// por el factor aprendido (`estimado/factor`), más el factor vigente y sus muestras.
+    pub async fn crear_tarea(
+        &self,
+        instancia_id: &str,
+        descripcion: &str,
+        estimado_seg: Option<i64>,
+    ) -> Result<RespuestaAbrirTarea> {
+        self.post(
+            "/crear-tarea",
+            &PeticionAbrirTarea {
+                instancia_id: instancia_id.to_string(),
+                descripcion: descripcion.to_string(),
+                area: None,
+                estimado_seg,
+            },
+        )
+        .await
+    }
+
+    /// Cierra una tarea por su id. El broker mide el tiempo REAL (timbra el fin con su reloj)
+    /// y, si la tarea traía estimado, aprende el factor de corrección de la diferencia.
+    pub async fn cerrar_tarea(&self, tarea_id: &str) -> Result<RespuestaOk> {
+        self.post(
+            "/cerrar-tarea",
+            &PeticionCerrarTarea {
+                tarea_id: tarea_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Añade una nota de progreso a una tarea abierta (no mide tiempo ni la cierra).
+    pub async fn reportar_tarea(&self, tarea_id: &str, texto: &str) -> Result<RespuestaOk> {
+        self.post(
+            "/tarea/reportar",
+            &PeticionReportarTarea {
+                tarea_id: tarea_id.to_string(),
+                texto: texto.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Lista las tareas de una instancia (con sus tiempos timbrados por el broker).
+    pub async fn listar_tareas(&self, instancia_id: &str) -> Result<Vec<Tarea>> {
+        self.post(
+            "/listar-tareas",
+            &PeticionJornada {
+                instancia_id: instancia_id.to_string(),
+            },
+        )
+        .await
+    }
 }
