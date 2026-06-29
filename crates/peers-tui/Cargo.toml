@@ -26,3 +26,6 @@ crossterm = "0.29.0"
 toml = "1"
 # Localización del home/config dir multiplataforma.
 dirs = "6"
+# Reloj UTC para timbrar el "ahora" que usa el orden overrun-primero de la vista global de
+# tareas (#14/R3). Mismo crate `time` que el broker/core, fijado por el workspace.
+time = { workspace = true }

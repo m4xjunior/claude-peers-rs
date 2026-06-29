@@ -372,7 +372,17 @@ async fn abrir_tarea_con_estimado(
         }
     }
 
-    let tarea_id = format!("tar-{}-{ahora}", p.instancia_id);
+    // #15/R5: id global atómico vía INCR cprs:tareaseq (espejo de cprs:msgseq) → `tar-{seq}`.
+    // Dos crear_tarea simultáneas del mismo peer NUNCA colisionan. Degradación graciosa: si el
+    // contador fallara (Redis caído), caemos al esquema viejo `tar-{inst}-{ahora}` para no perder
+    // la tarea — sigue siendo legible por `tarea_obtener` (compat AC5).
+    let tarea_id = match e.almacen.siguiente_tarea_seq().await {
+        Ok(seq) => format!("tar-{seq}"),
+        Err(err) => {
+            tracing::warn!("siguiente_tarea_seq falló ({err:#}); uso id por fecha como fallback");
+            format!("tar-{}-{ahora}", p.instancia_id)
+        }
+    };
     // La sesión activa es la abierta más reciente de la instancia.
     let (sesiones, _) = e.almacen.jornada(&p.instancia_id).await?;
     let sesion_id = sesiones
@@ -1077,6 +1087,14 @@ async fn admin_alertas(State(e): State<Estado>) -> Result<Json<Vec<Alerta>>, Err
     Ok(Json(e.almacen.alertas().await?))
 }
 
+/// `GET /admin/tareas` → vista global del jefe: TODAS las tareas de TODAS las instancias, cada
+/// una con su `instancia_id`, ordenadas por inicio desc (#14/R1/AC1). SOLO LECTURA. Lo consume
+/// la TUI en "vista global" (tecla `g`), que las filtra por estado y pone overrun-primero. Va en
+/// `rutas_protegidas` (token); nunca en /salud. El orden y el join sin KEYS los hace el almacén.
+async fn admin_tareas(State(e): State<Estado>) -> Result<Json<Vec<Tarea>>, ErrorApp> {
+    Ok(Json(e.almacen.tareas_todas().await?))
+}
+
 /// Evalúa los 3 detectores del supervisor y emite/resuelve alertas (R1–R4, R7).
 ///
 /// El tiempo lo mide el broker: recibe `ahora` (su reloj) y lo compara contra los timestamps
@@ -1362,6 +1380,16 @@ async fn main() -> anyhow::Result<()> {
             {
                 error!("fallo al podar historial: {e:#}");
             }
+            // #15/R6: retención de tareas por instancia — conserva las RETENCION_TAREAS más
+            // recientes por peer y purga las viejas (espejo de podar_historial). Degrada: si
+            // falla, se loguea y el ciclo sigue (no tumba el broker).
+            if let Err(e) = limpieza
+                .almacen
+                .podar_tareas(peers_core::RETENCION_TAREAS)
+                .await
+            {
+                error!("fallo al podar tareas: {e:#}");
+            }
             // Supervisor (R1): el `ahora` lo timbra el broker en cada tick. La función ya
             // aísla cada detector (warn + sigue), así que un fallo no rompe el ciclo (AC5).
             detectar_alertas(&limpieza, umbrales, &ahora_iso()).await;
@@ -1411,6 +1439,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/reenviar", post(admin_reenviar))
         // Supervisor (fase 5): alertas vigentes para el banner de la TUI (R6/AC3).
         .route("/admin/alertas", get(admin_alertas))
+        // #14/R1: vista global de todas las tareas (cuadro de mando del jefe).
+        .route("/admin/tareas", get(admin_tareas))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));
 
     let app = Router::new()

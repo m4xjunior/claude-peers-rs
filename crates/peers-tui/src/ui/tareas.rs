@@ -19,18 +19,29 @@ use ratatui::{
 };
 
 pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
-    let foco = app.traza_peer_actual();
+    // La lista a pintar y su orden los decide `App`: en vista global filtra por estado y sube las
+    // overrun/atascadas (#14/R3); en vista peer es el orden del broker. La selección indexa ESTA
+    // lista (ver `App::tarea_seleccionada`), así las acciones operan sobre la fila correcta (R4).
+    let visibles = app.tareas_ordenadas(&app.ahora);
 
-    let titulo = match &foco {
-        Some(id) => format!(" Tareas · {} ({}) ", id, app.datos.tareas.len()),
-        None => " Tareas (sin peer — selecciona uno en pantalla 1) ".to_string(),
+    // Título: en vista global anuncia GLOBAL + filtro activo; en vista peer, el peer enfocado.
+    let titulo = if app.vista_global {
+        format!(" Tareas · GLOBAL · filtro: {} ({}) ", app.etiqueta_filtro(), visibles.len())
+    } else {
+        match app.traza_peer_actual() {
+            Some(id) => format!(" Tareas · {} ({}) ", id, visibles.len()),
+            None => " Tareas (sin peer — selecciona uno en pantalla 1) ".to_string(),
+        }
     };
 
-    if foco.is_none() || app.datos.tareas.is_empty() {
-        let guia = if foco.is_none() {
-            "No hay peers. Ve a la pantalla 1 (Peers) y selecciona uno."
+    // Caso vacío: guía contextual distinta para vista peer (sin foco / sin tareas) y global.
+    if visibles.is_empty() {
+        let guia = if app.vista_global {
+            "No hay tareas que coincidan con el filtro. Pulsa 0 para ver todas, g para volver a la vista peer."
+        } else if app.traza_peer_actual().is_none() {
+            "No hay peers. Ve a la pantalla 1 (Peers) y selecciona uno. Pulsa g para la vista global."
         } else {
-            "Este peer aún no ha abierto tareas en su jornada."
+            "Este peer aún no ha abierto tareas en su jornada. Pulsa g para la vista global."
         };
         let p = Paragraph::new(Span::styled(guia, Style::default().fg(Color::DarkGray)))
             .block(Block::default().borders(Borders::ALL).title(titulo));
@@ -38,30 +49,49 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let encabezado = Row::new(["tarea", "estado", "estimado", "real"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-
-    let filas: Vec<Row> = app
-        .datos
-        .tareas
-        .iter()
-        .enumerate()
-        .map(|(idx, t)| fila_render(idx, t, app.seleccion))
-        .collect();
-
-    let tabla = Table::new(
-        filas,
-        [
-            Constraint::Min(20),
-            Constraint::Length(11),
-            Constraint::Length(10),
-            Constraint::Length(10),
-        ],
-    )
-    .header(encabezado)
-    .block(Block::default().borders(Borders::ALL).title(titulo));
-
-    f.render_widget(tabla, area);
+    // En vista global añadimos la columna PEER (dueño de la tarea) — el jefe ve de quién es cada una.
+    if app.vista_global {
+        let encabezado = Row::new(["peer", "tarea", "estado", "estimado", "real"])
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        let filas: Vec<Row> = visibles
+            .iter()
+            .enumerate()
+            .map(|(idx, t)| fila_render_global(idx, t, app.seleccion, &app.ahora))
+            .collect();
+        let tabla = Table::new(
+            filas,
+            [
+                Constraint::Length(16),
+                Constraint::Min(20),
+                Constraint::Length(11),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        )
+        .header(encabezado)
+        .block(Block::default().borders(Borders::ALL).title(titulo));
+        f.render_widget(tabla, area);
+    } else {
+        let encabezado = Row::new(["tarea", "estado", "estimado", "real"])
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        let filas: Vec<Row> = visibles
+            .iter()
+            .enumerate()
+            .map(|(idx, t)| fila_render(idx, t, app.seleccion))
+            .collect();
+        let tabla = Table::new(
+            filas,
+            [
+                Constraint::Min(20),
+                Constraint::Length(11),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        )
+        .header(encabezado)
+        .block(Block::default().borders(Borders::ALL).title(titulo));
+        f.render_widget(tabla, area);
+    }
 
     // Modal DETALLE encima de la tabla (Enter sobre una fila).
     if let Some(tarea) = &app.tarea_detalle {
@@ -83,6 +113,39 @@ fn fila_render(idx: usize, t: &Tarea, seleccion: usize) -> Row<'static> {
     };
 
     Row::new(vec![
+        Cell::from(desc),
+        Cell::from(etiqueta).style(Style::default().fg(color)),
+        Cell::from(estimado),
+        Cell::from(real),
+    ])
+    .style(estilo_fila)
+}
+
+/// Fila de tarea en VISTA GLOBAL: añade la columna PEER (dueño) al principio. Marca las
+/// overrun/atascadas con un `⚠` rojo en el peer para que salten a la vista del jefe (#14/R3).
+/// `ahora_iso` se usa para evaluar el overrun (mismo reloj que el orden). Función pura.
+fn fila_render_global(idx: usize, t: &Tarea, seleccion: usize, ahora_iso: &str) -> Row<'static> {
+    let [desc, estimado, real, _estado_viejo] = fila_tarea(t);
+    let color = color_estado_tarea(t.estado);
+    let etiqueta = etiqueta_estado_tarea(t.estado);
+    let overrun = App::tarea_overrun(t, ahora_iso);
+
+    let estilo_fila = if idx == seleccion {
+        Style::default().bg(Color::Rgb(40, 40, 60)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let peer_txt = crate::app::recortar(&t.instancia_id, 14);
+    let celda_peer = if overrun {
+        // Atascada: prefijo ⚠ y color rojo para destacarla por encima del resto.
+        Cell::from(format!("⚠ {peer_txt}")).style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Cell::from(peer_txt)
+    };
+
+    Row::new(vec![
+        celda_peer,
         Cell::from(desc),
         Cell::from(etiqueta).style(Style::default().fg(color)),
         Cell::from(estimado),

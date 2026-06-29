@@ -79,6 +79,9 @@ fn k_reportes(tarea_id: &str) -> String {
 fn k_factor() -> String {
     format!("{NS}factor_estimacion")
 }
+fn k_tareaseq() -> String {
+    format!("{NS}tareaseq")
+}
 fn k_alertas() -> String {
     format!("{NS}alertas")
 }
@@ -581,6 +584,77 @@ impl Almacen for AlmacenRedis {
             }
         }
         Ok((sesiones, tareas))
+    }
+
+    async fn tareas_todas(&self) -> anyhow::Result<Vec<Tarea>> {
+        // #14/R1: vista global. Itera las instancias conocidas (NUNCA KEYS) y por cada una lee los
+        // ids de su lista cprs:tareas:{id} + el índice directo cprs:tarea:{id_tarea}. Degrada por
+        // tarea: una corrupta/ausente se salta. Orden final por inicio DESC (más reciente primero).
+        let mut conn = self.conn().await?;
+        let ids: Vec<String> = conn.smembers(format!("{NS}instancias")).await?;
+        let mut tareas = Vec::new();
+        for inst in ids {
+            let ids_tarea: Vec<String> = conn.lrange(k_tareas(&inst), 0, -1).await?;
+            for id_t in ids_tarea {
+                if let Some(t) = self.tarea_obtener(&id_t).await? {
+                    tareas.push(t);
+                }
+            }
+        }
+        // inicio es ISO 8601 (orden lexicográfico == cronológico); DESC = más reciente primero.
+        tareas.sort_by(|a, b| b.inicio.cmp(&a.inicio));
+        Ok(tareas)
+    }
+
+    async fn siguiente_tarea_seq(&self) -> anyhow::Result<i64> {
+        // #15/R5: id global atómico, espejo de cprs:msgseq. INCR es atómico en Redis: dos
+        // crear_tarea simultáneas obtienen seqs distintas → tar-{seq} nunca colisiona.
+        let mut conn = self.conn().await?;
+        let seq: i64 = conn.incr(k_tareaseq(), 1).await?;
+        Ok(seq)
+    }
+
+    async fn podar_tareas(&self, retener: usize) -> anyhow::Result<()> {
+        // #15/R6: espejo de podar_historial pero sobre tareas. Por cada instancia, conserva las
+        // `retener` tareas más recientes (por inicio) y purga el resto: DEL del índice
+        // cprs:tarea:{id} de las viejas + reescribe la lista cprs:tareas:{inst} con las conservadas.
+        if retener == 0 {
+            return Ok(()); // no-op, igual que podar_historial(0).
+        }
+        let mut conn = self.conn().await?;
+        let ids: Vec<String> = conn.smembers(format!("{NS}instancias")).await?;
+        for inst in ids {
+            let lista = k_tareas(&inst);
+            let ids_tarea: Vec<String> = conn.lrange(&lista, 0, -1).await?;
+            if ids_tarea.len() <= retener {
+                continue;
+            }
+            // Resuelve (id, inicio) para ordenar por recencia. Una tarea sin índice (huérfana en la
+            // lista) se trata como antiquísima (inicio "") → cae entre las purgables y se limpia.
+            let mut con_inicio: Vec<(String, String)> = Vec::with_capacity(ids_tarea.len());
+            for id_t in &ids_tarea {
+                let inicio = match self.tarea_obtener(id_t).await? {
+                    Some(t) => t.inicio,
+                    None => String::new(),
+                };
+                con_inicio.push((id_t.clone(), inicio));
+            }
+            // inicio DESC: las primeras `retener` son las más recientes (conservadas).
+            con_inicio.sort_by(|a, b| b.1.cmp(&a.1));
+            let conservadas: Vec<String> =
+                con_inicio.iter().take(retener).map(|(id, _)| id.clone()).collect();
+            let purgadas = &con_inicio[retener..];
+            for (id_t, _) in purgadas {
+                let _: () = conn.del(k_tarea(id_t)).await?;
+            }
+            // Reescribe la lista solo con las conservadas (DEL + RPUSH): mantiene el invariante
+            // "la lista solo referencia índices vivos". Orden interno: inicio DESC (recencia).
+            let _: () = conn.del(&lista).await?;
+            if !conservadas.is_empty() {
+                let _: () = conn.rpush(&lista, &conservadas).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn tarea_editar(

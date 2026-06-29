@@ -182,6 +182,14 @@ impl AlmacenSqlite {
                 tipo TEXT NOT NULL, sujeto TEXT NOT NULL,
                 PRIMARY KEY (tipo, sujeto)
             );
+            -- #15/R5: contador transaccional para ids de tarea (espejo de cprs:tareaseq en Redis).
+            -- Fila única id=1; `siguiente_tarea_seq` hace UPDATE atómico + lectura bajo el mismo
+            -- lock del Mutex → dos crear_tarea simultáneas obtienen seqs distintas (sin colisión).
+            CREATE TABLE IF NOT EXISTS tareaseq (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                valor INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO tareaseq (id, valor) VALUES (1, 0);
             "#,
         )?;
         // Migración para bases YA existentes (R10/AC6): `CREATE TABLE IF NOT EXISTS` no añade
@@ -621,6 +629,52 @@ impl Almacen for AlmacenSqlite {
                 fila_a_tarea,
             )
             .ok())
+    }
+
+    async fn tareas_todas(&self) -> anyhow::Result<Vec<Tarea>> {
+        // #14/R1: vista global. Una sola consulta a la tabla `tareas` (cada fila ya tiene su
+        // instancia_id) ordenada por inicio DESC (más reciente primero). Degrada por fila:
+        // una que no parsea se descarta.
+        let conexion = self.bloquear();
+        let mut stmt = conexion.prepare(
+            "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo,factor_aprendido,evidencia
+             FROM tareas ORDER BY inicio DESC",
+        )?;
+        let filas = stmt.query_map([], fila_a_tarea)?;
+        Ok(filas.filter_map(Result::ok).collect())
+    }
+
+    async fn siguiente_tarea_seq(&self) -> anyhow::Result<i64> {
+        // #15/R5: contador transaccional. UPDATE + lectura bajo el MISMO lock del Mutex
+        // (self.bloquear() entrega exclusión mutua) → dos llamadas concurrentes serializan y
+        // obtienen valores distintos. Espejo de INCR cprs:tareaseq en Redis.
+        let conexion = self.bloquear();
+        conexion.execute("UPDATE tareaseq SET valor = valor + 1 WHERE id = 1", [])?;
+        let seq: i64 = conexion.query_row("SELECT valor FROM tareaseq WHERE id = 1", [], |r| r.get(0))?;
+        Ok(seq)
+    }
+
+    async fn podar_tareas(&self, retener: usize) -> anyhow::Result<()> {
+        // #15/R6: espejo de podar_historial sobre tareas. Por cada instancia, conserva las
+        // `retener` más recientes por inicio y borra el resto. Subconsulta: cuenta cuántas tareas
+        // del MISMO peer son más recientes (inicio mayor, id como desempate determinista); las que
+        // tienen >= `retener` por delante son las viejas a purgar.
+        if retener == 0 {
+            return Ok(()); // no-op, igual que podar_historial(0).
+        }
+        let conexion = self.bloquear();
+        conexion.execute(
+            "DELETE FROM tareas WHERE id IN (
+                SELECT id FROM tareas t
+                WHERE (
+                    SELECT COUNT(*) FROM tareas t2
+                    WHERE t2.instancia_id = t.instancia_id
+                      AND (t2.inicio > t.inicio OR (t2.inicio = t.inicio AND t2.id > t.id))
+                ) >= ?1
+            )",
+            params![retener as i64],
+        )?;
+        Ok(())
     }
 
     async fn jornada(&self, instancia_id: &str) -> anyhow::Result<(Vec<Sesion>, Vec<Tarea>)> {
@@ -1278,6 +1332,78 @@ mod pruebas {
         assert_eq!(leida.estimado_seg, Some(1200));
         // Inexistente → None.
         assert!(b.tarea_editar("fantasma", Some("x"), None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tareas_todas_junta_varios_peers_orden_inicio_desc() {
+        // #14/R1/AC1: vista global = tareas de >1 peer, cada una con su instancia_id, ordenadas
+        // por inicio DESC (la más reciente primero).
+        let b = base();
+        let mut t_a = tarea_base("ta");
+        t_a.instancia_id = "peerA".into();
+        t_a.inicio = "2026-01-01T00:00:00Z".into();
+        let mut t_b = tarea_base("tb");
+        t_b.instancia_id = "peerB".into();
+        t_b.inicio = "2026-01-03T00:00:00Z".into();
+        let mut t_c = tarea_base("tc");
+        t_c.instancia_id = "peerA".into();
+        t_c.inicio = "2026-01-02T00:00:00Z".into();
+        b.tarea_guardar(&t_a).await.unwrap();
+        b.tarea_guardar(&t_b).await.unwrap();
+        b.tarea_guardar(&t_c).await.unwrap();
+        let todas = b.tareas_todas().await.unwrap();
+        let ids: Vec<&str> = todas.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["tb", "tc", "ta"], "inicio DESC: más reciente primero");
+        // Cada tarea conserva su instancia_id (la TUI pinta la columna PEER).
+        let peers: std::collections::HashSet<&str> =
+            todas.iter().map(|t| t.instancia_id.as_str()).collect();
+        assert!(peers.contains("peerA") && peers.contains("peerB"));
+    }
+
+    #[tokio::test]
+    async fn siguiente_tarea_seq_incrementa_sin_colision() {
+        // #15/R5/AC3: cada llamada devuelve un valor mayor → ids tar-{seq} únicos.
+        let b = base();
+        let s1 = b.siguiente_tarea_seq().await.unwrap();
+        let s2 = b.siguiente_tarea_seq().await.unwrap();
+        let s3 = b.siguiente_tarea_seq().await.unwrap();
+        assert!(s2 > s1 && s3 > s2, "seq monótono creciente: {s1} {s2} {s3}");
+        // Distintos entre sí (no colisionan aunque sea el "mismo peer").
+        let set: std::collections::HashSet<i64> = [s1, s2, s3].into_iter().collect();
+        assert_eq!(set.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn podar_tareas_conserva_n_mas_recientes_por_peer() {
+        // #15/R6/AC4: conserva las RETENCION más recientes por peer; purga las viejas. retener=0 no-op.
+        let b = base();
+        // peerA: 5 tareas con inicios crecientes. peerB: 2 (no debe tocarse si retener>=2).
+        for i in 0..5 {
+            let mut t = tarea_base(&format!("a{i}"));
+            t.instancia_id = "peerA".into();
+            t.inicio = format!("2026-01-0{}T00:00:00Z", i + 1);
+            b.tarea_guardar(&t).await.unwrap();
+        }
+        for i in 0..2 {
+            let mut t = tarea_base(&format!("b{i}"));
+            t.instancia_id = "peerB".into();
+            t.inicio = format!("2026-02-0{}T00:00:00Z", i + 1);
+            b.tarea_guardar(&t).await.unwrap();
+        }
+        // retener=0 es no-op (no purga nada).
+        b.podar_tareas(0).await.unwrap();
+        assert_eq!(b.tareas_todas().await.unwrap().len(), 7, "retener=0 no purga");
+        // Conserva 3 por peer: peerA pasa de 5→3 (las 3 más recientes), peerB intacto (2<=3).
+        b.podar_tareas(3).await.unwrap();
+        let (_, ta) = b.jornada("peerA").await.unwrap();
+        let ids_a: std::collections::HashSet<String> = ta.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ta.len(), 3, "peerA conserva 3");
+        assert!(ids_a.contains("a4") && ids_a.contains("a3") && ids_a.contains("a2"));
+        assert!(!ids_a.contains("a0") && !ids_a.contains("a1"), "las 2 viejas purgadas");
+        // Las purgadas también desaparecen del índice (tarea_obtener None).
+        assert!(b.tarea_obtener("a0").await.unwrap().is_none());
+        let (_, tb) = b.jornada("peerB").await.unwrap();
+        assert_eq!(tb.len(), 2, "peerB intacto (2<=3)");
     }
 
     #[tokio::test]

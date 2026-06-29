@@ -44,6 +44,11 @@ pub struct Instancia {
 /// Usado por la limpieza periódica del broker (ZREMRANGEBYRANK). Ver R2.1.
 pub const RETENCION_HISTORIAL: usize = 500;
 
+/// Cuántas tareas retiene el almacén por instancia (las más recientes). Espejo de
+/// `RETENCION_HISTORIAL` para las tareas (#15/R6). La limpieza periódica del broker
+/// (`podar_tareas`) conserva las RETENCION_TAREAS más recientes por peer y purga las viejas.
+pub const RETENCION_TAREAS: usize = 500;
+
 /// Estado de un mensaje en su ciclo de vida. Máquina de estados timbrada por el broker
 /// (nunca por la IA). El avance natural es `Enviado → Entregado → Leido → Procesado`;
 /// `Fallido` y `DeadLetter` son terminales alternativos (R1.2).
@@ -761,6 +766,24 @@ pub fn supera_umbral(desde_iso: &str, ahora_iso: &str, umbral_seg: i64) -> bool 
     }
 }
 
+/// ¿Una tarea abierta ya superó su estimado? (#14/R3 — orden "atascadas primero")
+///
+/// Función PURA (sin reloj ni I/O): el caller calcula el tiempo `transcurrido_seg` (ahora -
+/// inicio) y pasa el `estimado_seg` de la tarea. `true` si la tarea, estando abierta, ya consumió
+/// más tiempo del que estimó (`transcurrido > estimado`). Sirve para ordenar la vista global de
+/// tareas poniendo primero las que se pasaron de su estimado (overrun).
+///
+/// DEGRADACIÓN: si la tarea no tiene estimado (`None`) o el estimado no es positivo, devuelve
+/// `false` — sin un estimado válido no hay "overrun" que detectar (no se puede superar la nada).
+/// El borde exacto (`transcurrido == estimado`) NO cuenta como overrun (estrictamente mayor).
+#[must_use]
+pub fn tarea_overrun_seg(transcurrido_seg: i64, estimado_seg: Option<i64>) -> bool {
+    match estimado_seg {
+        Some(est) if est > 0 => transcurrido_seg > est,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,5 +1244,24 @@ mod tests {
         assert!(!cancelacion_excesiva(4, 10)); // 40% justo NO supera (estricto >)
         assert!(cancelacion_excesiva(5, 10)); // 50% supera 0.4
         assert!(cancelacion_excesiva(10, 10)); // 100% canceladas
+    }
+
+    // --- Vista global de tareas (#14/R3): orden "atascadas/overrun primero" ---
+
+    /// #14/R3: `tarea_overrun_seg` marca como overrun una tarea cuyo transcurrido supera su
+    /// estimado; el borde exacto NO cuenta (estricto >); por debajo del estimado no es overrun.
+    #[test]
+    fn tarea_overrun_compara_transcurrido_contra_estimado() {
+        assert!(tarea_overrun_seg(3601, Some(3600))); // 1h01m > 1h estimada → overrun
+        assert!(!tarea_overrun_seg(3600, Some(3600))); // borde exacto NO supera (estricto >)
+        assert!(!tarea_overrun_seg(1800, Some(3600))); // 30min de 1h: aún dentro del estimado
+    }
+
+    /// #14/R3 degradación: sin estimado válido NO hay overrun (None / 0 / negativo → false).
+    #[test]
+    fn tarea_overrun_sin_estimado_valido_es_false() {
+        assert!(!tarea_overrun_seg(99_999, None)); // sin estimado no se puede superar nada
+        assert!(!tarea_overrun_seg(99_999, Some(0))); // estimado 0 no es positivo
+        assert!(!tarea_overrun_seg(99_999, Some(-5))); // estimado negativo (basura) no dispara
     }
 }

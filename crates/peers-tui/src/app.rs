@@ -246,6 +246,17 @@ pub struct App {
     /// Índice del peer destino para REASIGNAR (acción 'a'): se cicla con pulsaciones repetidas
     /// de 'a' sobre la misma tarea. Se aplica al confirmar con Enter. Independiente de `peer_foco`.
     pub reasignar_destino: usize,
+    /// VISTA GLOBAL de tareas (#14/R2): si `true`, la pantalla Tareas muestra las tareas de TODOS
+    /// los peers (`GET /admin/tareas`, con columna PEER) en vez de las del peer enfocado por `[`/`]`.
+    /// Se alterna con la tecla `g`. En vista global, `[`/`]` no aplica y `1`-`5`/`0` filtran por estado.
+    pub vista_global: bool,
+    /// Filtro de estado activo en la VISTA GLOBAL (#14/R3): `None` = todas. Se fija con `1`-`5`
+    /// (Abierta/EnCurso/Bloqueada/Hecha/Cancelada) y se limpia con `0`. Solo aplica en vista global.
+    pub filtro_estado: Option<EstadoTarea>,
+    /// "Ahora" en RFC3339 (UTC), refrescado por el loop en cada tick. Lo usa el orden
+    /// overrun-primero de la vista global para medir el transcurrido SIN reloj propio en cada
+    /// helper puro (el reloj se timbra una vez por frame en el loop). Vacío = aún sin timbrar.
+    pub ahora: String,
 }
 
 impl App {
@@ -266,12 +277,86 @@ impl App {
             tarea_detalle: None,
             tarea_reportes: Vec::new(),
             reasignar_destino: 0,
+            vista_global: false,
+            filtro_estado: None,
+            ahora: String::new(),
         }
     }
 
-    /// Tarea seleccionada en la pantalla Tareas (por la fila `seleccion`), si la hay.
+    /// Tarea seleccionada en la pantalla Tareas (por la fila `seleccion`), si la hay. Resuelve
+    /// sobre la lista REALMENTE mostrada (`tareas_visibles`): así las acciones de gestión
+    /// (e/f/h/c/a…) operan sobre la fila correcta tanto en vista peer como en vista global, sea
+    /// cual sea el filtro/orden aplicado (#14/R4/AC2 — cada `Tarea` ya trae su `instancia_id`).
     pub fn tarea_seleccionada(&self) -> Option<&Tarea> {
-        self.datos.tareas.get(self.seleccion)
+        self.tareas_ordenadas(&self.ahora).get(self.seleccion).copied()
+    }
+
+    /// Lista de tareas que la pantalla Tareas debe PINTAR, en el mismo orden que la tabla:
+    /// en vista global, aplica `filtro_estado` y ordena overrun/atascadas primero (R3); en vista
+    /// peer, devuelve `datos.tareas` tal cual (orden del broker). Devuelve referencias (sin clonar).
+    ///
+    /// El orden overrun-primero usa `peers_core::supera_umbral(inicio, ahora, estimado)` para
+    /// detectar las tareas vivas que ya pasaron su estimado, evitando depender de un reloj aquí:
+    /// el `ahora` lo aporta el llamador (`tareas_ordenadas_global`). Esta variante SIN reloj se
+    /// usa cuando solo importa el filtrado (p.ej. contar) y mantiene el orden de origen.
+    pub fn tareas_visibles(&self) -> Vec<&Tarea> {
+        if !self.vista_global {
+            return self.datos.tareas.iter().collect();
+        }
+        self.datos
+            .tareas
+            .iter()
+            .filter(|t| self.filtro_estado.is_none_or(|e| t.estado == e))
+            .collect()
+    }
+
+    /// Igual que `tareas_visibles` pero ORDENADA con las overrun/atascadas primero (R3), usando
+    /// `ahora_iso` como reloj para medir el transcurrido de las tareas vivas. El orden es estable:
+    /// dentro de cada grupo (overrun / no overrun) se conserva el orden de origen (inicio desc del
+    /// broker). En vista peer no reordena (devuelve el orden del broker). Función pura — testeada.
+    pub fn tareas_ordenadas(&self, ahora_iso: &str) -> Vec<&Tarea> {
+        let mut visibles = self.tareas_visibles();
+        if self.vista_global {
+            // `sort_by_key` de Rust es ESTABLE: las overrun (clave 0) van antes que el resto
+            // (clave 1) conservando el orden relativo previo. Sin reloj inventado: lo trae el caller.
+            visibles.sort_by_key(|t| u8::from(!Self::tarea_overrun(t, ahora_iso)));
+        }
+        visibles
+    }
+
+    /// ¿La tarea `t` está en OVERRUN/atascada? = está VIVA (Abierta/EnCurso) y ya consumió más
+    /// tiempo del estimado desde su `inicio`. Reusa `peers_core::supera_umbral` (parseo robusto de
+    /// ISO; degrada a `false` si algo no parsea). Las terminales/bloqueadas nunca son overrun aquí.
+    pub fn tarea_overrun(t: &Tarea, ahora_iso: &str) -> bool {
+        let viva = matches!(t.estado, EstadoTarea::Abierta | EstadoTarea::EnCurso);
+        if !viva {
+            return false;
+        }
+        match t.estimado_seg {
+            Some(est) if est > 0 => peers_core::supera_umbral(&t.inicio, ahora_iso, est),
+            _ => false,
+        }
+    }
+
+    /// Mapea las teclas `1`-`5` a un estado para el filtro de la VISTA GLOBAL (R3); cualquier otra
+    /// tecla → `None` (que el llamador interpreta como "0 = todas"). Función pura — testeada.
+    pub fn filtro_desde_tecla(c: char) -> Option<EstadoTarea> {
+        match c {
+            '1' => Some(EstadoTarea::Abierta),
+            '2' => Some(EstadoTarea::EnCurso),
+            '3' => Some(EstadoTarea::Bloqueada),
+            '4' => Some(EstadoTarea::Hecha),
+            '5' => Some(EstadoTarea::Cancelada),
+            _ => None,
+        }
+    }
+
+    /// Etiqueta del filtro activo para el título de la pantalla Tareas en vista global.
+    pub fn etiqueta_filtro(&self) -> &'static str {
+        match self.filtro_estado {
+            None => "todas",
+            Some(e) => etiqueta_estado_tarea(e),
+        }
     }
 
     /// Cierra el modal DETALLE de tarea y limpia sus reportes cacheados.
@@ -826,6 +911,107 @@ mod tests {
         assert_eq!(etiqueta_estado_tarea(EstadoTarea::Bloqueada), "bloqueada");
         assert_eq!(etiqueta_estado_tarea(EstadoTarea::Hecha), "hecha");
         assert_eq!(etiqueta_estado_tarea(EstadoTarea::Cancelada), "cancelada");
+    }
+
+    /// Constructor mínimo de tarea para los tests de la vista global.
+    fn mk_tarea(id: &str, inst: &str, estado: EstadoTarea, inicio: &str, estimado_seg: Option<i64>) -> Tarea {
+        Tarea {
+            id: id.into(),
+            instancia_id: inst.into(),
+            sesion_id: "s".into(),
+            descripcion: "x".into(),
+            inicio: inicio.into(),
+            fin: None,
+            duracion_seg: None,
+            estimado_seg,
+            estado,
+            bloqueo_motivo: None,
+            issue_number: None,
+            factor_aprendido: false,
+            evidencia: None,
+        }
+    }
+
+    #[test]
+    fn filtro_desde_tecla_mapea_estados() {
+        assert_eq!(App::filtro_desde_tecla('1'), Some(EstadoTarea::Abierta));
+        assert_eq!(App::filtro_desde_tecla('2'), Some(EstadoTarea::EnCurso));
+        assert_eq!(App::filtro_desde_tecla('3'), Some(EstadoTarea::Bloqueada));
+        assert_eq!(App::filtro_desde_tecla('4'), Some(EstadoTarea::Hecha));
+        assert_eq!(App::filtro_desde_tecla('5'), Some(EstadoTarea::Cancelada));
+        assert_eq!(App::filtro_desde_tecla('0'), None);
+        assert_eq!(App::filtro_desde_tecla('9'), None);
+    }
+
+    #[test]
+    fn tarea_overrun_solo_vivas_y_pasadas_de_estimado() {
+        let ahora = "2026-06-29T12:00:00Z";
+        // Viva (EnCurso), empezó hace 2h con estimado 1h → overrun.
+        let viva_tarde = mk_tarea("a", "p1", EstadoTarea::EnCurso, "2026-06-29T10:00:00Z", Some(3600));
+        assert!(App::tarea_overrun(&viva_tarde, ahora));
+        // Viva pero dentro del estimado (empezó hace 30min, estimado 1h) → no overrun.
+        let viva_ok = mk_tarea("b", "p1", EstadoTarea::Abierta, "2026-06-29T11:30:00Z", Some(3600));
+        assert!(!App::tarea_overrun(&viva_ok, ahora));
+        // Hecha aunque pasada de tiempo → nunca overrun (no está viva).
+        let hecha = mk_tarea("c", "p1", EstadoTarea::Hecha, "2026-06-29T08:00:00Z", Some(3600));
+        assert!(!App::tarea_overrun(&hecha, ahora));
+        // Sin estimado válido → no overrun (degrada).
+        let sin_est = mk_tarea("d", "p1", EstadoTarea::EnCurso, "2026-06-29T08:00:00Z", None);
+        assert!(!App::tarea_overrun(&sin_est, ahora));
+    }
+
+    #[test]
+    fn vista_global_filtra_y_ordena_overrun_primero() {
+        let cfg = crate::config::Config::default();
+        let mut app = App::nueva(cfg);
+        let ahora = "2026-06-29T12:00:00Z";
+        app.ahora = ahora.to_string();
+        // 3 tareas: una hecha, una en curso a tiempo, una en curso en overrun.
+        app.datos.tareas = vec![
+            mk_tarea("hecha", "p1", EstadoTarea::Hecha, "2026-06-29T08:00:00Z", Some(3600)),
+            mk_tarea("ok", "p2", EstadoTarea::EnCurso, "2026-06-29T11:50:00Z", Some(3600)),
+            mk_tarea("overrun", "p3", EstadoTarea::EnCurso, "2026-06-29T09:00:00Z", Some(3600)),
+        ];
+
+        // Vista peer (default): sin reordenar ni filtrar → orden de origen.
+        let peer = app.tareas_ordenadas(ahora);
+        assert_eq!(peer.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["hecha", "ok", "overrun"]);
+
+        // Vista global sin filtro: la overrun sube al principio (orden estable en el resto).
+        app.vista_global = true;
+        let glob = app.tareas_ordenadas(ahora);
+        assert_eq!(glob[0].id, "overrun", "la atascada va primero");
+        assert_eq!(glob.len(), 3);
+
+        // Filtro por EnCurso: solo las 2 en curso, overrun primero.
+        app.filtro_estado = Some(EstadoTarea::EnCurso);
+        let enc = app.tareas_ordenadas(ahora);
+        assert_eq!(enc.len(), 2);
+        assert_eq!(enc[0].id, "overrun");
+        assert_eq!(enc[1].id, "ok");
+
+        // Filtro por Hecha: solo la hecha.
+        app.filtro_estado = Some(EstadoTarea::Hecha);
+        let h = app.tareas_ordenadas(ahora);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].id, "hecha");
+    }
+
+    #[test]
+    fn tarea_seleccionada_sigue_el_orden_mostrado_en_vista_global() {
+        let mut app = App::nueva(crate::config::Config::default());
+        let ahora = "2026-06-29T12:00:00Z";
+        app.ahora = ahora.to_string();
+        app.vista_global = true;
+        app.datos.tareas = vec![
+            mk_tarea("hecha", "p1", EstadoTarea::Hecha, "2026-06-29T08:00:00Z", Some(3600)),
+            mk_tarea("overrun", "p3", EstadoTarea::EnCurso, "2026-06-29T09:00:00Z", Some(3600)),
+        ];
+        // En vista global la overrun va primero: seleccion 0 debe apuntar a "overrun".
+        app.seleccion = 0;
+        assert_eq!(app.tarea_seleccionada().map(|t| t.id.as_str()), Some("overrun"));
+        app.seleccion = 1;
+        assert_eq!(app.tarea_seleccionada().map(|t| t.id.as_str()), Some("hecha"));
     }
 
     #[test]

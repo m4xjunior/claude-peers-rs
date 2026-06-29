@@ -261,6 +261,14 @@ impl ClienteAdmin {
         self.get("/admin/alertas").await
     }
 
+    /// `GET /admin/tareas` → TODAS las tareas de TODAS las instancias (R1/#14), cada `Tarea`
+    /// con su `instancia_id`, ya ordenadas por inicio desc por el broker (sin KEYS). Alimenta
+    /// la VISTA GLOBAL de la pantalla Tareas (tecla `g`). Degrada como el resto: si el broker
+    /// está offline o devuelve 401, el banner lo refleja y la pantalla conserva su última lista.
+    pub async fn admin_tareas(&self) -> ResultadoBroker<Vec<Tarea>> {
+        self.get("/admin/tareas").await
+    }
+
     // --- Gestión interactiva de tareas (pantalla Tareas, R4-R9) ---
 
     /// `POST /tarea/editar {tarea_id, descripcion?, estimado_seg?}` → parche parcial de la tarea

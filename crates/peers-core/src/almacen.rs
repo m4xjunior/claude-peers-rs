@@ -141,6 +141,29 @@ pub trait Almacen: Send + Sync {
     async fn sesion_abrir(&self, sesion: &Sesion) -> anyhow::Result<()>;
     async fn sesion_cerrar(&self, instancia_id: &str, fin: &str) -> anyhow::Result<()>;
     async fn tarea_guardar(&self, tarea: &Tarea) -> anyhow::Result<()>;
+
+    /// Todas las tareas de TODAS las instancias (#14/R1), para la vista global del jefe
+    /// (`GET /admin/tareas`). Ordenadas por `inicio` DESC (la más reciente primero). Reusa
+    /// `listar_ids` + lectura por peer SIN `KEYS`. Redis: por cada id, LRANGE `cprs:tareas:{id}`
+    /// y lee el índice `cprs:tarea:{id_tarea}`. SQLite: `SELECT * FROM tareas ORDER BY inicio DESC`.
+    /// Cada `Tarea` sabe su `instancia_id`, así que la TUI puede pintar la columna PEER y operar
+    /// sobre la fila. Degrada por tarea: una corrupta se descarta, no aborta el listado.
+    async fn tareas_todas(&self) -> anyhow::Result<Vec<Tarea>>;
+
+    /// Reserva el siguiente nº de secuencia GLOBAL para un id de tarea (#15/R5), espejo de
+    /// `cprs:msgseq`. Redis: `INCR cprs:tareaseq` (atómico — dos `crear_tarea` simultáneas NUNCA
+    /// colisionan). SQLite: contador transaccional (tabla `tareaseq` con `UPDATE ... RETURNING`/
+    /// lectura tras incremento, dentro del mismo lock). El broker construye `tar-{seq}` con esto
+    /// (los ids viejos `tar-{inst}-{fecha}` siguen siendo legibles por `tarea_obtener`).
+    async fn siguiente_tarea_seq(&self) -> anyhow::Result<i64>;
+
+    /// Aplica la retención de tareas por instancia (#15/R6), espejo de `podar_historial`:
+    /// conserva las `retener` tareas más recientes (por `inicio`) de cada peer y purga el resto.
+    /// Redis: por cada instancia, ordena su `cprs:tareas:{id}` por `inicio`, hace `DEL` del índice
+    /// `cprs:tarea:{id_purgada}` de las viejas y reescribe la lista con las conservadas. SQLite:
+    /// `DELETE` de las que sobran por `instancia_id`. `retener == 0` es no-op (no purga nada, igual
+    /// que `podar_historial`). Se llama desde la limpieza periódica del broker.
+    async fn podar_tareas(&self, retener: usize) -> anyhow::Result<()>;
     async fn tarea_obtener(&self, tarea_id: &str) -> anyhow::Result<Option<Tarea>>;
     async fn jornada(&self, instancia_id: &str) -> anyhow::Result<(Vec<Sesion>, Vec<Tarea>)>;
 

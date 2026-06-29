@@ -101,6 +101,12 @@ async fn correr(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Resu
     let mut flash_desde: Option<Instant> = None;
 
     while !app.salir {
+        // Timbramos el "ahora" UTC una vez por frame: lo usa el orden overrun-primero de la
+        // vista global (#14/R3) sin que cada helper puro necesite su propio reloj. Si el formateo
+        // fallara (no debería con Rfc3339), conservamos el último valor — nunca crasheamos.
+        if let Ok(s) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) {
+            app.ahora = s;
+        }
         terminal.draw(|f| ui::dibujar(f, &app))?;
 
         // Caduca el flash tras 2s.
@@ -243,25 +249,36 @@ async fn refrescar(cliente: &ClienteAdmin, app: &mut App) {
             }
         }
         Pantalla::Tareas => {
+            // La lista de peers se necesita en ambas vistas: en vista peer para resolver el foco
+            // ([ ]) y en vista global para reasignar (a) sobre la fila seleccionada (R4).
             let lp = cliente.listar().await;
             if let Ok(peers) = &lp {
                 app.datos.peers = peers.clone();
             }
-            match app.traza_peer_actual() {
-                Some(id) => {
-                    let r = cliente.listar_tareas(&id).await;
-                    app.marcar_resultado(&r);
-                    if let Ok(t) = r {
-                        let n = t.len();
-                        app.datos.tareas = t;
-                        if app.seleccion >= n {
-                            app.seleccion = n.saturating_sub(1);
+            if app.vista_global {
+                // VISTA GLOBAL (#14/R1): tareas de TODOS los peers vía GET /admin/tareas.
+                // `[`/`]` no aplica aquí; el filtrado/orden se hace en cliente (tareas_ordenadas).
+                let r = cliente.admin_tareas().await;
+                app.marcar_resultado(&r);
+                if let Ok(t) = r {
+                    app.datos.tareas = t;
+                    acotar_seleccion_tareas(app);
+                }
+            } else {
+                // VISTA PEER (actual): solo las tareas del peer enfocado por `[`/`]`.
+                match app.traza_peer_actual() {
+                    Some(id) => {
+                        let r = cliente.listar_tareas(&id).await;
+                        app.marcar_resultado(&r);
+                        if let Ok(t) = r {
+                            app.datos.tareas = t;
+                            acotar_seleccion_tareas(app);
                         }
                     }
-                }
-                None => {
-                    app.marcar_resultado(&lp);
-                    app.datos.tareas.clear();
+                    None => {
+                        app.marcar_resultado(&lp);
+                        app.datos.tareas.clear();
+                    }
                 }
             }
         }
@@ -326,6 +343,24 @@ async fn manejar_tecla(
             _ => {}
         }
         return;
+    }
+
+    // VISTA GLOBAL de Tareas (#14): la tecla `g` la alterna en cualquier momento dentro de la
+    // pantalla Tareas. Resetea la selección porque la lista mostrada cambia por completo.
+    if app.pantalla == Pantalla::Tareas && tecla.code == KeyCode::Char('g') {
+        app.vista_global = !app.vista_global;
+        app.seleccion = 0;
+        return;
+    }
+    // En pantalla Tareas CON vista global activa, las teclas `1`-`5`/`0` se REINTERPRETAN como
+    // FILTRO por estado (R3), NO como cambio de pantalla. Para cambiar de pantalla aquí se usa Tab
+    // (documentado en la ayuda). Fuera de esta condición, `1`-`9` siguen cambiando de pantalla.
+    if app.pantalla == Pantalla::Tareas && app.vista_global {
+        if let KeyCode::Char(c @ ('0'..='5')) = tecla.code {
+            app.filtro_estado = App::filtro_desde_tecla(c); // '0' o no-1..5 → None (todas)
+            acotar_seleccion_tareas(app);
+            return;
+        }
     }
 
     match tecla.code {
@@ -437,15 +472,26 @@ fn manejar_mouse(evento: MouseEvent, app: &mut App) {
 }
 
 /// Número de filas seleccionables de la pantalla activa (las que tienen tabla navegable).
-/// Centraliza la cuenta que el teclado hacía inline, para reusarla en el mouse.
+/// Centraliza la cuenta que el teclado hacía inline, para reusarla en el mouse. En Tareas usa la
+/// lista VISIBLE (filtrada en vista global), que es la que realmente se pinta y se puede seleccionar.
 fn filas_pantalla(app: &App) -> usize {
     match app.pantalla {
         Pantalla::Peers => app.datos.peers.len(),
         Pantalla::Redis => app.datos.redis.as_ref().map(|r| r.colas.len()).unwrap_or(0),
         Pantalla::Trazabilidad => app.datos.historial.len(),
-        Pantalla::Tareas => app.datos.tareas.len(),
+        Pantalla::Tareas => app.tareas_visibles().len(),
         Pantalla::Alertas => app.datos.alertas.len(),
         _ => 0,
+    }
+}
+
+/// Acota la selección de la pantalla Tareas al número de filas VISIBLES (tras filtro en vista
+/// global). Evita que la fila seleccionada quede fuera de rango al cambiar de vista/filtro o al
+/// encoger la lista tras un refresco.
+fn acotar_seleccion_tareas(app: &mut App) {
+    let n = app.tareas_visibles().len();
+    if app.seleccion >= n {
+        app.seleccion = n.saturating_sub(1);
     }
 }
 
