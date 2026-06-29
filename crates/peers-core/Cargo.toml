@@ -8,3 +8,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
+# Parsing RFC3339 para `supera_umbral` (la comparación temporal del supervisor).
+# Mismo crate `time` que ya usa el broker — versión centralizada en el workspace.
+time = { workspace = true }

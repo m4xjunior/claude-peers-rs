@@ -126,7 +126,7 @@ async fn redis_outbox_sobrevive_reinicio_del_peer() {
 
     let item = ItemOutbox {
         id: "it-ob-restart".into(),
-        para_id: "it-jefin".into(),
+        para_id: "it-ob-peer".into(),
         texto: "tarea a medio hacer".into(),
         creado_en: "2026-01-01T00:00:00Z".into(),
         confirmado: false,
@@ -137,7 +137,7 @@ async fn redis_outbox_sobrevive_reinicio_del_peer() {
 
     // "El peer se reinicia": creamos un handle NUEVO al mismo Redis.
     let alm2 = AlmacenRedis::nuevo(&url).unwrap();
-    let pendientes = alm2.outbox_pendientes("it-jefin").await.unwrap();
+    let pendientes = alm2.outbox_pendientes("it-ob-peer").await.unwrap();
     assert!(
         pendientes.iter().any(|i| i.id == "it-ob-restart"),
         "el ítem del outbox debe sobrevivir al reinicio (lo ve un handle nuevo)"
@@ -145,7 +145,7 @@ async fn redis_outbox_sobrevive_reinicio_del_peer() {
 
     // ACK con el segundo handle → ya no está pendiente.
     alm2.outbox_confirmar("it-ob-restart").await.unwrap();
-    let tras_ack = alm2.outbox_pendientes("it-jefin").await.unwrap();
+    let tras_ack = alm2.outbox_pendientes("it-ob-peer").await.unwrap();
     assert!(
         !tras_ack.iter().any(|i| i.id == "it-ob-restart"),
         "tras el ACK el ítem ya no debe estar pendiente"

@@ -460,6 +460,72 @@ pub struct PeticionHistorial {
     pub estado: Option<EstadoMensaje>,
 }
 
+// ===========================================================================
+// FASE 5 — SUPERVISOR: detección de ociosos / atascados / ghosteo.
+// Trazabilidad PASIVA → ACTIVA: el broker evalúa y emite alertas (el tiempo lo
+// mide el broker; aquí solo viven los tipos y la comparación temporal PURA).
+// ===========================================================================
+
+/// Tipo de condición anómala detectada por el supervisor (R2/R3/R4).
+///
+/// INTENCIÓN: enum cerrado (no "stringly typed") para que la TUI y el broker
+/// compartan exactamente el mismo vocabulario de alerta. Serializa en minúsculas
+/// para encajar con el resto del protocolo (`ocioso`/`atascado`/`ghosteo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TipoAlerta {
+    /// Peer VIVO sin tarea en curso desde hace > `UMBRAL_OCIOSO_SEG` (R2).
+    Ocioso,
+    /// Tarea abierta (sin `fin`) desde hace > `UMBRAL_ATASCO_SEG` sin reporte (R3).
+    Atascado,
+    /// Mensaje en `Leido` (no `Procesado`) desde hace > `UMBRAL_GHOSTEO_SEG` (R4).
+    Ghosteo,
+}
+
+/// Una alerta emitida por el supervisor hacia `cprs:alertas` (R5).
+///
+/// `sujeto` identifica QUÉ disparó la alerta (id de peer, id de tarea o id de mensaje
+/// según el `tipo`); junto al `tipo` forma la clave de idempotencia del set de activas
+/// (R7), para no re-alertar lo mismo cada 30s. `creada_en` lo timbra el broker (su reloj).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Alerta {
+    pub tipo: TipoAlerta,
+    pub sujeto: String,
+    pub detalle: String,
+    pub creada_en: String, // ISO 8601, timbrado por el broker
+}
+
+/// Segundos sin tarea en curso para considerar OCIOSO a un peer vivo (R2, default 10min).
+pub const UMBRAL_OCIOSO_SEG: i64 = 600;
+
+/// Segundos con tarea abierta sin reporte para considerarla ATASCADA (R3, default 30min).
+pub const UMBRAL_ATASCO_SEG: i64 = 1800;
+
+/// Segundos en estado `Leido` sin pasar a `Procesado` para considerar GHOSTEO (R4, default 5min).
+pub const UMBRAL_GHOSTEO_SEG: i64 = 300;
+
+/// Tope de alertas retenidas en la LIST `cprs:alertas` (R5: últimas 50).
+pub const MAX_ALERTAS: usize = 50;
+
+/// ¿La distancia temporal entre `desde_iso` y `ahora_iso` supera `umbral_seg`?
+///
+/// Función PURA (sin reloj ni I/O): el broker le pasa SU `ahora` y el timestamp del sujeto.
+/// `true` solo si ambos parsean como RFC3339 y la diferencia (ahora - desde) supera el umbral.
+///
+/// DEGRADACIÓN (AC5): si alguno NO parsea, devuelve `false` — un timestamp corrupto NO
+/// dispara una falsa alerta ni tumba el detector; el broker sigue con los demás sujetos.
+/// Una diferencia negativa (reloj hacia atrás / desde futuro) tampoco supera el umbral.
+#[must_use]
+pub fn supera_umbral(desde_iso: &str, ahora_iso: &str, umbral_seg: i64) -> bool {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    let parse = |s: &str| OffsetDateTime::parse(s, &Rfc3339).ok();
+    match (parse(desde_iso), parse(ahora_iso)) {
+        (Some(desde), Some(ahora)) => (ahora - desde).whole_seconds() > umbral_seg,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +681,81 @@ mod tests {
         assert_eq!(vuelta.muestras, 23);
         assert!((vuelta.factor - 6.2).abs() < 1e-9);
         assert_eq!(vuelta.actualizado_en, "2026-06-29T10:00:00Z");
+    }
+
+    // --- Supervisor (Fase 5): tipos y comparación temporal pura ---
+
+    /// TipoAlerta serializa en minúsculas, igual que el resto del protocolo.
+    #[test]
+    fn tipo_alerta_serializa_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&TipoAlerta::Ocioso).expect("serializar"),
+            "\"ocioso\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TipoAlerta::Atascado).expect("serializar"),
+            "\"atascado\""
+        );
+        let g: TipoAlerta = serde_json::from_str("\"ghosteo\"").expect("deser");
+        assert_eq!(g, TipoAlerta::Ghosteo);
+    }
+
+    /// Roundtrip de Alerta: serializa y vuelve sin pérdida.
+    #[test]
+    fn alerta_roundtrip() {
+        let original = Alerta {
+            tipo: TipoAlerta::Ghosteo,
+            sujeto: "msg:42".into(),
+            detalle: "leído hace 7min sin procesar".into(),
+            creada_en: "2026-06-29T15:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&original).expect("serializar");
+        let vuelta: Alerta = serde_json::from_str(&json).expect("deserializar");
+        assert_eq!(vuelta.tipo, TipoAlerta::Ghosteo);
+        assert_eq!(vuelta.sujeto, "msg:42");
+        assert_eq!(vuelta.detalle, "leído hace 7min sin procesar");
+        assert_eq!(vuelta.creada_en, "2026-06-29T15:00:00Z");
+    }
+
+    /// supera_umbral: una diferencia mayor que el umbral devuelve true; una menor, false.
+    /// El borde exacto (diferencia == umbral) NO lo supera (estrictamente mayor).
+    #[test]
+    fn supera_umbral_compara_diferencia() {
+        // 11min de diferencia (660s) supera el umbral de ocioso (600s).
+        assert!(supera_umbral(
+            "2026-06-29T15:00:00Z",
+            "2026-06-29T15:11:00Z",
+            UMBRAL_OCIOSO_SEG
+        ));
+        // 5min (300s) NO supera el de ocioso (600s).
+        assert!(!supera_umbral(
+            "2026-06-29T15:00:00Z",
+            "2026-06-29T15:05:00Z",
+            UMBRAL_OCIOSO_SEG
+        ));
+        // Borde exacto: 600s NO es > 600s.
+        assert!(!supera_umbral(
+            "2026-06-29T15:00:00Z",
+            "2026-06-29T15:10:00Z",
+            UMBRAL_OCIOSO_SEG
+        ));
+    }
+
+    /// AC5/degradación: un timestamp corrupto NO dispara alerta (devuelve false), no panic.
+    #[test]
+    fn supera_umbral_degrada_si_no_parsea() {
+        assert!(!supera_umbral("basura", "2026-06-29T15:11:00Z", UMBRAL_OCIOSO_SEG));
+        assert!(!supera_umbral("2026-06-29T15:00:00Z", "no-es-fecha", UMBRAL_OCIOSO_SEG));
+        assert!(!supera_umbral("", "", UMBRAL_OCIOSO_SEG));
+    }
+
+    /// Una diferencia negativa (sujeto en el futuro / reloj hacia atrás) no supera el umbral.
+    #[test]
+    fn supera_umbral_negativo_no_dispara() {
+        assert!(!supera_umbral(
+            "2026-06-29T15:11:00Z",
+            "2026-06-29T15:00:00Z",
+            UMBRAL_OCIOSO_SEG
+        ));
     }
 }

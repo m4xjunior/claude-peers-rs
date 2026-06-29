@@ -7,8 +7,8 @@
 
 use async_trait::async_trait;
 use peers_core::{
-    aplicar_media_movil, Alcance, Almacen, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox,
-    Mensaje, Sesion, Tarea,
+    aplicar_media_movil, Alcance, Alerta, Almacen, EstadoMensaje, FactorEstimacion, Instancia,
+    ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
 };
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
@@ -34,6 +34,24 @@ fn texto_a_estado(s: &str) -> EstadoMensaje {
         "fallido" => EstadoMensaje::Fallido,
         "deadletter" => EstadoMensaje::DeadLetter,
         _ => EstadoMensaje::Enviado,
+    }
+}
+
+/// Forma textual lowercase de un `TipoAlerta` (coincide con el `rename_all` de serde).
+fn tipo_alerta_a_texto(t: TipoAlerta) -> &'static str {
+    match t {
+        TipoAlerta::Ocioso => "ocioso",
+        TipoAlerta::Atascado => "atascado",
+        TipoAlerta::Ghosteo => "ghosteo",
+    }
+}
+
+/// Parsea la columna `tipo` a `TipoAlerta` (cae a `Ocioso` si es desconocida — defensivo).
+fn texto_a_tipo_alerta(s: &str) -> TipoAlerta {
+    match s {
+        "atascado" => TipoAlerta::Atascado,
+        "ghosteo" => TipoAlerta::Ghosteo,
+        _ => TipoAlerta::Ocioso,
     }
 }
 
@@ -105,6 +123,18 @@ impl AlmacenSqlite {
                 muestras INTEGER NOT NULL DEFAULT 0,
                 factor REAL NOT NULL DEFAULT 1.0,
                 actualizado_en TEXT NOT NULL DEFAULT ''
+            );
+            -- Supervisor (fase 5): cola de alertas + set de activas para idempotencia (R5/R7).
+            -- `alertas` es la LIST acotada (rowid asc = orden de emisión, se poda a MAX_ALERTAS).
+            -- `alertas_activas` es el SET (PK tipo+sujeto): una alerta viva por par hasta resolver.
+            CREATE TABLE IF NOT EXISTS alertas (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                tipo TEXT NOT NULL, sujeto TEXT NOT NULL,
+                detalle TEXT NOT NULL, creada_en TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS alertas_activas (
+                tipo TEXT NOT NULL, sujeto TEXT NOT NULL,
+                PRIMARY KEY (tipo, sujeto)
             );
             "#,
         )?;
@@ -588,6 +618,77 @@ impl Almacen for AlmacenSqlite {
         )?;
         Ok(nuevo)
     }
+
+    // --- Supervisor (fase 5): alertas ---
+
+    async fn alerta_emitir(&self, a: &Alerta) -> anyhow::Result<bool> {
+        let conexion = self.bloquear();
+        let tipo = tipo_alerta_a_texto(a.tipo);
+        // Idempotencia (R7): INSERT en el SET de activas; si el par (tipo,sujeto) ya existe, la
+        // restricción de PK lo rechaza → 0 filas afectadas → no re-alertamos (AC1/AC4).
+        let insertadas = conexion.execute(
+            "INSERT OR IGNORE INTO alertas_activas (tipo,sujeto) VALUES (?1,?2)",
+            params![tipo, a.sujeto],
+        )?;
+        if insertadas == 0 {
+            return Ok(false);
+        }
+        // Encola la alerta y poda a las últimas MAX_ALERTAS (R5): borra todo lo que tenga al
+        // menos MAX_ALERTAS filas con seq mayor (las más nuevas se conservan).
+        conexion.execute(
+            "INSERT INTO alertas (tipo,sujeto,detalle,creada_en) VALUES (?1,?2,?3,?4)",
+            params![tipo, a.sujeto, a.detalle, a.creada_en],
+        )?;
+        conexion.execute(
+            "DELETE FROM alertas WHERE seq IN (
+                SELECT seq FROM alertas a
+                WHERE (SELECT COUNT(*) FROM alertas a2 WHERE a2.seq > a.seq) >= ?1
+            )",
+            params![MAX_ALERTAS as i64],
+        )?;
+        Ok(true)
+    }
+
+    async fn alerta_resolver(&self, tipo: &str, sujeto: &str) -> anyhow::Result<()> {
+        // Idempotente: DELETE de 0 o 1 filas. Al resolverse, el par vuelve a poder alertarse (AC2).
+        self.bloquear().execute(
+            "DELETE FROM alertas_activas WHERE tipo=?1 AND sujeto=?2",
+            params![tipo, sujeto],
+        )?;
+        Ok(())
+    }
+
+    async fn alertas(&self) -> anyhow::Result<Vec<Alerta>> {
+        let conexion = self.bloquear();
+        let mut stmt = conexion
+            .prepare("SELECT tipo,sujeto,detalle,creada_en FROM alertas ORDER BY seq ASC")?;
+        let filas = stmt.query_map([], |f| {
+            Ok(Alerta {
+                tipo: texto_a_tipo_alerta(&f.get::<_, String>(0)?),
+                sujeto: f.get(1)?,
+                detalle: f.get(2)?,
+                creada_en: f.get(3)?,
+            })
+        })?;
+        Ok(filas.filter_map(Result::ok).collect())
+    }
+
+    async fn mensajes_en_estado(
+        &self,
+        estado: EstadoMensaje,
+    ) -> anyhow::Result<Vec<(String, Mensaje)>> {
+        let conexion = self.bloquear();
+        // La tabla `mensajes` es bandeja + historial; filtramos por estado. El detector de
+        // ghosteo (R4) pide los `Leido` no `Procesado`.
+        let sql = format!("SELECT {COLS_MSG} FROM mensajes WHERE estado=?1 ORDER BY id ASC");
+        let mut stmt = conexion.prepare(&sql)?;
+        let estado_txt = estado_a_texto(estado);
+        let filas = stmt.query_map(params![estado_txt], fila_a_mensaje)?;
+        Ok(filas
+            .filter_map(Result::ok)
+            .map(|m| (m.para_id.clone(), m))
+            .collect())
+    }
 }
 
 fn fila_a_instancia(f: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
@@ -835,6 +936,54 @@ mod pruebas {
         assert_eq!(leido.muestras, 3);
         assert!((leido.factor - 35.6).abs() < 1e-9);
         assert_eq!(leido.actualizado_en, "2026-01-01T00:00:30Z");
+    }
+
+    #[tokio::test]
+    async fn alerta_emitir_es_idempotente_por_tipo_y_sujeto() {
+        // R7/AC4: la primera emisión de (ghosteo, msg:42) devuelve true y encola; una segunda
+        // emisión del MISMO par devuelve false y NO duplica en la cola. Tras resolver, vuelve
+        // a poder emitir (AC2). Una alerta de OTRO sujeto sí se emite.
+        let b = base();
+        let a1 = Alerta {
+            tipo: TipoAlerta::Ghosteo,
+            sujeto: "msg:42".into(),
+            detalle: "leído sin procesar".into(),
+            creada_en: "2026-06-29T15:00:00Z".into(),
+        };
+        assert!(b.alerta_emitir(&a1).await.unwrap(), "primera emisión");
+        assert!(!b.alerta_emitir(&a1).await.unwrap(), "duplicado no re-alerta");
+        assert_eq!(b.alertas().await.unwrap().len(), 1, "cola no duplica");
+
+        // Otro sujeto → alerta distinta, sí se emite.
+        let a2 = Alerta {
+            tipo: TipoAlerta::Ocioso,
+            sujeto: "claudia".into(),
+            detalle: "10min sin tarea".into(),
+            creada_en: "2026-06-29T15:01:00Z".into(),
+        };
+        assert!(b.alerta_emitir(&a2).await.unwrap());
+        assert_eq!(b.alertas().await.unwrap().len(), 2);
+
+        // Resolver el ghosteo → vuelve a poder alertarse (AC2).
+        b.alerta_resolver("ghosteo", "msg:42").await.unwrap();
+        assert!(b.alerta_emitir(&a1).await.unwrap(), "tras resolver re-alerta");
+        assert_eq!(b.alertas().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn mensajes_en_estado_filtra_leido() {
+        // R4: el detector de ghosteo pide los Leido (no Procesado). Devuelve (para_id, Mensaje).
+        let b = base();
+        b.registrar("a", 1, "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
+        b.encolar_mensaje("b", "a", "dos", "2026-01-01T00:00:02Z").await.unwrap();
+        let ids: Vec<i64> = b.recibir_mensajes("a").await.unwrap().iter().map(|m| m.id).collect();
+        // Sube el primero a Leido; el segundo se queda Enviado.
+        b.transicionar_mensaje(ids[0], EstadoMensaje::Leido, "2026-01-01T00:00:03Z").await.unwrap();
+        let leidos = b.mensajes_en_estado(EstadoMensaje::Leido).await.unwrap();
+        assert_eq!(leidos.len(), 1);
+        assert_eq!(leidos[0].0, "a");
+        assert_eq!(leidos[0].1.id, ids[0]);
     }
 
     #[tokio::test]

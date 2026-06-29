@@ -8,7 +8,9 @@
 //! Todos los métodos son async (Redis lo es) y devuelven `anyhow::Result` — nada entra
 //! en pánico; el handler traduce el error a un 500 con JSON.
 
-use crate::{Alcance, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea};
+use crate::{
+    Alcance, Alerta, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea,
+};
 use async_trait::async_trait;
 
 /// Alcance de listado, reexportado para que las firmas no dependan del módulo concreto.
@@ -153,4 +155,32 @@ pub trait Almacen: Send + Sync {
     /// incrementa `muestras`, timbra `actualizado_en = ahora` (el reloj lo pone el broker,
     /// nunca la IA) y persiste. Devuelve el factor ya actualizado.
     async fn actualizar_factor(&self, ratio: f64, ahora: &str) -> anyhow::Result<FactorEstimacion>;
+
+    // --- Supervisor (fase 5): alertas de ocioso/atascado/ghosteo ---
+
+    /// Emite una alerta a la cola `cprs:alertas` (LIST acotada a `MAX_ALERTAS` con LTRIM)
+    /// SOLO si `(tipo+sujeto)` no está ya en el SET de activas `cprs:alertas_activas` (R7).
+    /// Devuelve `true` si la emitió, `false` si ya estaba activa (idempotencia: no re-alertar
+    /// lo mismo cada 30s). El `creada_en` de la alerta lo timbra el broker (su reloj), aquí
+    /// solo se persiste. Redis: SADD condicional + RPUSH + LTRIM. SQLite: INSERT en `alertas_activas`
+    /// (PK tipo+sujeto) + INSERT en `alertas` con poda a las últimas `MAX_ALERTAS`.
+    async fn alerta_emitir(&self, a: &Alerta) -> anyhow::Result<bool>;
+
+    /// Quita `(tipo+sujeto)` del SET de activas cuando la condición se resuelve (AC2: al pasar
+    /// un mensaje a `Procesado`, su ghosteo deja de estar activo y puede volver a alertarse si
+    /// reaparece). Idempotente: si no estaba, no es error.
+    async fn alerta_resolver(&self, tipo: &str, sujeto: &str) -> anyhow::Result<()>;
+
+    /// Lee la cola de alertas `cprs:alertas` (R6, para `GET /admin/alertas`). Las últimas
+    /// `MAX_ALERTAS` como mucho (la cola ya está acotada por `alerta_emitir`).
+    async fn alertas(&self) -> anyhow::Result<Vec<Alerta>>;
+
+    /// Devuelve TODOS los mensajes (de cualquier cola/historial) que están en `estado`, junto
+    /// a su `para_id`. Lo usa el detector de ghosteo (R4): busca los `Leido` no `Procesado`.
+    /// Redis: itera el historial de cada instancia (vía `listar_ids`); NUNCA usa KEYS.
+    /// SQLite: `SELECT ... WHERE estado = ?`.
+    async fn mensajes_en_estado(
+        &self,
+        estado: EstadoMensaje,
+    ) -> anyhow::Result<Vec<(String, Mensaje)>>;
 }

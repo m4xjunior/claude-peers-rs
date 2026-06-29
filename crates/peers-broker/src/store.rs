@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use deadpool_redis::redis::{cmd, AsyncCommands};
 use deadpool_redis::{Config, Pool, Runtime};
 use peers_core::{
-    aplicar_media_movil, Alcance, Almacen, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox,
-    Mensaje, Sesion, Tarea,
+    aplicar_media_movil, Alcance, Alerta, Almacen, EstadoMensaje, FactorEstimacion, Instancia,
+    ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
 };
 
 const NS: &str = "cprs:";
@@ -75,6 +75,22 @@ fn k_tarea(id: &str) -> String {
 }
 fn k_factor() -> String {
     format!("{NS}factor_estimacion")
+}
+fn k_alertas() -> String {
+    format!("{NS}alertas")
+}
+fn k_alertas_activas() -> String {
+    format!("{NS}alertas_activas")
+}
+
+/// Forma textual lowercase de un `TipoAlerta` (sin comillas JSON), para componer la clave
+/// de idempotencia del SET de activas (`{tipo}:{sujeto}`). Coincide con el `rename_all`.
+fn tipo_alerta_texto(t: TipoAlerta) -> &'static str {
+    match t {
+        TipoAlerta::Ocioso => "ocioso",
+        TipoAlerta::Atascado => "atascado",
+        TipoAlerta::Ghosteo => "ghosteo",
+    }
 }
 
 #[async_trait]
@@ -581,6 +597,67 @@ impl Almacen for AlmacenRedis {
             .query_async::<()>(&mut conn)
             .await?;
         Ok(nuevo)
+    }
+
+    // --- Supervisor (fase 5): alertas ---
+
+    async fn alerta_emitir(&self, a: &Alerta) -> anyhow::Result<bool> {
+        let mut conn = self.conn().await?;
+        // Idempotencia (R7): SADD devuelve 1 si el miembro era NUEVO, 0 si ya estaba. La clave
+        // es {tipo}:{sujeto} → una sola alerta activa por (tipo+sujeto) hasta que se resuelva.
+        let clave_activa = format!("{}:{}", tipo_alerta_texto(a.tipo), a.sujeto);
+        let nuevo: i64 = conn.sadd(k_alertas_activas(), &clave_activa).await?;
+        if nuevo == 0 {
+            // Ya estaba activa: no re-alertar (no toca la cola). AC1/AC4.
+            return Ok(false);
+        }
+        // Encola la alerta y acota la LIST a las últimas MAX_ALERTAS (R5). LTRIM -N -1 conserva
+        // los N más recientes (el extremo derecho son los nuevos por el RPUSH).
+        let _: () = conn.rpush(k_alertas(), serde_json::to_string(a)?).await?;
+        let _: () = conn
+            .ltrim(k_alertas(), -(MAX_ALERTAS as isize), -1)
+            .await?;
+        Ok(true)
+    }
+
+    async fn alerta_resolver(&self, tipo: &str, sujeto: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn().await?;
+        // SREM es idempotente (quita 0 o 1). Al resolverse la condición, el (tipo+sujeto) deja
+        // de estar activo y podrá volver a alertarse si reaparece (AC2).
+        let _: () = conn.srem(k_alertas_activas(), format!("{tipo}:{sujeto}")).await?;
+        Ok(())
+    }
+
+    async fn alertas(&self) -> anyhow::Result<Vec<Alerta>> {
+        let mut conn = self.conn().await?;
+        let crudos: Vec<String> = conn.lrange(k_alertas(), 0, -1).await?;
+        Ok(crudos
+            .into_iter()
+            .filter_map(|c| serde_json::from_str::<Alerta>(&c).ok())
+            .collect())
+    }
+
+    async fn mensajes_en_estado(
+        &self,
+        estado: EstadoMensaje,
+    ) -> anyhow::Result<Vec<(String, Mensaje)>> {
+        let mut conn = self.conn().await?;
+        // Itera el historial de cada instancia conocida (NUNCA KEYS): por cada cola, recorre sus
+        // msg_id y lee el HASH fuente de verdad. Filtra por estado. El detector de ghosteo (R4)
+        // pide los Leido (no Procesado).
+        let ids: Vec<String> = conn.smembers(format!("{NS}instancias")).await?;
+        let mut out = Vec::new();
+        for id in ids {
+            let msg_ids: Vec<i64> = conn.zrangebyscore(k_historial(&id), "-inf", "+inf").await?;
+            for mid in msg_ids {
+                if let Some(m) = leer_msg(&mut conn, mid).await? {
+                    if m.estado == estado {
+                        out.push((m.para_id.clone(), m));
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

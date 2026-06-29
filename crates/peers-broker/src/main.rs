@@ -28,13 +28,13 @@ use axum::{
 use clap::Parser;
 use github::GitHub;
 use peers_core::{
-    corregir_estimado, Almacen, ColaResumen, FactorEstimacion, Mensaje, PeticionAbrirTarea,
-    PeticionCerrarTarea, PeticionConfirmar, PeticionDefinirResumen, PeticionEnviar,
-    PeticionHistorial, PeticionJornada, PeticionLatido, PeticionListar, PeticionPurgar,
-    PeticionRecibir, PeticionRegistrar, PeticionReenviar, PeticionReportarTarea, PeticionSalir,
-    RespuestaAbrirTarea, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar,
-    RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, PUERTO_DEFECTO,
-    VENCIMIENTO_MS,
+    corregir_estimado, supera_umbral, Alerta, Almacen, ColaResumen, EstadoMensaje,
+    FactorEstimacion, Mensaje, PeticionAbrirTarea, PeticionCerrarTarea, PeticionConfirmar,
+    PeticionDefinirResumen, PeticionEnviar, PeticionHistorial, PeticionJornada, PeticionLatido,
+    PeticionListar, PeticionPurgar, PeticionRecibir, PeticionRegistrar, PeticionReenviar,
+    PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea, RespuestaAdminInfo,
+    RespuestaAdminRedis, RespuestaEnviar, RespuestaJornada, RespuestaOk, RespuestaRegistrar,
+    RespuestaSalud, Tarea, TipoAlerta, PUERTO_DEFECTO, VENCIMIENTO_MS,
 };
 use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -63,6 +63,27 @@ struct Args {
     /// rutas salvo /salud. Sin token → sin auth (uso local localhost sigue funcionando igual).
     #[arg(long, env = "CLAUDE_PEERS_TOKEN")]
     token: Option<String>,
+
+    /// Umbral OCIOSO en segundos: peer vivo sin tarea desde hace > X → alerta (R2/R8).
+    #[arg(long, env = "CLAUDE_PEERS_UMBRAL_OCIOSO", default_value_t = peers_core::UMBRAL_OCIOSO_SEG)]
+    umbral_ocioso: i64,
+
+    /// Umbral ATASCO en segundos: tarea abierta sin reporte desde hace > X → alerta (R3/R8).
+    #[arg(long, env = "CLAUDE_PEERS_UMBRAL_ATASCO", default_value_t = peers_core::UMBRAL_ATASCO_SEG)]
+    umbral_atasco: i64,
+
+    /// Umbral GHOSTEO en segundos: mensaje en Leido sin Procesado desde hace > X → alerta (R4/R8).
+    #[arg(long, env = "CLAUDE_PEERS_UMBRAL_GHOSTEO", default_value_t = peers_core::UMBRAL_GHOSTEO_SEG)]
+    umbral_ghosteo: i64,
+}
+
+/// Umbrales del supervisor (R8): configurables vía env/flags del broker, con los defaults
+/// de `peers-core`. Se resuelven una vez en `main` y se mueven al spawn periódico.
+#[derive(Debug, Clone, Copy)]
+struct Umbrales {
+    ocioso_seg: i64,
+    atasco_seg: i64,
+    ghosteo_seg: i64,
 }
 
 impl std::fmt::Debug for Args {
@@ -672,6 +693,173 @@ async fn admin_reenviar(
     Ok(Json(serde_json::json!({ "ok": true, "msg_id": nuevo_id })))
 }
 
+// --- Supervisor (fase 5): detección de ociosos / atascados / ghosteo ---
+
+/// `GET /admin/alertas` → las alertas vigentes de la cola `cprs:alertas` (R6). SOLO LECTURA.
+/// La TUI la pinta como banner. Va en `rutas_protegidas` (token, AC3); nunca en /salud.
+async fn admin_alertas(State(e): State<Estado>) -> Result<Json<Vec<Alerta>>, ErrorApp> {
+    Ok(Json(e.almacen.alertas().await?))
+}
+
+/// Evalúa los 3 detectores del supervisor y emite/resuelve alertas (R1–R4, R7).
+///
+/// El tiempo lo mide el broker: recibe `ahora` (su reloj) y lo compara contra los timestamps
+/// de cada sujeto con `peers_core::supera_umbral` (función pura). La idempotencia (R7/AC4) la
+/// garantiza el almacén: `alerta_emitir` solo emite si `(tipo+sujeto)` no estaba ya activa.
+///
+/// DEGRADACIÓN (R8/AC5): cada detector va en su propio bloque con manejo de error (warn +
+/// sigue). Un detector que falle leyendo su cola NO impide los otros ni tumba el broker.
+async fn detectar_alertas(estado: &Estado, umbrales: Umbrales, ahora: &str) {
+    if let Err(err) = detectar_ociosos(estado, umbrales.ocioso_seg, ahora).await {
+        warn!("detector OCIOSO falló (se sigue con los demás): {err:#}");
+    }
+    if let Err(err) = detectar_atascados(estado, umbrales.atasco_seg, ahora).await {
+        warn!("detector ATASCADO falló (se sigue con los demás): {err:#}");
+    }
+    if let Err(err) = detectar_ghosteo(estado, umbrales.ghosteo_seg, ahora).await {
+        warn!("detector GHOSTEO falló (se sigue con los demás): {err:#}");
+    }
+}
+
+/// R2 — Ocioso: por cada instancia VIVA (visto < VENCIMIENTO) sin tarea en curso, mira cuánto
+/// lleva sin actividad. La "actividad" más reciente es el inicio de su tarea/sesión más reciente
+/// (o su registro). Si ese instante está a más de `umbral_seg` del `ahora` del broker → alerta.
+/// Cuando recupera una tarea abierta, se resuelve la alerta (AC2: la condición cesa).
+async fn detectar_ociosos(estado: &Estado, umbral_seg: i64, ahora: &str) -> anyhow::Result<()> {
+    // Instancias VIVAS según la liveness por latido (mismo criterio que `listar`).
+    let vivas = estado
+        .almacen
+        .listar(
+            peers_core::Alcance::Maquina,
+            "",
+            None,
+            None,
+            &vencidas_antes_iso(),
+        )
+        .await?;
+
+    for inst in &vivas {
+        let (sesiones, tareas) = estado.almacen.jornada(&inst.id).await?;
+        let tiene_tarea_abierta = tareas.iter().any(|t| t.fin.is_none());
+
+        if tiene_tarea_abierta {
+            // La condición cesó: si había una alerta de ocioso activa, se resuelve (AC2).
+            estado.almacen.alerta_resolver("ocioso", &inst.id).await?;
+            continue;
+        }
+
+        // Instante de la última actividad conocida: el inicio más reciente entre las tareas y
+        // las sesiones; si no hay ninguna, su `visto_en` (latido). Es el ancla del "desde".
+        let ultima_actividad = tareas
+            .iter()
+            .map(|t| t.inicio.as_str())
+            .chain(sesiones.iter().map(|s| s.inicio.as_str()))
+            .max()
+            .unwrap_or(inst.visto_en.as_str());
+
+        if supera_umbral(ultima_actividad, ahora, umbral_seg) {
+            let alerta = Alerta {
+                tipo: TipoAlerta::Ocioso,
+                sujeto: inst.id.clone(),
+                detalle: format!(
+                    "peer '{}' vivo sin tarea en curso desde hace > {}s",
+                    inst.id, umbral_seg
+                ),
+                creada_en: ahora.to_string(),
+            };
+            if estado.almacen.alerta_emitir(&alerta).await? {
+                info!("alerta OCIOSO emitida: {}", inst.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// R3 — Atascado: por cada tarea abierta (sin `fin`) cuyo `inicio` está a más de `umbral_seg`
+/// del `ahora` del broker → alerta. Al cerrarse la tarea (deja de aparecer abierta) se resuelve.
+/// Itera sobre las instancias VIVAS y sus jornadas (reusa lo existente, sin nuevos métodos).
+async fn detectar_atascados(estado: &Estado, umbral_seg: i64, ahora: &str) -> anyhow::Result<()> {
+    let vivas = estado
+        .almacen
+        .listar(
+            peers_core::Alcance::Maquina,
+            "",
+            None,
+            None,
+            &vencidas_antes_iso(),
+        )
+        .await?;
+
+    for inst in &vivas {
+        let (_sesiones, tareas) = estado.almacen.jornada(&inst.id).await?;
+        for tarea in &tareas {
+            if tarea.fin.is_some() {
+                // Tarea cerrada: la condición cesó, se resuelve su alerta (AC2).
+                estado.almacen.alerta_resolver("atascado", &tarea.id).await?;
+                continue;
+            }
+            if supera_umbral(&tarea.inicio, ahora, umbral_seg) {
+                let alerta = Alerta {
+                    tipo: TipoAlerta::Atascado,
+                    sujeto: tarea.id.clone(),
+                    detalle: format!(
+                        "tarea '{}' de '{}' abierta sin reporte desde hace > {}s: {}",
+                        tarea.id, inst.id, umbral_seg, tarea.descripcion
+                    ),
+                    creada_en: ahora.to_string(),
+                };
+                if estado.almacen.alerta_emitir(&alerta).await? {
+                    info!("alerta ATASCADO emitida: {}", tarea.id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// R4 — Ghosteo: mensajes en estado `Leido` (no `Procesado`) cuyo `leido_en` está a más de
+/// `umbral_seg` del `ahora` del broker → alerta. Cuando el mensaje pasa a `Procesado` deja de
+/// aparecer en `mensajes_en_estado(Leido)`, así que aquí lo resolvemos explícitamente (AC2):
+/// recogemos los `Procesado` recientes y limpiamos su alerta activa.
+async fn detectar_ghosteo(estado: &Estado, umbral_seg: i64, ahora: &str) -> anyhow::Result<()> {
+    // (AC2) Resolver: todo lo que ya está Procesado deja de ghostear.
+    let procesados = estado
+        .almacen
+        .mensajes_en_estado(EstadoMensaje::Procesado)
+        .await?;
+    for (_para_id, msg) in &procesados {
+        estado
+            .almacen
+            .alerta_resolver("ghosteo", &format!("msg:{}", msg.id))
+            .await?;
+    }
+
+    // Detectar: Leido sin Procesado por encima del umbral.
+    let leidos = estado.almacen.mensajes_en_estado(EstadoMensaje::Leido).await?;
+    for (para_id, msg) in &leidos {
+        // El "desde" es el instante en que se marcó Leido; si falta, no se puede medir → skip.
+        let Some(leido_en) = msg.leido_en.as_deref() else {
+            continue;
+        };
+        if supera_umbral(leido_en, ahora, umbral_seg) {
+            let sujeto = format!("msg:{}", msg.id);
+            let alerta = Alerta {
+                tipo: TipoAlerta::Ghosteo,
+                sujeto: sujeto.clone(),
+                detalle: format!(
+                    "mensaje {} de '{}' para '{}' leído sin procesar desde hace > {}s",
+                    msg.id, msg.de_id, para_id, umbral_seg
+                ),
+                creada_en: ahora.to_string(),
+            };
+            if estado.almacen.alerta_emitir(&alerta).await? {
+                info!("alerta GHOSTEO emitida: {sujeto}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -709,7 +897,19 @@ async fn main() -> anyhow::Result<()> {
         puerto: args.puerto,
     });
 
-    // Limpieza periódica por latido (cada 30s).
+    // Umbrales del supervisor (R8): resueltos una vez, copiados al spawn (Copy).
+    let umbrales = Umbrales {
+        ocioso_seg: args.umbral_ocioso,
+        atasco_seg: args.umbral_atasco,
+        ghosteo_seg: args.umbral_ghosteo,
+    };
+    info!(
+        "supervisor activo — umbrales (s): ocioso={} atasco={} ghosteo={}",
+        umbrales.ocioso_seg, umbrales.atasco_seg, umbrales.ghosteo_seg
+    );
+
+    // Limpieza periódica por latido (cada 30s). En el MISMO ciclo corre el supervisor (R1):
+    // detecta ociosos/atascados/ghosteo y emite/resuelve alertas. El tiempo lo pone el broker.
     let limpieza = estado.clone();
     tokio::spawn(async move {
         let mut intervalo = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -728,6 +928,9 @@ async fn main() -> anyhow::Result<()> {
             {
                 error!("fallo al podar historial: {e:#}");
             }
+            // Supervisor (R1): el `ahora` lo timbra el broker en cada tick. La función ya
+            // aísla cada detector (warn + sigue), así que un fallo no rompe el ciclo (AC5).
+            detectar_alertas(&limpieza, umbrales, &ahora_iso()).await;
         }
     });
 
@@ -764,6 +967,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/purgar", post(admin_purgar))
         .route("/admin/historial", get(admin_historial))
         .route("/admin/reenviar", post(admin_reenviar))
+        // Supervisor (fase 5): alertas vigentes para el banner de la TUI (R6/AC3).
+        .route("/admin/alertas", get(admin_alertas))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));
 
     let app = Router::new()
@@ -836,6 +1041,9 @@ mod pruebas {
             redis_url: "redis://127.0.0.1:6379".into(),
             db: None,
             token: Some("secreto-super-sensible".into()),
+            umbral_ocioso: peers_core::UMBRAL_OCIOSO_SEG,
+            umbral_atasco: peers_core::UMBRAL_ATASCO_SEG,
+            umbral_ghosteo: peers_core::UMBRAL_GHOSTEO_SEG,
         };
         let s = format!("{args:?}");
         assert!(!s.contains("secreto-super-sensible"), "el token NO debe aparecer en claro");
