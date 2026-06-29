@@ -45,43 +45,40 @@ peers-broker --db /var/lib/claude-peers/red.db   # SQLite embebido, sin Redis
    `claude --dangerously-skip-permissions` ya sale conectado. El id estable lo deriva el
    binario del nombre de la carpeta (o de `CLAUDE_PEERS_ID` si lo exportas).
 
-## Receta B — Servidor Linux (otus u otro)
+## Receta B — Servidor Linux (otus u otro): UN comando con `install.sh`
 
-1. **Compilar portable** (estático musl, corre en cualquier Linux sin libc-version-hell):
-   ```bash
-   rustup target add x86_64-unknown-linux-musl
-   cargo build --release --target x86_64-unknown-linux-musl
-   # binarios: target/x86_64-unknown-linux-musl/release/{peers-broker,peers-client}
-   ```
-2. **Copiar al server:**
-   ```bash
-   scp target/x86_64-unknown-linux-musl/release/peers-* otus:/usr/local/bin/
-   ```
-3. **Broker como servicio (systemd):** crear `/etc/systemd/system/claude-peers.service`:
-   ```ini
-   [Unit]
-   Description=claude-peers-rs broker
-   After=network.target redis.service
+El instalador `install.sh` hace TODO solo (idempotente): coloca binarios, levanta el broker
+como servicio (systemd), registra el MCP en `~/.claude.json` y añade la función `claude()`.
 
-   [Service]
-   ExecStart=/usr/local/bin/peers-broker --puerto 7899
-   Environment=CLAUDE_PEERS_REDIS_URL=redis://127.0.0.1:6379
-   Restart=always
-   RestartSec=2
-   User=otus
+**1. Compilar el binario portable (en tu Mac, una vez) y empaquetarlo:**
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+# Empaqueta binarios + instalador para enviar:
+mkdir -p dist/bin
+cp target/x86_64-unknown-linux-musl/release/peers-broker dist/bin/
+cp target/x86_64-unknown-linux-musl/release/peers-client dist/bin/
+cp install.sh dist/
+```
 
-   [Install]
-   WantedBy=multi-user.target
-   ```
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now claude-peers
-   ```
-4. **MCP del usuario** (`~/.claude.json` del server, o `claude mcp add --scope user`):
-   ```bash
-   claude mcp add --scope user --transport stdio claude-peers -- /usr/local/bin/peers-client
-   ```
-5. **Función `claude()`** equivalente en el `~/.bashrc`/`~/.zshrc` del server (igual que el Mac).
+**2. Copiar al servidor y ejecutar el instalador (1 comando allí):**
+```bash
+scp -r dist/* otus:/tmp/cprs/
+ssh otus 'cd /tmp/cprs && ./install.sh'
+```
+
+Eso es todo. El servidor queda con el broker corriendo (arranque + autoreinicio), el MCP
+registrado y la función `claude()` lista. El usuario abre `claude --dangerously-skip-permissions`
+y la equipe aparece.
+
+**Variantes por entorno (variables ante `./install.sh`):**
+- `PREFIX=~/.local ./install.sh` — sin sudo (binarios en `~/.local/bin`).
+- `CLAUDE_PEERS_REDIS_URL=redis://10.0.0.5:6379 ./install.sh` — Redis remoto.
+- `CLAUDE_PEERS_BROKER_URL=https://peers.midominio.com ./install.sh` — NO levanta broker local;
+  el client de este server apunta al broker central (ver Receta C).
+
+> El instalador detecta el SO: en Mac usa launchd (igual que la Receta A), en Linux systemd.
+> Re-ejecutarlo es seguro (no duplica la función shell ni rompe el servicio).
 
 ## Receta C — Red entre servidores (cross-host, vía túnel)
 
