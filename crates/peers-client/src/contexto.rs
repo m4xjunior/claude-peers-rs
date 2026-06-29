@@ -81,6 +81,35 @@ pub fn tty() -> Option<String> {
     }
 }
 
+/// Id estable derivado del directorio de trabajo, para el caso "sin --id".
+///
+/// INTENCIÓN: Max quiere lanzar `claude` sin pasar CLAUDE_PEERS_ID ni --id y aun así
+/// tener un id ESTABLE por terminal (para heredar la cola al reiniciar). El nombre de la
+/// carpeta es estable y único por proyecto, así que sirve como rol implícito: dos Claudes
+/// en la misma carpeta comparten rol (lo cual es deseable: misma "estación de trabajo");
+/// dos en carpetas distintas tienen ids distintos sin que él escriba nada.
+///
+/// Sanea el nombre a [a-z0-9-] (el broker y el harness tratan el id como string opaco,
+/// pero un id limpio evita sorpresas en logs/labels de GitHub). Si por algún motivo no
+/// hay nombre de carpeta usable, cae a "instancia".
+pub fn id_desde_directorio(directorio: &str) -> String {
+    let crudo = Path::new(directorio)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let limpio: String = crudo
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if limpio.is_empty() {
+        "instancia".into()
+    } else {
+        limpio
+    }
+}
+
 /// Resumen inicial de la instancia. A diferencia del TS (que llamaba a gpt-5.4-nano y
 /// dependía de OPENAI_API_KEY), aquí lo construimos local y sin dependencias externas:
 /// el papel (id) + el nombre del proyecto (carpeta del repo o del cwd). Es determinista,
@@ -115,7 +144,25 @@ fn salida_git(directorio: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod pruebas {
-    use super::parsear_repo_github;
+    use super::{id_desde_directorio, parsear_repo_github};
+
+    #[test]
+    fn id_desde_directorio_usa_nombre_carpeta() {
+        assert_eq!(id_desde_directorio("/Users/max/claude-peers-rs"), "claude-peers-rs");
+        assert_eq!(id_desde_directorio("/home/aistudio/ds"), "ds");
+    }
+
+    #[test]
+    fn id_desde_directorio_sanea_y_minuscula() {
+        assert_eq!(id_desde_directorio("/tmp/P2V Grupo KH"), "p2v-grupo-kh");
+        assert_eq!(id_desde_directorio("/x/Mi_Proyecto"), "mi-proyecto");
+    }
+
+    #[test]
+    fn id_desde_directorio_fallback_si_vacio() {
+        assert_eq!(id_desde_directorio("/"), "instancia");
+        assert_eq!(id_desde_directorio(""), "instancia");
+    }
 
     #[test]
     fn ssh_estandar() {

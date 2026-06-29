@@ -69,6 +69,13 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", args.puerto));
 
     let directorio = contexto::directorio_actual();
+    // Id efectivo: el --id/CLAUDE_PEERS_ID si vino; si no, derivado del directorio. Así
+    // `claude` sin argumentos ya tiene id ESTABLE por terminal (hereda cola al reiniciar)
+    // sin que Max escriba nada. A partir de aquí, el id_preferido SIEMPRE está presente.
+    let id_efectivo = args
+        .id
+        .clone()
+        .unwrap_or_else(|| contexto::id_desde_directorio(&directorio));
     let repo_git = contexto::repo_git(&directorio);
     // Resuelve "owner/repo" del remote origin AQUÍ (en la máquina del peer, con gh logado).
     // El broker no lo resuelve: recibe el valor y abre la issue en ESE repo (dinámico).
@@ -86,11 +93,10 @@ async fn main() -> Result<()> {
         warn!("el broker no responde en {url} — reintentaré en el próximo latido");
     }
 
-    // Resumen inicial local (sin API externa). Si hay --id lo usa como papel.
-    let id_papel = args.id.clone().unwrap_or_else(|| "instancia".into());
-    let resumen = contexto::resumen_inicial(&id_papel, &directorio, repo_git.as_deref());
+    // Resumen inicial local (sin API externa). Usa el id_efectivo como papel.
+    let resumen = contexto::resumen_inicial(&id_efectivo, &directorio, repo_git.as_deref());
 
-    // Registro (con id_preferido si vino --id → herencia de fila en restart).
+    // Registro con id_preferido = id_efectivo (siempre presente) → herencia de fila en restart.
     let id_asignado = match broker
         .registrar(&PeticionRegistrar {
             pid: std::process::id() as i64,
@@ -99,7 +105,7 @@ async fn main() -> Result<()> {
             repo_github: repo_github.clone(),
             tty,
             resumen,
-            id_preferido: args.id.clone(),
+            id_preferido: Some(id_efectivo.clone()),
         })
         .await
     {
@@ -123,7 +129,8 @@ async fn main() -> Result<()> {
     });
 
     // Loop de latido (cada 15s) — mantiene viva la instancia y re-registra si hizo falta.
-    lanzar_latido(estado.clone(), args.id.clone());
+    // Pasa el id_efectivo (no args.id) para que el re-registro conserve el id estable.
+    lanzar_latido(estado.clone(), Some(id_efectivo.clone()));
 
     // Loop de recepción (cada 1s) — empuja mensajes entrantes a la sesión como canal.
     lanzar_recepcion(estado.clone());
@@ -404,8 +411,13 @@ fn lanzar_latido(estado: Arc<EstadoCliente>, id_preferido: Option<String>) {
 
 /// Re-registra la instancia (usado cuando el latido falla o aún no había id).
 async fn reintentar_registro(estado: &Arc<EstadoCliente>, id_preferido: Option<String>) {
-    let id_papel = id_preferido.clone().unwrap_or_else(|| "instancia".into());
+    // id_preferido siempre llega como Some(id_efectivo) desde lanzar_latido; el fallback
+    // deriva del directorio (no "instancia") para conservar el id estable en cualquier caso.
+    let id_papel = id_preferido
+        .clone()
+        .unwrap_or_else(|| contexto::id_desde_directorio(&estado.directorio));
     let resumen = contexto::resumen_inicial(&id_papel, &estado.directorio, estado.repo_git.as_deref());
+    let id_preferido = id_preferido.or_else(|| Some(id_papel.clone()));
     if let Ok(r) = estado
         .broker
         .registrar(&PeticionRegistrar {

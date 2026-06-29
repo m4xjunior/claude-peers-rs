@@ -7,10 +7,12 @@ en cualquier servidor.
 
 ## Por qué Rust
 
-- **Binario sin deps**: SQLite va embebido. No requiere bun/node ni instalar nada.
+- **Binario sin bun/node**: un solo ejecutable; `scp` y corre. Backend Redis por defecto
+  (durabilidad + cross-host); con `--features sqlite` el broker es 100% autocontenido (sin red).
 - **Sin los 3 errores de diseño del original**:
-  1. **ID estable por papel** (`--id`) — al reiniciar una instancia con el mismo id,
-     hereda su fila de mensajes pendientes (en el TS el id era aleatorio y se perdía).
+  1. **ID estable** — sin `--id`, lo deriva del nombre de la carpeta automáticamente
+     (o de `CLAUDE_PEERS_ID`); al reiniciar una instancia con el mismo id hereda su fila
+     de mensajes pendientes (en el TS el id era aleatorio y se perdía).
   2. **Liveness por latido** (no por PID) — funciona cross-host: una instancia está viva
      si fue vista en los últimos 45s, sin depender de un PID local.
   3. **URL del broker configurable** (`--broker-url`) — el cliente apunta a donde quiera
@@ -21,12 +23,13 @@ en cualquier servidor.
 ```
 ┌──────────────┐   HTTP    ┌──────────────┐   stdio MCP   ┌─────────────┐
 │ peers-client │ ────────► │ peers-broker │               │ Claude Code │
-│  (MCP stdio) │ ◄──────── │ (axum+SQLite)│ ◄───────────► │  (sesión)   │
+│  (MCP stdio) │ ◄──────── │ (axum+Redis) │ ◄───────────► │  (sesión)   │
 └──────────────┘           └──────────────┘   notif canal  └─────────────┘
 ```
 
-- **`peers-broker`** — daemon HTTP (axum + tokio + SQLite). Registra instancias, rutea
-  mensajes, mantiene liveness. Un solo broker por red.
+- **`peers-broker`** — daemon HTTP (axum + tokio). Persistencia tras el trait `Almacen`:
+  Redis por defecto, SQLite con `--features sqlite`. Registra instancias, rutea mensajes,
+  mantiene liveness, mide la jornada. Un solo broker por red.
 - **`peers-client`** — servidor MCP stdio, uno por instancia de Claude Code. Expone las
   tools, registra la instancia y empuja los mensajes entrantes a la sesión como canal.
 - **`peers-core`** — tipos compartidos del protocolo (única fuente de verdad del wire format).
