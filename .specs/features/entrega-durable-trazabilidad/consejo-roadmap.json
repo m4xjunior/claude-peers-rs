@@ -1,0 +1,394 @@
+{
+  "opiniones": [
+    {
+      "features": [
+        {
+          "nombre": "Migrar /recibir de pop-destructivo a peek+ACK (matar el LRANGE+DEL)",
+          "que_es": "Reescribir AlmacenRedis::recibir_mensajes para que NO haga DEL. La entrega pasa a un ZSET ordenado cprs:bandeja:{id} (score = msgseq) donde cada Mensaje gana un campo estado:EstadoMensaje{Enviado,Entregado,Leido,Procesado,Fallido,DeadLetter} y entregado_intentos:u32. recibir() (peek): hace ZRANGEBYSCORE de los Enviado, los marca Entregado (HSET del estado en cprs:msg:{msg_id} HASH) y los devuelve SIN borrar. Nuevo endpoint POST /confirmar {msg_ids:[i64], estado:Leido|Procesado} que reusa la mecánica del outbox_confirmar ya existente. El cliente (lanzar_recepcion) llama /confirmar con estado=Leido tras empujar_canal con éxito. El borrado real solo ocurre al confirmar Procesado o tras retención. Esto convierte el msg en el ItemOutbox que el modelo ya tiene cableado a medias.",
+          "por_que_importa": "Es el bug raíz: el mensaje se borra al leerse, antes de que el receptor confirme que lo procesó. Sin esto NO hay trazabilidad posible ni reenvio: lo que no existe en Redis no se puede auditar ni recuperar. Todo lo demas cuelga de aqui.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Maquina de estados de mensaje con sello de tiempo por transicion",
+          "que_es": "Enum EstadoMensaje en peers-core (Enviado/Entregado/Leido/Procesado/Fallido/DeadLetter) + struct Mensaje extendido con estado, entregado_en:Option<String>, leido_en:Option<String>, procesado_en:Option<String>, intentos:u32. Cada transicion la timbra el broker con SU reloj (mismo patron que jornada, la IA nunca estima). Almacen gana transicionar_mensaje(msg_id, nuevo_estado, ahora). El cliente reporta Leido al empujar al canal y Procesado cuando el agente responde/acciona (se infiere: cuando ese de_id recibe a su vez un enviar_mensaje de vuelta, o via tool explicita marcar_procesado).",
+          "por_que_importa": "Responde la pregunta central de Max: quien recibio/leyo/proceso que. Sin estados discretos timbrados solo hay un booleano entregado que miente (se pone true en memoria y se pierde). Es la columna vertebral de accountability de empleados IA.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Historial durable por cola + endpoint /historial (no se borra al leer)",
+          "que_es": "Clave cprs:historial:{id} = ZSET (score=msgseq) que retiene TODO mensaje entregado a ese id con su estado final, aunque ya se haya procesado. recibir() copia al historial al entregar; transicionar_mensaje actualiza el estado en el historial tambien. Endpoint GET /admin/historial?id=&desde=&estado= que la TUI consume en una pantalla nueva Historial. Retencion configurable (ej. ultimos 500 o 7 dias) via ZREMRANGEBYRANK en la limpieza periodica ya existente.",
+          "por_que_importa": "Es literalmente lo que Max pide: ver quien recibio/leyo/proceso que. Hoy recibir_mensajes destruye la evidencia. El historial es el registro permanente que sobrevive al procesamiento, base del reenvio y de las metricas.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Reenviar un mensaje que el Claude ignoro (/reenviar)",
+          "que_es": "Endpoint POST /admin/reenviar {msg_id} (y POST /reenviar para peers). Lee el mensaje del historial, clona su texto con un nuevo msgseq y estado=Enviado, lo re-encola en cprs:bandeja:{para_id}, e incrementa un campo reenvios:u32 + reenviado_de:Option<i64> (traza la cadena). La TUI gana accion 'r' en la pantalla Historial/Peers sobre un mensaje seleccionado. Detecta 'ignorado' = entregado/leido pero NO procesado tras N segundos.",
+          "por_que_importa": "Max lo pide explicito: reenviar un mensaje que el Claude ignoro. El push fire-and-forget al harness se traga mensajes si no hay turno activo; el reenvio manual desde la TUI es el control humano de supervision que cierra ese agujero.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "bajo"
+        },
+        {
+          "nombre": "Idempotencia de entrega por dedupe key (no empujar dos veces el mismo)",
+          "que_es": "Cada Mensaje ya tiene id:i64 unico (msgseq). El cliente mantiene un SET local de ultimos msg_ids empujados al canal (cprs no, en memoria del peers-client, ventana de ~500). empujar_canal solo dispara si el id no esta visto. En el broker, transicionar a Entregado es un HSETNX sobre entregado_en (solo timbra la PRIMERA vez). Asi un peek repetido (cliente reinicia, relee la bandeja) no re-empuja ni re-timbra.",
+          "por_que_importa": "Al dejar de borrar al leer (P0), el mismo mensaje se leera en cada ciclo de 1s hasta que se confirme Procesado. Sin idempotencia, el agente recibiria el mismo <channel> en bucle cada segundo: ruido insoportable. La idempotencia es el requisito que hace viable el peek no-destructivo.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "bajo"
+        },
+        {
+          "nombre": "Recuperacion del receptor caido a mitad (replay de no-procesados al re-registrar)",
+          "que_es": "En registrar() (handler), tras resolver el id estable, el broker re-marca como Enviado todo mensaje de cprs:bandeja:{id} que este en Entregado o Leido pero NO Procesado (transicion de vuelta atras + incrementa intentos). Asi un peer que cayo tras leer pero antes de procesar, al reiniciar con su id estable, vuelve a recibir esos mensajes por el peek normal. El id estable por carpeta (que ya existe) es justo lo que ata la bandeja al peer que vuelve.",
+          "por_que_importa": "Cubre el caso exacto del prompt: receptor que cae a mitad. Hoy el mensaje ya fue DELeteado y se perdio; con bandeja durable + replay al re-registro, el trabajo no se pierde nunca. Es la garantia at-least-once real apoyada en el id estable ya implementado.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "bajo"
+        },
+        {
+          "nombre": "Dead-letter queue tras N intentos fallidos",
+          "que_es": "Clave cprs:dlq:{id} = LIST. La limpieza periodica (el tokio::spawn de 30s ya existente en main.rs) escanea bandejas: mensaje con intentos >= MAX_INTENTOS (ej. 5) y aun no Procesado pasa a estado DeadLetter y se mueve a la DLQ, saliendo de la bandeja activa (deja de re-empujarse). Endpoint GET /admin/dlq y accion TUI para reinyectar (mover DLQ -> bandeja con intentos=0) o descartar. Razon del fallo en campo motivo_dlq:Option<String>.",
+          "por_que_importa": "Sin DLQ, un mensaje a un peer muerto-permanente (carpeta que ya no se abre) se reintentaria para siempre o se perderia en silencio. La DLQ es el cementerio observable: Max ve que NO se entrego y decide. Accountability incluye registrar los fracasos, no solo los exitos.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "ACK del harness real (confirmar entrega al canal, no solo al stdout)",
+          "que_es": "Hoy empujar_canal escribe a stdout y asume exito (fire-and-forget). Mejora: la notificacion notifications/claude/channel se envia y el cliente marca Entregado solo tras flush exitoso del writer (ya hay Result en enviar_json, hoy se ignora con let _). Cambiar empujar_canal para devolver bool de exito de escritura, y solo entonces llamar /confirmar estado=Entregado. Si el flush falla (stdout roto, harness cerrado), NO se confirma y el mensaje sigue Enviado -> se reintenta.",
+          "por_que_importa": "El push es fire-and-forget hoy: si stdout esta roto o el harness no acepta, se pierde sin rastro. Atar la transicion Entregado al exito real de escritura cierra la ventana entre leer-de-Redis y entregar-al-agente, que es donde el mensaje muere segun el bug de aistudio.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "bajo"
+        },
+        {
+          "nombre": "Pantalla Trazabilidad en la TUI (timeline de estados por mensaje)",
+          "que_es": "Nueva pantalla ratatui (junto a Peers/Red/Redis/Broker/Config) que pinta, por instancia seleccionada, la lista de mensajes del historial con columnas: de_id, texto recortado, estado (color por estado), enviado/entregado/leido/procesado timestamps, intentos. Acciones: 'r' reenviar, 'd' enviar a DLQ, Enter para ver el timeline completo de un mensaje. Consume /admin/historial y /admin/dlq.",
+          "por_que_importa": "La trazabilidad sin visualizacion es solo claves Redis. Max supervisa a sus empleados IA desde la TUI; necesita ver de un vistazo quien ignoro que y reenviar con una tecla. Convierte los estados (P0) en una herramienta de supervision usable.",
+          "prioridad": "P2-medio",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Metricas de entrega por instancia (/admin/metricas)",
+          "que_es": "Contadores en Redis (HINCRBY cprs:metricas:{id}) por estado: total_enviados, entregados, leidos, procesados, fallidos, reenvios, dlq. Mas latencia media enviado->procesado (acumulador de segundos / count). Endpoint GET /admin/metricas y un panel resumen en la TUI: tasa de procesamiento por empleado IA, mensajes ignorados, tiempo medio de respuesta.",
+          "por_que_importa": "Plataforma de empleados IA real necesita KPIs: que peer responde rapido, cual ignora, cual falla. Reusa el patron jornada (medir con el reloj del broker). Da a Max el dashboard de rendimiento de su equipo sin instrumentar nada manual.",
+          "prioridad": "P2-medio",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Atomicidad de peek+marcar via script Lua (eliminar la race del LRANGE/LSET)",
+          "que_es": "outbox_confirmar y la nueva transicionar_mensaje hoy harian LRANGE + LSET en dos viajes: ventana de carrera si dos confirmaciones concurren. Reemplazar por un EVAL Lua atomico que lee, transiciona y reescribe en un solo comando server-side. Aplica tambien al peek de recibir (leer Enviado + marcar Entregado atomico).",
+          "por_que_importa": "Con multiples peers y la TUI tocando la misma bandeja, el LRANGE+LSET no atomico puede perder transiciones (lost update). Lua garantiza linealidad sin bloquear el pool. Es la base de robustez para que los estados no mientan bajo concurrencia.",
+          "prioridad": "P3-futuro",
+          "esfuerzo": "alto"
+        }
+      ],
+      "lente": "arquitectura",
+      "no_hacer": [
+        "Reescribir el transporte a WebSocket/SSE push real desde el broker: el modelo pull cada 1s + push MCP ya funciona cross-host y por tunel; cambiar el transporte es un proyecto entero que NO ataca el bug de perdida (el bug es de persistencia, no de transporte). YAGNI hasta que la latencia de 1s moleste de verdad.",
+        "Adoptar Redis Streams (XADD/XREADGROUP/consumer groups) en vez de ZSET+HASH: Streams da consumer groups y ACK nativos que SUENAN perfectos, pero reescribe todo el store, rompe el patron JSON-en-LIST homogeneo del resto del sistema, y el numero de peers (decenas, no millones) no justifica la complejidad. El ZSET+estado cubre 100% de los requisitos de Max con el codigo existente.",
+        "Exactly-once semantics / transacciones distribuidas de dos fases: at-least-once + idempotencia por msg_id es suficiente y es lo que usan los sistemas serios (Kafka, SQS). Perseguir exactly-once real es un agujero negro de ingenieria para una red de empleados IA donde un mensaje duplicado ocasional es inocuo.",
+        "Outbox pattern transaccional acoplado a la BD del emisor (al estilo microservicios): aqui el broker ES la fuente unica de verdad, no hay BDs de servicio separadas que sincronizar. El ItemOutbox del modelo es realmente una bandeja durable del receptor, no el outbox-pattern clasico; usarlo como bandeja+estados es correcto, montar el patron transaccional completo es sobre-ingenieria.",
+        "Priorización/colas con prioridad por mensaje, TTL por mensaje individual, o routing por topic: nadie lo pidio y anaden superficie. La retencion global por cola (ZREMRANGEBYRANK) cubre la limpieza sin meter politica por-mensaje."
+      ]
+    },
+    {
+      "lente": "producto-empleados",
+      "features": [
+        {
+          "nombre": "Historial inmutable de cola: leer sin destruir (arreglo del bug + base de trazabilidad)",
+          "que_es": "Reemplazar el LRANGE+DEL de recibir_mensajes() (store.rs:236-244) por un patrón no destructivo: cada mensaje pasa a estado 'entregado' (marca de tiempo de lectura) pero PERMANECE en un historial cprs:historial:{id} (LIST append-only, JSON de Mensaje con campos nuevos leido_en/procesado_en). /recibir devuelve solo los no-entregados y los timbra como leídos; nunca borra. El campo 'entregado:bool' de Mensaje (lib.rs:51) pasa a un enum EstadoMensaje{Encolado,Leido,Procesado}. Nuevo metodo en trait Almacen: historial_mensajes(id, limite).",
+          "por_que_importa": "Es el bug que halló aistudio: hoy un push fire-and-forget sin turno activo pierde el mensaje sin rastro. Sin historial no hay NINGUNA de las demás features de accountability — es el cimiento. Convierte 'le mandé algo y desapareció' en 'aquí está todo lo que le mandé y cuándo lo leyó'.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Reenvío de mensaje ignorado (re-push desde TUI)",
+          "que_es": "Endpoint POST /admin/reenviar { id_mensaje } o { para_id, ultimo:true } que toma un mensaje del historial y lo vuelve a encolar+pushear al peer. En la TUI, pantalla Peers: tecla 'R' sobre un peer abre su historial y permite reenviar el mensaje seleccionado. Reusa encolar_mensaje + el push notifications/claude/channel ya existente. Marca reenvios_count en el mensaje.",
+          "por_que_importa": "Es exactamente lo que Max pidió: 'poder REENVIAR un mensaje que el Claude ignoró'. El caso real: el push llegó sin turno activo y el Claude no reaccionó. Max no quiere reescribir la orden, quiere re-tocarle el hombro al empleado. Sin esto, un Claude distraído = trabajo perdido y Max copia-pegando manualmente.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "bajo"
+        },
+        {
+          "nombre": "ACK de lectura/procesamiento real (entrega usa el outbox que ya existe)",
+          "que_es": "Cablear el outbox durable (ItemOutbox + outbox_encolar/pendientes/confirmar, YA en el trait pero SIN usar en /recibir). /enviar encola tambien en outbox; el cliente, tras inyectar el <channel> en la sesión, llama un nuevo POST /confirmar { item_id } al consumir → outbox_confirmar. Tres marcas de tiempo por mensaje: enviado_en / leido_en (lo sacó de la cola) / confirmado_en (el Claude lo procesó de verdad). La TUI muestra el icono de estado por mensaje (○ encolado, ◑ leído, ● confirmado).",
+          "por_que_importa": "Cierra el agujero raíz del bug: 'leído' (LRANGE) no es 'procesado'. Hoy el sistema asume que sacar de la cola = entregado, y por eso pierde. Con ACK real, Max ve la diferencia entre 'el Claude vio el mensaje' y 'el Claude lo ignoró tras verlo' — distingue un empleado caído de uno que te está ghosteando. El modelo ya está, solo falta cablearlo a /recibir.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Estado de tarea (asignada/en curso/bloqueada/hecha) + razón de bloqueo",
+          "que_es": "Añadir enum EstadoTarea{Asignada,EnCurso,Bloqueada,Hecha,Abandonada} y bloqueo_motivo:Option<String> al struct Tarea (lib.rs:176). Endpoints: POST /tarea/estado { tarea_id, estado, motivo? } y el ya existente /tarea/cerrar pasa a Hecha. El cliente marca EnCurso al empezar a trabajar y puede reportar Bloqueada con motivo (ej. 'espero respuesta de aistudio'). Sincroniza con label de la issue de GitHub (ya hay integración).",
+          "por_que_importa": "Sin estado, una 'tarea' es solo un timestamp de inicio. Max quiere ver el tablero de su equipo como en una empresa: quién está atascado y por qué. 'Bloqueada con motivo' es lo que convierte un equipo opaco en uno que Max puede desatascar — el corazón de sentir que dirige gente, no procesos.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Pantalla TUI 'Equipo': quién hace qué AHORA",
+          "que_es": "Nueva pantalla (6 Equipo) en peers-tui/src/ui/ y en el enum Pantalla (app.rs:10). Una fila por peer vivo: id, estado de jornada (en sesión/ocioso), tarea activa con su EstadoTarea+color, duración en curso timbrada por el broker, nº mensajes pendientes/sin confirmar. Se alimenta de un nuevo GET /admin/equipo que consolida instancias vivas + jornada(inst) + colas. Refresco con el intervalo de config ya existente.",
+          "por_que_importa": "Es el dashboard de jefe que no existe: hoy la jornada se mide pero está enterrada (solo accesible vía /jornada por instancia, sin vista de conjunto). Max abre la TUI y de un vistazo ve a su equipo trabajando — esto ES la experiencia 'iniciar el claude y la equipe aparece' llevada a la gestión. Reusa datos que el broker ya tiene.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Historial de conversación por agente en la TUI (inbox/outbox visible)",
+          "que_es": "En la pantalla Peers, tecla Enter sobre un peer abre un panel de conversación: lista cronológica de mensajes hacia/desde ese peer (de su historial cprs:historial:{id}) con de_id, texto, estado (○◑●) y horas. Scroll. Desde ahí se reenvía (la feature de re-push) o se compone un mensaje nuevo (reusa Input::Mensaje ya existente en app.rs:77). Backend: GET /admin/conversacion { id }.",
+          "por_que_importa": "Max pidió 'ver quién recibió/leyó/procesó qué' e 'inbox/outbox visible en la TUI'. Es la vista de chat por empleado: el equivalente a abrir el DM de un trabajador y ver toda la conversación con su estado de lectura. Sin esto, el historial existe en Redis pero Max no lo puede inspeccionar — la trazabilidad sin UI es invisible.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Reasignación de tarea de un agente caído a otro vivo",
+          "que_es": "POST /admin/reasignar { tarea_id, nuevo_instancia_id }: cambia instancia_id de la Tarea, la deja EstadoTarea::Asignada, y encola+pushea al nuevo peer un mensaje con la descripción + contexto ('heredas la tarea X que dejó claudia bloqueada en: ...'). Si la tarea tiene issue de GitHub, reasigna el assignee/label. En la pantalla Equipo, tecla 'a' sobre una tarea de un peer muerto/bloqueado abre un selector de peers vivos como destino.",
+          "por_que_importa": "Es la red de seguridad de un equipo real: si un empleado se va a casa enfermo, su trabajo no muere con él. Caso concreto: un Claude en un server se reinicia y deja una tarea EnCurso a medias — Max la pasa a otro peer vivo sin perder el contexto. Esto convierte una flota frágil de procesos en un equipo resiliente. Depende de EstadoTarea.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "alto"
+        },
+        {
+          "nombre": "Supervisor: detector de agentes ociosos, atascados o que ghostean",
+          "que_es": "Tarea tokio periódica en el broker (junto al limpiar_vencidas de main.rs:541) que detecta: (1) peer vivo SIN tarea EnCurso por >N min = ocioso; (2) tarea EnCurso sin reporte por >N min = posible atasco; (3) mensajes Leido pero no Confirmado por >N min = ghosteo (vio pero no actuó). Emite alertas a una cola cprs:alertas que la TUI pinta como banner/lista en la pantalla Equipo. Umbrales en Config.",
+          "por_que_importa": "Es el supervisor que Max no puede ser 24/7. El caso del bug original (mensaje pusheado sin turno activo) lo cazaría: 'aistudio leyó hace 20 min y no confirmó'. Transforma la trazabilidad pasiva (puedo mirar) en supervisión activa (el sistema me avisa). Es lo que hace que Max confíe en delegar sin vigilar — la diferencia entre tener funcionarios y tener scripts.",
+          "prioridad": "P2-medio",
+          "esfuerzo": "alto"
+        },
+        {
+          "nombre": "Métricas de jornada por agente (productividad del equipo)",
+          "que_es": "GET /admin/metricas { instancia_id?, desde?, hasta? } que agrega sobre sesiones/tareas ya persistidas: tiempo total en sesión, nº tareas hechas/bloqueadas/abandonadas, duración media por tarea, % de mensajes confirmados vs ignorados, tiempo medio de respuesta (enviado_en→confirmado_en). Vista en la pantalla Equipo (tecla 'm') o Broker. Todo derivado de datos que el broker YA timbra — cero estimación de la IA.",
+          "por_que_importa": "Cierra el círculo de 'empresa real': Max no solo ve qué pasa ahora, sino el desempeño histórico. Qué agente confirma rápido, cuál abandona tareas, cuál se bloquea seguido. Como la jornada la timbra el reloj del broker (no la IA), las métricas son auditables de verdad. Es accountability con números, alineado con la obsesión de Max por el fichaje real.",
+          "prioridad": "P2-medio",
+          "esfuerzo": "medio"
+        }
+      ],
+      "no_hacer": [
+        "Chat en tiempo real estilo Slack con threads, reacciones y typing indicators — Max no charla con los agentes, les da órdenes y supervisa resultado. El historial cronológico por agente cubre el 100% de la necesidad; los threads son complejidad de UI sin valor para un jefe que delega.",
+        "Sistema de roles/permisos granular entre peers (quién puede mandar a quién) — todos los agentes son funcionarios de Max bajo un solo token X-Peers-Token. Un RBAC interno es seguridad inventada para un problema que no existe en una flota de un solo dueño.",
+        "Persistencia en Postgres/SQL para el historial 'por si crece' — Redis con LIST append-only y un LTRIM de retención (ej. últimos 500 msg por cola) sobra para la escala real (puñado de peers en LAN). SQLite ya está como alternativa tras feature. Migrar a Postgres es over-engineering YAGNI.",
+        "Editor visual de flujos/orquestación de tareas (DAG de dependencias entre agentes) — Max orquesta vía tmux y mensajes directos, no necesita un motor de workflows. La reasignación manual + estados de tarea cubren la coordinación real sin construir un n8n dentro del broker.",
+        "Reintentos automáticos con backoff del push fire-and-forget — el problema no es que el push falle en la red, es que llega sin turno activo. El outbox durable + ACK + reenvío manual desde la TUI lo resuelven con Max en el loop; un reintentador automático esconde el problema (el Claude sigue sin verlo) y añade un sistema que puede martillar al peer.",
+        "Notificaciones push externas (email/Telegram/desktop) cuando un agente se atasca — el supervisor que pinta alertas en la TUI es suficiente para el modo de trabajo de Max (TUI abierta mientras dirige). Integrar canales externos es scope creep; si lo quiere, lo pide explícito."
+      ]
+    },
+    {
+      "lente": "mensajeria-context7",
+      "features": [
+        {
+          "nombre": "Migrar cola de mensajes LIST -> Redis Stream con consumer group (FIX del bug)",
+          "que_es": "Reescribir en store.rs (crate peers-broker) los metodos del trait Almacen para mensajes: encolar_mensaje -> XADD cprs:stream:{para_id} * de_id .. texto .. con MAXLEN ~ 1000; recibir_mensajes -> XREADGROUP GROUP recv {consumidor} COUNT N STREAMS cprs:stream:{para_id} > (entrega solo no-leidos, los deja en el PEL sin borrar); en el registro de instancia, XGROUP CREATE cprs:stream:{id} recv $ MKSTREAM idempotente (ignorar BUSYGROUP). recibir devuelve los mensajes pero NO los ACKea aun: pasan al PEL.",
+          "por_que_importa": "Es el bug exacto que reporto aistudio: LRANGE+DEL borra al leer y pierde el push fire-and-forget sin rastro. Con XREADGROUP el mensaje queda en el PEL hasta ACK: si Claude no tiene turno, no se pierde — queda pendiente y recuperable. La doc verificada lo exige textualmente para at-least-once + crash recovery.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "ACK explicito al procesar (XACK) + endpoint /confirmar",
+          "que_es": "Nuevo metodo trait Almacen::confirmar_mensaje(para_id, stream_id) -> XACK cprs:stream:{para_id} recv {stream_id}, idempotente. Endpoint POST /confirmar en broker main.rs (junto a /recibir, ruta linea ~568). El cliente (peers-client) llama /confirmar tras inyectar el bloque <channel> en la sesion del Claude. El campo entregado:bool del struct Mensaje pasa a tener semantica real (ACKeado=procesado) en vez de un flag cosmetico.",
+          "por_que_importa": "Distingue los 3 estados que Max pide explicitamente: recibido (en PEL), leido (XREADGROUP lo entrego), procesado (XACK). Sin ACK no hay forma de saber 'quien proceso que'. El PEL pasa a ser la lista viva de 'mensajes que el Claude vio pero aun no atendio'.",
+          "prioridad": "P0-critico",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Reenviar mensaje ignorado (XAUTOCLAIM / XPENDING + re-entrega)",
+          "que_es": "Metodo Almacen::reenviar_pendientes(para_id, idle_ms) que usa XAUTOCLAIM cprs:stream:{para_id} recv {consumidor} {idle_ms} 0 (reclama entries del PEL idle > umbral y los re-entrega), o XPENDING para listar+XCLAIM puntual de un stream_id concreto. Endpoint POST /admin/reenviar {id, stream_id?|todos}. Boton 'Reenviar' en la pantalla Peers/Redis de la TUI (peers-tui ui/peers.rs o ui/redis.rs).",
+          "por_que_importa": "Es literalmente lo que Max pide: 'poder REENVIAR un mensaje que el Claude ignoro'. Un mensaje que quedo en el PEL sin ACK (Claude lo ignoro o crasheo) se vuelve a empujar via push. XAUTOCLAIM es el mecanismo nativo de recuperacion de consumidor caido segun la doc.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Historial de mensajes por cola (XRANGE) + pantalla TUI",
+          "que_es": "Metodo Almacen::historial_mensajes(id, desde, hasta, limite) -> XRANGE cprs:stream:{id} - + COUNT n, devuelve TODO (leidos y no, ACKeados o no) con su stream_id-timestamp. Endpoint GET /admin/historial/{id}. Nueva pantalla/columna en TUI: ver el historial completo de una cola con estado (pendiente-en-PEL / ACKeado) cruzando XRANGE con XPENDING.",
+          "por_que_importa": "'ver quien recibio/leyo/proceso que' y 'historial de mensajes por cola'. XRANGE da historial nativo independiente del estado del grupo (cita doc) — algo IMPOSIBLE con la LIST que se borraba al leer. El timestamp del stream_id da trazabilidad temporal real sin inventar nada.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Eliminar outbox LIST duplicado — el PEL ES el outbox",
+          "que_es": "Borrar k_outbox/ItemOutbox de la ruta de mensajes: outbox_encolar/pendientes/confirmar quedan subsumidos por XADD(historial)+XPENDING(pendientes)+XACK(confirmar). Eliminar el escaneo O(n) de outbox_confirmar (store.rs:295-315 hace KEYS cprs:outbox:* + LRANGE de todas — no escala). Actualizar contar_mensajes_pendientes -> XLEN o XPENDING summary. purgar -> DEL del stream.",
+          "por_que_importa": "El outbox actual reimplementa a mano (y mal: O(n) sobre KEYS, prohibido en prod) lo que el Stream da nativo. Mantener dos sistemas de durabilidad en paralelo es deuda y fuente de inconsistencia. YAGNI inverso: ya existe codigo que sobra una vez migrado a Streams.",
+          "prioridad": "P1-alto",
+          "esfuerzo": "bajo"
+        },
+        {
+          "nombre": "Metricas de accountability por empleado-IA (XINFO/XPENDING)",
+          "que_es": "Endpoint GET /admin/metricas que agrega por instancia: mensajes recibidos (XLEN), pendientes sin procesar (XPENDING count), tiempo medio en PEL antes de ACK (idle de XPENDING), tasa de ignorados (entries reclamados por XAUTOCLAIM). Pantalla 'Equipo' en TUI con tabla: empleado | recibidos | procesados | ignorados | latencia-media-respuesta.",
+          "por_que_importa": "Convierte 'empleados IA' de metafora a panel real de supervision: quien responde rapido, quien deja mensajes colgados, carga por instancia. Es la trazabilidad que pide Max llevada a metricas de desempeno, todo derivado de comandos XINFO/XPENDING nativos.",
+          "prioridad": "P2-medio",
+          "esfuerzo": "medio"
+        },
+        {
+          "nombre": "Dead-letter stream para mensajes irrecuperables",
+          "que_es": "Cuando un mensaje supera N reenvios (delivery-count del PEL via XPENDING > umbral), XACKearlo del stream original y XADD a cprs:dlq:{id} con metadata (intentos, ultimo_idle). Endpoint /admin/dlq para inspeccionar y re-inyectar manualmente.",
+          "por_que_importa": "La doc advierte: si XADD MAXLEN~/XTRIM borra el payload mientras el id sigue en PEL, XAUTOCLAIM quita el id pero no se puede reintentar -> 'requires logging and routing to a dead-letter store' (cita textual). Evita loops infinitos de reenvio de un mensaje que el Claude nunca atiende y da rastro de lo no-entregado.",
+          "prioridad": "P2-medio",
+          "esfuerzo": "bajo"
+        },
+        {
+          "nombre": "Retencion acotada nativa (XADD MAXLEN ~ / XTRIM MINID)",
+          "que_es": "XADD con MAXLEN ~ 1000 (trimming aproximado barato) en encolar, y un XTRIM MINID por edad (ej. mensajes > 7 dias) en el limpiar_vencidas existente. Configurable en peers-tui pantalla Config.",
+          "por_que_importa": "Sin esto el historial crece sin limite. La doc lo da como ventaja nativa: 'bounded retention via XADD MAXLEN~ or XTRIM MINID~ without a separate cleanup job'. Mantiene el historial util sin un cron de limpieza aparte ni el riesgo de borrar mensajes aun en PEL (MINID respeta lo pendiente mejor que MAXLEN duro).",
+          "prioridad": "P3-futuro",
+          "esfuerzo": "bajo"
+        }
+      ],
+      "no_hacer": [
+        "NO migrar a un broker externo (Kafka/RabbitMQ/NATS): Redis Streams ya da consumer groups+PEL+ACK+replay; meter otra pieza rompe el criterio de '2 binarios sin deps' del Cargo.toml y la infra LAN actual. YAGNI.",
+        "NO usar XREAD (sin grupo) ni seguir con LIST 'parcheada' (no-DEL + flag manual): la doc verificada dice explicitamente que XREAD no tiene PEL y no se puede ACKear; parchear la LIST obliga a reimplementar a mano PEL/claim/idle — trabajo que el Stream ya trae probado.",
+        "NO crear un consumer group por cada lector/rol cuando hoy cada destinatario es un unico consumidor: basta UN grupo 'recv' por stream-destinatario. Multiples grupos solo si en el futuro varias vistas (ej. TUI tailing + cliente) deben leer el mismo stream a ritmos distintos — diferirlo.",
+        "NO conservar el contador cprs:msgseq como id de mensaje: el stream_id que genera Redis (ms-seq) ya da orden total y timestamp de trazabilidad gratis; mantener un INCR paralelo es estado redundante que puede desincronizarse.",
+        "NO construir un dashboard web/grafico ahora: la TUI ratatui existente cubre la supervision; un frontend separado es scope creep contra la vision 'iniciar el claude y la equipe aparece' (todo en terminal).",
+        "NO implementar prioridades/colas multiples por urgencia todavia: no hay evidencia de que Max lo necesite; un solo stream FIFO por destinatario con reenvio cubre el caso. Anadir prioridad es over-engineering junior."
+      ]
+    },
+    {
+      "lente": "robustez-critico",
+      "features": [
+        {
+          "nombre": "x",
+          "que_es": "y",
+          "por_que_importa": "z",
+          "prioridad": "P0-critico",
+          "esfuerzo": "bajo"
+        }
+      ],
+      "no_hacer": [
+        "test"
+      ]
+    }
+  ],
+  "sintesis": {
+    "resumen_ejecutivo": "El bug raíz está confirmado en codigo: `AlmacenRedis::recibir_mensajes` (store.rs:236-244) hace LRANGE+DEL, borrando el mensaje al leerlo, antes de que el receptor confirme que lo procesó — por eso un push fire-and-forget sin turno activo se pierde sin rastro. Encima, `enviar_json` ignora el Result del flush a stdout (mcp.rs:54-58), así que ni siquiera se sabe si el harness recibió la notificación. La plataforma de \"empleados IA con trazabilidad\" se construye sobre tres cimientos que Max pidió explícitamente: historial durable por cola (leer sin destruir), estados de mensaje timbrados por el reloj del broker (enviado/entregado/leído/procesado), y reenvío manual desde la TUI. Lo bueno: el modelo ya tiene `ItemOutbox` con campo `confirmado` (ACK) cableado a medias y un `id` estable por carpeta — gran parte del trabajo es conectar lo que ya existe, no reescribir. Sobre eso se montan el dashboard de Equipo, las métricas de jornada y el supervisor de ghosteo que convierten la trazabilidad pasiva en supervisión activa.",
+    "veredicto_streams": "Quedarse con LIST/ZSET parcheada (no destructiva + estados en HASH), NO migrar a Redis Streams. Razón: el bug es de PERSISTENCIA (se borra al leer), no de transporte ni de falta de consumer-groups. Streams ofrece PEL/XACK/XAUTOCLAIM/XRANGE que suenan ideales y son tentadores, pero (1) reescriben TODO el store, rompiendo el patrón homogéneo JSON-en-LIST del resto del sistema (instancias, sesiones, tareas, jornada), (2) la escala real es decenas de peers en LAN, no millones de eventos — el PEL no compra nada que un ZSET+estado no resuelva, y (3) el `id:i64` (cprs:msgseq) ya da orden total y es la clave del historial y del dedupe; el stream_id de Redis sería estado redundante a sincronizar. La lente de Streams tenía razón en UN punto que adopto sin migrar: el outbox actual con `KEYS cprs:outbox:*` + LRANGE (store.rs:299-315) es O(n) y está prohibido en prod — pero la solución es indexar el outbox por para_id (que ya se conoce) y subsumirlo en la bandeja durable, no traer Streams. Veredicto: la bandeja durable = ZSET cprs:bandeja:{id} (score=msgseq) + estado en HASH cprs:msg:{id}, con script Lua para atomicidad solo cuando la concurrencia lo exija (P3). Esto cubre el 100% de lo que Max pidió reusando el código existente. Si algún día hay multi-lector concurrente del mismo stream a ritmos distintos (TUI tailing + cliente), se reevalúa — hoy es YAGNI.",
+    "roadmap": [
+      {
+        "fase": "Fase 1: entrega durable (mata el bug)",
+        "feature": "Peek no-destructivo: matar el LRANGE+DEL de recibir_mensajes",
+        "que_incluye": "Reescribir AlmacenRedis::recibir_mensajes (store.rs:236) para NO borrar. Bandeja durable cprs:bandeja:{id}=ZSET (score=msgseq). recibir() hace ZRANGEBYSCORE de los Enviado y los marca Entregado SIN borrar. Borrado real solo al confirmar Procesado o por retención. Indexar el outbox por para_id para eliminar el KEYS O(n) de outbox_confirmar (store.rs:299).",
+        "prioridad": "P0-critico",
+        "esfuerzo": "medio",
+        "desbloquea": "Que el mensaje sobreviva a un push sin turno activo: deja de perderse sin rastro. Cimiento de TODA la trazabilidad — lo que no existe en Redis no se puede auditar ni reenviar."
+      },
+      {
+        "fase": "Fase 1: entrega durable (mata el bug)",
+        "feature": "Máquina de estados de mensaje timbrada por el reloj del broker",
+        "que_incluye": "Enum EstadoMensaje{Enviado,Entregado,Leido,Procesado,Fallido,DeadLetter} en peers-core (reemplaza el `entregado:bool` de lib.rs:51). Mensaje gana entregado_en/leido_en/procesado_en:Option<String> + intentos:u32. Estado en HASH cprs:msg:{id}. transicionar_mensaje(msg_id,estado,ahora) en el trait Almacen; cada transición la timbra el broker con SU reloj (patrón jornada, nunca se estima).",
+        "prioridad": "P0-critico",
+        "esfuerzo": "medio",
+        "desbloquea": "Responde la pregunta central de Max: quién recibió/leyó/procesó qué, con timestamps auditables. Distingue 'el Claude lo vio' de 'lo ignoró tras verlo'."
+      },
+      {
+        "fase": "Fase 1: entrega durable (mata el bug)",
+        "feature": "Idempotencia de entrega (no re-empujar el mismo mensaje en bucle)",
+        "que_incluye": "El cliente mantiene un SET en memoria de los ultimos ~500 msg_ids empujados; empujar_canal solo dispara si el id:i64 no fue visto. En el broker, marcar Entregado es HSETNX sobre entregado_en (timbra solo la primera vez). Un peek repetido (cliente reinicia, relee bandeja) no re-empuja ni re-timbra.",
+        "prioridad": "P0-critico",
+        "esfuerzo": "bajo",
+        "desbloquea": "Es el requisito que HACE VIABLE el peek no-destructivo: sin él, al no borrar, el mismo <channel> se re-empujaría cada 1s hasta confirmar Procesado = ruido insoportable para el agente."
+      },
+      {
+        "fase": "Fase 1: entrega durable (mata el bug)",
+        "feature": "ACK real del harness + endpoint POST /confirmar",
+        "que_incluye": "Cambiar enviar_json (mcp.rs:54-58) para devolver el éxito real del flush a stdout en vez de ignorarlo con `let _`. empujar_canal devuelve bool; solo si el flush tuvo éxito, el cliente llama POST /confirmar {msg_ids,estado:Entregado}. Tras inyectar el <channel> con éxito, /confirmar estado=Leido. Si el flush falla (stdout roto/harness cerrado), NO se confirma y el mensaje sigue Enviado → se reintenta. Reusa la mecánica de outbox_confirmar ya existente.",
+        "prioridad": "P0-critico",
+        "esfuerzo": "medio",
+        "desbloquea": "Cierra la ventana exacta donde el mensaje muere: entre leer-de-Redis y entregar-al-agente. 'Leído' (sacar de cola) deja de mentir como 'procesado'."
+      },
+      {
+        "fase": "Fase 2: trazabilidad visible",
+        "feature": "Historial durable por cola + endpoint /admin/historial",
+        "que_incluye": "Clave cprs:historial:{id}=ZSET (score=msgseq) que retiene TODO mensaje con su estado final aunque ya se procesara. recibir() copia al historial al entregar; transicionar_mensaje actualiza también el historial. GET /admin/historial?id=&desde=&estado=. Retención configurable (ultimos 500 / 7 dias) via ZREMRANGEBYRANK en la limpieza periodica de 30s ya existente en main.rs.",
+        "prioridad": "P0-critico",
+        "esfuerzo": "medio",
+        "desbloquea": "El registro permanente que Max pidió: 'ver quién recibió/leyó/procesó qué'. Base del reenvío y de todas las métricas."
+      },
+      {
+        "fase": "Fase 2: trazabilidad visible",
+        "feature": "Reenviar un mensaje que el Claude ignoró (/admin/reenviar)",
+        "que_incluye": "POST /admin/reenviar {msg_id} (y /reenviar para peers): lee el mensaje del historial, lo re-encola en cprs:bandeja:{para_id} con nuevo msgseq y estado=Enviado, incrementa reenvios:u32 + reenviado_de:Option<i64> (traza la cadena). En la TUI, tecla 'r' sobre un mensaje seleccionado. 'Ignorado' = Entregado/Leido pero NO Procesado tras N seg.",
+        "prioridad": "P0-critico",
+        "esfuerzo": "bajo",
+        "desbloquea": "Lo que Max pidió literal: re-tocarle el hombro al empleado distraído sin reescribir la orden ni copiar-pegar a mano. El control humano de supervisión."
+      },
+      {
+        "fase": "Fase 2: trazabilidad visible",
+        "feature": "Pantalla TUI 'Trazabilidad/Conversación' por peer (timeline + inbox/outbox)",
+        "que_incluye": "Nueva pantalla ratatui (junto a Peers/Red/Redis/Broker/Config; añadir al enum Pantalla en app.rs:10). Por peer seleccionado: lista cronológica del historial con de_id, texto recortado, estado coloreado (○ encolado, ◑ leído, ● procesado) y timestamps enviado/entregado/leído/procesado, intentos. Enter abre timeline completo de un mensaje; 'r' reenvía; compone mensaje nuevo reusando Input::Mensaje (app.rs:77). Consume /admin/historial. Backend GET /admin/conversacion?id=.",
+        "prioridad": "P1-alto",
+        "esfuerzo": "medio",
+        "desbloquea": "La trazabilidad sin UI es invisible (solo claves Redis). Es el DM por empleado: Max ve de un vistazo quién ignoró qué y reenvía con una tecla."
+      },
+      {
+        "fase": "Fase 3: recuperación y red de seguridad",
+        "feature": "Replay de no-procesados al re-registrar (recuperación del caído a mitad)",
+        "que_incluye": "En registrar() (handler), tras resolver el id estable, el broker re-marca como Enviado todo mensaje de cprs:bandeja:{id} que esté en Entregado o Leido pero NO Procesado (transición atrás + incrementa intentos). El id estable por carpeta (id_preferido, ya implementado, lib.rs:73) ata la bandeja al peer que vuelve.",
+        "prioridad": "P1-alto",
+        "esfuerzo": "bajo",
+        "desbloquea": "Cubre el caso exacto del prompt: receptor que cae tras leer pero antes de procesar. Garantía at-least-once real apoyada en infraestructura ya existente."
+      },
+      {
+        "fase": "Fase 3: recuperación y red de seguridad",
+        "feature": "Dead-letter queue tras N intentos fallidos",
+        "que_incluye": "Clave cprs:dlq:{id}=LIST. La limpieza periodica de 30s (main.rs:541) escanea bandejas: mensaje con intentos>=MAX_INTENTOS (5) y no Procesado pasa a DeadLetter y sale de la bandeja activa (deja de re-empujarse). Campo motivo_dlq:Option<String>. GET /admin/dlq + acción TUI para reinyectar (intentos=0) o descartar.",
+        "prioridad": "P1-alto",
+        "esfuerzo": "medio",
+        "desbloquea": "El cementerio observable: un peer muerto-permanente (carpeta que ya no se abre) no se reintenta para siempre ni se pierde en silencio. Accountability incluye registrar los fracasos."
+      },
+      {
+        "fase": "Fase 4: gestión de equipo",
+        "feature": "Estado de tarea (asignada/en curso/bloqueada/hecha) + razón de bloqueo",
+        "que_incluye": "Enum EstadoTarea{Asignada,EnCurso,Bloqueada,Hecha,Abandonada} y bloqueo_motivo:Option<String> al struct Tarea (lib.rs:176). POST /tarea/estado {tarea_id,estado,motivo?}; /tarea/cerrar pasa a Hecha. El cliente marca EnCurso al empezar y puede reportar Bloqueada con motivo. Sincroniza con label de la issue de GitHub (integración ya existe, github.rs).",
+        "prioridad": "P1-alto",
+        "esfuerzo": "medio",
+        "desbloquea": "Convierte 'tarea' (hoy solo un timestamp de inicio) en tablero de equipo: quién está atascado y por qué. Lo que Max puede desatascar — sensación de dirigir gente, no procesos."
+      },
+      {
+        "fase": "Fase 4: gestión de equipo",
+        "feature": "Pantalla TUI 'Equipo': quién hace qué AHORA",
+        "que_incluye": "Nueva pantalla (6 Equipo) en peers-tui/src/ui/ y enum Pantalla. Una fila por peer vivo: id, estado de jornada (en sesión/ocioso), tarea activa con EstadoTarea coloreado, duración en curso timbrada por el broker, nº mensajes pendientes/sin confirmar. GET /admin/equipo consolida instancias vivas + jornada(inst) + colas. Refresco con el intervalo de config ya existente.",
+        "prioridad": "P1-alto",
+        "esfuerzo": "medio",
+        "desbloquea": "El dashboard de jefe que no existe (hoy la jornada está enterrada en /jornada por instancia). ES la experiencia 'inicio el claude y la equipe aparece' llevada a la gestión."
+      },
+      {
+        "fase": "Fase 5: supervisión activa y KPIs",
+        "feature": "Supervisor: detector de ociosos, atascados y ghosteo",
+        "que_incluye": "Tarea tokio periodica (junto a limpiar_vencidas, main.rs:541) que detecta: (1) peer vivo sin tarea EnCurso >N min = ocioso; (2) tarea EnCurso sin reporte >N min = posible atasco; (3) mensajes Leido pero no Procesado >N min = ghosteo. Alertas a cola cprs:alertas que la TUI pinta como banner en la pantalla Equipo. Umbrales en Config.",
+        "prioridad": "P2-medio",
+        "esfuerzo": "alto",
+        "desbloquea": "El supervisor que Max no puede ser 24/7. Cazaría el bug original: 'aistudio leyó hace 20 min y no confirmó'. Transforma trazabilidad pasiva (puedo mirar) en supervisión activa (el sistema avisa)."
+      },
+      {
+        "fase": "Fase 5: supervisión activa y KPIs",
+        "feature": "Métricas de accountability por empleado IA (/admin/metricas)",
+        "que_incluye": "Contadores HINCRBY cprs:metricas:{id} por estado: total_enviados/entregados/leidos/procesados/fallidos/reenvios/dlq + latencia media enviado→procesado (acumulador seg/count). Sobre tareas: hechas/bloqueadas/abandonadas, duración media, % confirmados vs ignorados. GET /admin/metricas + panel en pantalla Equipo (tecla 'm'). Todo derivado de datos que el broker YA timbra — cero estimación de la IA.",
+        "prioridad": "P2-medio",
+        "esfuerzo": "medio",
+        "desbloquea": "KPIs del equipo: qué peer responde rápido, cuál ignora, cuál abandona. Auditables de verdad porque los timbra el reloj del broker. Accountability con números, alineado con la obsesión de Max por el fichaje real."
+      },
+      {
+        "fase": "Fase 6: reasignación (cuando el equipo ya es resiliente)",
+        "feature": "Reasignación de tarea de un agente caído a otro vivo",
+        "que_incluye": "POST /admin/reasignar {tarea_id,nuevo_instancia_id}: cambia instancia_id, deja la Tarea Asignada, encola+pushea al nuevo peer la descripción + contexto ('heredas la tarea X que dejó X bloqueada en: ...'). Reasigna assignee/label de la issue de GitHub si existe. En pantalla Equipo, tecla 'a' sobre tarea de peer muerto/bloqueado abre selector de peers vivos. Depende de EstadoTarea (Fase 4).",
+        "prioridad": "P2-medio",
+        "esfuerzo": "alto",
+        "desbloquea": "La red de seguridad de un equipo real: si un empleado se reinicia con tarea EnCurso a medias, su trabajo no muere con él. Flota frágil de procesos → equipo resiliente."
+      },
+      {
+        "fase": "Fase 7: robustez bajo concurrencia (diferible)",
+        "feature": "Atomicidad de peek+transición via script Lua",
+        "que_incluye": "Reemplazar el LRANGE+LSET en dos viajes de transicionar_mensaje y outbox_confirmar por un EVAL Lua atómico (lee+transiciona+reescribe server-side en un comando). Aplica también al peek (leer Enviado + marcar Entregado atómico).",
+        "prioridad": "P3-futuro",
+        "esfuerzo": "alto",
+        "desbloquea": "Evita lost-update cuando múltiples peers + la TUI tocan la misma bandeja concurrentemente. YAGNI hasta que la concurrencia real lo demuestre — con un solo lector por cola hoy no hace falta."
+      }
+    ],
+    "descartado": [
+      "Migrar a Redis Streams (XADD/XREADGROUP/consumer groups/PEL/XACK): suena perfecto pero reescribe TODO el store, rompe el patrón homogéneo JSON-en-LIST del resto del sistema, y la escala (decenas de peers LAN) no lo justifica. El ZSET+estado cubre 100% de los requisitos reusando el código existente. Veredicto de fondo: LIST/ZSET parcheada gana.",
+      "Reescribir el transporte a WebSocket/SSE push real: el bug es de persistencia, no de transporte. El pull cada 1s + push MCP ya funciona cross-host y por túnel. YAGNI hasta que la latencia de 1s moleste de verdad.",
+      "Exactly-once / transacciones distribuidas de dos fases: at-least-once + idempotencia por msg_id es lo que usan Kafka y SQS. Un duplicado ocasional es inocuo en una red de empleados IA.",
+      "Reintentos automáticos con backoff del push: el problema no es que la red falle, es que llega sin turno activo. Un reintentador automático ESCONDE el problema (el Claude sigue sin verlo) y puede martillar al peer. El outbox durable + ACK + reenvío manual con Max en el loop lo resuelven bien.",
+      "Chat estilo Slack (threads, reacciones, typing indicators): Max da órdenes y supervisa, no charla. El historial cronológico por agente cubre el 100%.",
+      "RBAC/roles-permisos entre peers: todos son funcionarios de Max bajo un solo X-Peers-Token. Seguridad inventada para un problema que no existe en una flota de un solo dueño.",
+      "Persistencia en Postgres/SQL 'por si crece': Redis con retención por ZREMRANGEBYRANK sobra para la escala real. SQLite ya está como alternativa. Over-engineering YAGNI.",
+      "Editor visual de flujos / DAG de orquestación de tareas: Max orquesta via tmux y mensajes directos. Reasignación manual + estados de tarea cubren la coordinación sin construir un n8n dentro del broker.",
+      "Notificaciones externas (email/Telegram/desktop) cuando un agente se atasca: el supervisor que pinta alertas en la TUI basta para el modo de trabajo de Max (TUI abierta). Scope creep si no lo pide explícito.",
+      "Prioridades/colas por urgencia, TTL por mensaje individual, routing por topic, múltiples consumer-groups por lector: nadie lo pidió. Un solo FIFO por destinatario + reenvío cubre el caso. La retención global por cola basta para la limpieza.",
+      "Dashboard web/gráfico separado: la TUI ratatui cubre la supervisión y respeta la visión 'todo en terminal'.",
+      "Mantener el outbox LIST como sistema de durabilidad paralelo a la bandeja: es deuda. El ItemOutbox/confirmado debe subsumirse en la bandeja durable con estados (no es el outbox-pattern transaccional clásico, es la bandeja del receptor). Y eliminar el KEYS O(n) de outbox_confirmar (store.rs:299) está incluido en Fase 1.",
+      "NOTA: la lente 'robustez-critico' del consejo llegó vacía (placeholders x/y/z/test). No se pierde cobertura: sus temas esperables (idempotencia, DLQ, recuperación del caído, atomicidad Lua) ya están en el roadmap vía las otras tres lentes."
+    ]
+  }
+}
