@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Launcher del peers-broker: detecta SO/arch y ejecuta el binario correcto.
+# Lo usa el hook de arranque del plugin para levantar el broker si no está vivo.
+set -euo pipefail
+
+raiz="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+bin_dir="$raiz/bin"
+
+os="$(uname -s)"
+arch="$(uname -m)"
+
+case "$os/$arch" in
+  Darwin/arm64)  exe="$bin_dir/peers-broker-darwin-arm64" ;;
+  Linux/x86_64)  exe="$bin_dir/peers-broker-linux-x64" ;;
+  Linux/aarch64) exe="$bin_dir/peers-broker-linux-arm64" ;;
+  Darwin/x86_64) exe="$bin_dir/peers-broker-darwin-x64" ;;
+  *) echo "claude-peers: plataforma no soportada: $os/$arch" >&2; exit 1 ;;
+esac
+
+[[ -x "$exe" ]] || { echo "claude-peers: binario broker no encontrado ($exe)" >&2; exit 1; }
+exec "$exe" "$@"

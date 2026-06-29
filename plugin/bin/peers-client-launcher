@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Launcher del peers-client: detecta SO/arch y ejecuta el binario correcto.
+# El plugin.json declara un solo `command`, así que este wrapper resuelve la plataforma.
+# CLAUDE_PLUGIN_ROOT lo inyecta Claude Code al cargar el plugin → apunta a la raíz del plugin.
+set -euo pipefail
+
+raiz="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+bin_dir="$raiz/bin"
+
+os="$(uname -s)"
+arch="$(uname -m)"
+
+case "$os/$arch" in
+  Darwin/arm64)         exe="$bin_dir/peers-client-darwin-arm64" ;;
+  Linux/x86_64)         exe="$bin_dir/peers-client-linux-x64" ;;
+  Linux/aarch64)        exe="$bin_dir/peers-client-linux-arm64" ;;   # si algún día se compila
+  Darwin/x86_64)        exe="$bin_dir/peers-client-darwin-x64" ;;     # Intel Mac, si se compila
+  *) echo "claude-peers: plataforma no soportada: $os/$arch" >&2; exit 1 ;;
+esac
+
+if [[ ! -x "$exe" ]]; then
+  echo "claude-peers: binario no encontrado para $os/$arch ($exe)" >&2
+  exit 1
+fi
+
+# Pasa todos los argumentos (p.ej. --broker-url) tal cual al binario real.
+exec "$exe" "$@"

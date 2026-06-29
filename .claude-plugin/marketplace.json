@@ -1,0 +1,14 @@
+{
+  "name": "lexusfx",
+  "owner": { "name": "Max (LexusFX)" },
+  "metadata": {
+    "description": "Marketplace personal de LexusFX. Incluye claude-peers-rs: la red de peers entre instancias de Claude Code, en Rust, con el binario incluido."
+  },
+  "plugins": [
+    {
+      "name": "claude-peers-rs",
+      "source": "./plugin",
+      "description": "Red de descubrimiento y mensajería entre instancias de Claude Code (Rust). Instalar = MCP registrado + broker que arranca solo. Binarios Mac ARM y Linux x64 incluidos."
+    }
+  ]
+}

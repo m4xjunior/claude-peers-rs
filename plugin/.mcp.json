@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "claude-peers": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/peers-client-launcher",
+      "args": [],
+      "env": {}
+    }
+  }
+}
