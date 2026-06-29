@@ -96,6 +96,28 @@ externa aceptada por la VISIÓN es la **red**, resuelta por túnel:
    (o `CLAUDE_PEERS_BROKER_URL=https://peers.tudominio.com`)
 4. La liveness es por latido (no por PID) → funciona cross-host sin problemas.
 
+## Setup REAL de Max (LAN, 2026-06-29) — broker en el Mac, servers se conectan
+
+**Broker central: el Mac de Max**, expuesto en la LAN con token.
+- Mac: LaunchAgent con `--host 0.0.0.0 --puerto 7899` + `CLAUDE_PEERS_TOKEN=lexusfx-peers-2026`.
+- IP del Mac en la LAN: **`10.0.1.60`** (verificada; cambia si cambia la red — re-verificar con
+  `ifconfig | grep "inet "`).
+- Client del Mac (`~/.claude.json`): `env.CLAUDE_PEERS_TOKEN=lexusfx-peers-2026` (apunta a
+  `127.0.0.1:7899` por defecto, local).
+
+**En cada servidor de la MISMA LAN** (vía el plugin o install.sh), el client apunta al Mac.
+Lo más simple: exportar las variables en el entorno donde corre `claude` (p.ej. en el
+`~/.bashrc`/`~/.zshrc` del server, junto a la función `claude()`):
+```bash
+export CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899
+export CLAUDE_PEERS_TOKEN=lexusfx-peers-2026
+```
+El `peers-client` lee ambas (clap env). Reinicia el `claude` del server y `listar_instancias`
+mostrará los peers del Mac; los mensajes cruzan en ambos sentidos.
+
+> Requiere que el server alcance `10.0.1.60:7899` (misma LAN, sin firewall bloqueando). Probar
+> desde el server: `curl -s -o /dev/null -w "%{http_code}\n" http://10.0.1.60:7899/salud` → 200.
+
 ## Por qué esto supera al TS
 
 - El TS necesitaba `bun` instalado + `git clone` + `bun install` (falló en el ai-studio).
