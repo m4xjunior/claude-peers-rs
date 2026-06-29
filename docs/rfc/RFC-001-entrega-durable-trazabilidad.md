@@ -95,5 +95,7 @@ Redis Streams · WebSocket/SSE · exactly-once/2PC · reintentos automáticos co
 
 ## Outcome
 
-*(Placeholder — se rellena cuando Max decida.)*
-Decisión: ___ · Fecha: ___ · Notas: ___
+**Decisión: APROBADA la Opción A** (bandeja durable ZSET + estados en HASH, NO migrar a Streams).
+**Fecha:** 2026-06-29 · **Aprobador:** Max.
+**Notas:** Se ejecuta la Fase 1 (P0, mata el bug) + Fase 2 (trazabilidad visible) según `tasks.md`
+(T1-T8). Fases 3-7 quedan para specs posteriores.
