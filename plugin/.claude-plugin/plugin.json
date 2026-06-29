@@ -1,6 +1,6 @@
 {
   "name": "claude-peers-rs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Red de descubrimiento y mensajería entre instancias de Claude Code, en Rust. El binario va incluido: instalar el plugin registra el MCP y la equipe aparece — sin compilar ni instalar nada.",
   "author": { "name": "Max (LexusFX)" },
   "repository": "https://github.com/m4xjunior/claude-peers-rs",
