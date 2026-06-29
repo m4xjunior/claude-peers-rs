@@ -61,13 +61,23 @@ pub async fn abrir_tarea(
         // Una tarea recién abierta nace Abierta y sin motivo de bloqueo (R2).
         estado: peers_core::EstadoTarea::Abierta,
         bloqueo_motivo: None,
+        // #3 idempotencia: nace SIN haber aprendido el factor. #7: sin evidencia todavía.
+        factor_aprendido: false,
+        evidencia: None,
     };
     almacen.tarea_guardar(&tarea).await?;
     Ok(tarea)
 }
 
-/// Cierra una tarea: timbra fin y calcula duración (fin - inicio) con el reloj del broker.
-/// Devuelve la tarea cerrada (para que github.rs cierre la issue espejo con la duración).
+/// Cierra una tarea de forma IDEMPOTENTE (#1): timbra fin y mide la duración (fin - inicio) con
+/// el reloj del broker SOLO si la tarea no estaba ya cerrada. Si la tarea ya tiene `fin` o ya está
+/// en un estado terminal (`Hecha`/`Cancelada`/`Bloqueada`), NO re-timbra ni re-mide: devuelve la
+/// tarea tal cual está. Así un segundo `cerrar_tarea` (ACK perdido, o tras la TUI) no re-mide una
+/// duración inflada (que incluiría el tiempo que estuvo cerrada) ni vuelve a disparar el aprendizaje.
+///
+/// Marca `estado = Hecha` para unificar las dos vías de cierre (MCP y TUI) en una sola semántica:
+/// el único punto que mide es el primer cierre real. Devuelve la tarea (para que github.rs cierre
+/// la issue espejo con la duración).
 pub async fn cerrar_tarea(
     almacen: &Arc<dyn Almacen>,
     tarea_id: &str,
@@ -77,8 +87,13 @@ pub async fn cerrar_tarea(
         .tarea_obtener(tarea_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("la tarea '{tarea_id}' no existe"))?;
+    // IDEMPOTENCIA: ya cerrada (fin presente o estado terminal) → no re-timbrar, no re-medir.
+    if tarea.fin.is_some() || tarea.estado.es_terminal() {
+        return Ok(tarea);
+    }
     tarea.fin = Some(ahora.to_string());
     tarea.duracion_seg = Some(diferencia_seg(&tarea.inicio, ahora));
+    tarea.estado = peers_core::EstadoTarea::Hecha;
     almacen.tarea_guardar(&tarea).await?;
     Ok(tarea)
 }

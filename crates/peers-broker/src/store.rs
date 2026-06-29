@@ -93,7 +93,17 @@ fn tipo_alerta_texto(t: TipoAlerta) -> &'static str {
         TipoAlerta::Ocioso => "ocioso",
         TipoAlerta::Atascado => "atascado",
         TipoAlerta::Ghosteo => "ghosteo",
+        // #8/#10: variantes compuestas. La cadena DEBE coincidir con el `#[serde(rename)]` del
+        // enum en peers-core para que la clave de idempotencia {tipo}:{sujeto} sea consistente.
+        TipoAlerta::CierreSospechoso => "cierre_sospechoso",
+        TipoAlerta::CancelacionExcesiva => "cancelacion_excesiva",
     }
+}
+
+/// Clave del factor de corrección POR PEER (#9): `cprs:factor:{instancia_id}`. Distinta del
+/// global `cprs:factor_estimacion` (k_factor), que sigue como fallback para peers sin historial.
+fn k_factor_peer(instancia_id: &str) -> String {
+    format!("{NS}factor:{instancia_id}")
 }
 
 #[async_trait]
@@ -432,6 +442,20 @@ impl Almacen for AlmacenRedis {
                 None => continue,
             };
             if inst.visto_en.as_str() < vencidas_antes {
+                // #12: antes de borrar la instancia, bloquea sus tareas NO terminales (huérfanas
+                // de peer caído) para que no queden con fin=None para siempre ni envenenen el
+                // factor si algún día se cerraran. Bloqueada NO alimenta el factor (lo gestiona
+                // el handler) y deja claro el motivo. Se hace sobre el índice cprs:tarea:{id} +
+                // lista (mismo path que tarea_estado) — degrada por tarea: un fallo no aborta la
+                // limpieza de la instancia.
+                for id_t in self.tareas_no_terminales(&id).await?.into_iter().map(|t| t.id) {
+                    if let Err(err) = self
+                        .tarea_estado(&id_t, EstadoTarea::Bloqueada, Some("peer caído"), vencidas_antes)
+                        .await
+                    {
+                        tracing::warn!("no se pudo bloquear la tarea huérfana '{id_t}': {err:#}");
+                    }
+                }
                 let _: () = conn.del(k_instancia(&id)).await?;
                 let _: () = conn.srem(format!("{NS}instancias"), &id).await?;
                 // Purga su bandeja ACTIVA (no el historial durable ni el outbox): si vuelve,
@@ -616,24 +640,7 @@ impl Almacen for AlmacenRedis {
 
     async fn factor_estimacion(&self) -> anyhow::Result<FactorEstimacion> {
         let mut conn = self.conn().await?;
-        let clave = k_factor();
-        let existe: bool = conn.exists(&clave).await?;
-        if !existe {
-            // Default neutro: sin corrección, 0 muestras.
-            return Ok(FactorEstimacion {
-                muestras: 0,
-                factor: 1.0,
-                actualizado_en: String::new(),
-            });
-        }
-        let muestras: Option<u32> = conn.hget(&clave, "muestras").await?;
-        let factor: Option<f64> = conn.hget(&clave, "factor").await?;
-        let actualizado_en: Option<String> = conn.hget(&clave, "actualizado_en").await?;
-        Ok(FactorEstimacion {
-            muestras: muestras.unwrap_or(0),
-            factor: factor.unwrap_or(1.0),
-            actualizado_en: actualizado_en.unwrap_or_default(),
-        })
+        leer_factor_hash(&mut conn, &k_factor()).await
     }
 
     async fn actualizar_factor(&self, ratio: f64, ahora: &str) -> anyhow::Result<FactorEstimacion> {
@@ -641,20 +648,68 @@ impl Almacen for AlmacenRedis {
         // persiste con el timbre del broker. El factor NUEVO se devuelve para que el handler
         // lo informe.
         let actual = self.factor_estimacion().await?;
-        let nuevo = FactorEstimacion {
-            muestras: actual.muestras.saturating_add(1),
-            factor: aplicar_media_movil(actual.factor, ratio),
-            actualizado_en: ahora.to_string(),
-        };
+        let nuevo = paso_factor(&actual, ratio, ahora);
         let mut conn = self.conn().await?;
-        cmd("HSET")
-            .arg(k_factor())
-            .arg("muestras").arg(nuevo.muestras)
-            .arg("factor").arg(nuevo.factor)
-            .arg("actualizado_en").arg(&nuevo.actualizado_en)
-            .query_async::<()>(&mut conn)
-            .await?;
+        guardar_factor_hash(&mut conn, &k_factor(), &nuevo).await?;
         Ok(nuevo)
+    }
+
+    async fn factor_estimacion_peer(&self, instancia_id: &str) -> anyhow::Result<FactorEstimacion> {
+        // #9: factor POR PEER. Mismo HASH-shape que el global, en clave cprs:factor:{inst}.
+        let mut conn = self.conn().await?;
+        leer_factor_hash(&mut conn, &k_factor_peer(instancia_id)).await
+    }
+
+    async fn actualizar_factor_peer(
+        &self,
+        instancia_id: &str,
+        ratio: f64,
+        ahora: &str,
+    ) -> anyhow::Result<FactorEstimacion> {
+        // #9: aprende el factor del peer (no toca el global). Misma media móvil que el global.
+        let actual = self.factor_estimacion_peer(instancia_id).await?;
+        let nuevo = paso_factor(&actual, ratio, ahora);
+        let mut conn = self.conn().await?;
+        guardar_factor_hash(&mut conn, &k_factor_peer(instancia_id), &nuevo).await?;
+        Ok(nuevo)
+    }
+
+    async fn tarea_reasignar(
+        &self,
+        tarea_id: &str,
+        nuevo_instancia_id: &str,
+    ) -> anyhow::Result<Option<Tarea>> {
+        // #11: quita el id de la lista del dueño viejo (LREM) y lo añade a la del nuevo (RPUSH),
+        // cambia instancia_id y persiste el índice + la lista. Reasignar al mismo dueño es no-op.
+        let Some(mut tarea) = self.tarea_obtener(tarea_id).await? else {
+            return Ok(None);
+        };
+        let viejo = tarea.instancia_id.clone();
+        if viejo == nuevo_instancia_id {
+            return Ok(Some(tarea)); // no-op seguro: mismo dueño.
+        }
+        tarea.instancia_id = nuevo_instancia_id.to_string();
+        let mut conn = self.conn().await?;
+        // LREM borra TODAS las apariciones del id en la lista vieja (count 0); idempotente.
+        let _: () = conn.lrem(k_tareas(&viejo), 0, tarea_id).await?;
+        // RPUSH a la nueva lista solo si no estaba ya (evita duplicar al reasignar dos veces).
+        let ids_nuevo: Vec<String> = conn.lrange(k_tareas(nuevo_instancia_id), 0, -1).await?;
+        if !ids_nuevo.iter().any(|i| i == tarea_id) {
+            let _: () = conn.rpush(k_tareas(nuevo_instancia_id), tarea_id).await?;
+        }
+        // Persiste el índice directo con el nuevo dueño. `tarea_guardar` ya hace el RPUSH defensivo
+        // pero como el id YA está en la lista nueva, solo reescribe el índice (sin duplicar).
+        let _: () = conn.set(k_tarea(tarea_id), serde_json::to_string(&tarea)?).await?;
+        Ok(Some(tarea))
+    }
+
+    async fn tareas_no_terminales(&self, instancia_id: &str) -> anyhow::Result<Vec<Tarea>> {
+        // #12: tareas vivas (no terminales) de la instancia, para bloquear las huérfanas.
+        let (_, tareas) = self.jornada(instancia_id).await?;
+        Ok(tareas
+            .into_iter()
+            .filter(|t| !t.estado.es_terminal())
+            .collect())
     }
 
     // --- Supervisor (fase 5): alertas ---
@@ -722,8 +777,15 @@ impl Almacen for AlmacenRedis {
 /// Aplica una transición de estado YA validada sobre una `Tarea` en memoria (R5/AC2). Centraliza
 /// las reglas de timbrado para que Redis y SQLite no las dupliquen divergiendo:
 ///   - `Hecha` sin `fin` previo → timbra `fin = ahora` y mide `duracion_seg = ahora - inicio`
-///     (el real lo pone SIEMPRE el broker vía `ahora`). El aprendizaje del factor lo hace el
-///     handler, no el store, y SOLO en `Hecha`.
+///     (el real lo pone SIEMPRE el broker vía `ahora`). IDEMPOTENTE (#1): si ya tenía `fin`, NO
+///     re-timbra ni re-mide (un segundo Hecha no infla la duración). El aprendizaje del factor lo
+///     hace el handler, no el store, y SOLO en `Hecha`.
+///   - `Abierta` DESDE un estado terminal/parado (`Hecha`/`Cancelada`/`Bloqueada`) → REABRIR (#2):
+///     la vida anterior se descarta. Limpia `fin = None`, `duracion_seg = None`, `bloqueo_motivo
+///     = None` y RE-TIMBRA `inicio = ahora` (la nueva vida empieza ahora). Resetea también
+///     `factor_aprendido = false` (#3): el segundo ciclo es trabajo nuevo y legítimo y podrá
+///     contribuir una vez al factor cuando se cierre. Así el siguiente cierre vuelve a medir desde
+///     cero y no arrastra el tiempo del ciclo anterior.
 ///   - `Bloqueada` → guarda `bloqueo_motivo = motivo`.
 ///   - cualquier otro estado → solo cambia `estado`.
 pub(crate) fn aplicar_transicion_tarea(
@@ -732,12 +794,24 @@ pub(crate) fn aplicar_transicion_tarea(
     motivo: Option<&str>,
     ahora: &str,
 ) {
+    let venia_de_terminal = tarea.estado.es_terminal();
     tarea.estado = estado;
     match estado {
         EstadoTarea::Hecha => {
+            // #1 idempotente: solo timbra/mide en el PRIMER cierre (fin aún vacío).
             if tarea.fin.is_none() {
                 tarea.fin = Some(ahora.to_string());
                 tarea.duracion_seg = Some(crate::jornada::diferencia_seg(&tarea.inicio, ahora));
+            }
+        }
+        EstadoTarea::Abierta => {
+            // #2 reabrir desde terminal: descarta la vida anterior y re-timbra inicio.
+            if venia_de_terminal {
+                tarea.fin = None;
+                tarea.duracion_seg = None;
+                tarea.bloqueo_motivo = None;
+                tarea.inicio = ahora.to_string();
+                tarea.factor_aprendido = false;
             }
         }
         EstadoTarea::Bloqueada => {
@@ -745,6 +819,57 @@ pub(crate) fn aplicar_transicion_tarea(
         }
         _ => {}
     }
+}
+
+/// Calcula el siguiente `FactorEstimacion` desde el actual y un `ratio` (media móvil + clamp,
+/// +1 muestra, timbre del broker). Pura: ni I/O ni clave. Compartida por el factor global y el
+/// por-peer (#9) para que ambos apliquen EXACTAMENTE la misma fórmula.
+fn paso_factor(actual: &FactorEstimacion, ratio: f64, ahora: &str) -> FactorEstimacion {
+    FactorEstimacion {
+        muestras: actual.muestras.saturating_add(1),
+        factor: aplicar_media_movil(actual.factor, ratio),
+        actualizado_en: ahora.to_string(),
+    }
+}
+
+/// Lee un `FactorEstimacion` desde un HASH Redis (clave global o por-peer). Default neutro
+/// `{ muestras: 0, factor: 1.0, actualizado_en: "" }` si la clave no existe.
+async fn leer_factor_hash(
+    conn: &mut deadpool_redis::Connection,
+    clave: &str,
+) -> anyhow::Result<FactorEstimacion> {
+    let existe: bool = conn.exists(clave).await?;
+    if !existe {
+        return Ok(FactorEstimacion {
+            muestras: 0,
+            factor: 1.0,
+            actualizado_en: String::new(),
+        });
+    }
+    let muestras: Option<u32> = conn.hget(clave, "muestras").await?;
+    let factor: Option<f64> = conn.hget(clave, "factor").await?;
+    let actualizado_en: Option<String> = conn.hget(clave, "actualizado_en").await?;
+    Ok(FactorEstimacion {
+        muestras: muestras.unwrap_or(0),
+        factor: factor.unwrap_or(1.0),
+        actualizado_en: actualizado_en.unwrap_or_default(),
+    })
+}
+
+/// Persiste un `FactorEstimacion` en un HASH Redis (clave global o por-peer).
+async fn guardar_factor_hash(
+    conn: &mut deadpool_redis::Connection,
+    clave: &str,
+    f: &FactorEstimacion,
+) -> anyhow::Result<()> {
+    cmd("HSET")
+        .arg(clave)
+        .arg("muestras").arg(f.muestras)
+        .arg("factor").arg(f.factor)
+        .arg("actualizado_en").arg(&f.actualizado_en)
+        .query_async::<()>(conn)
+        .await?;
+    Ok(())
 }
 
 /// Guarda el mensaje completo en su HASH `cprs:msg:{id}` (fuente de verdad). Los campos van

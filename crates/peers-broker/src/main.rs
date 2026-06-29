@@ -358,6 +358,20 @@ async fn abrir_tarea_con_estimado(
     p: &PeticionAbrirTarea,
     ahora: &str,
 ) -> Result<(Tarea, Option<u64>), ErrorApp> {
+    // #4: valida el rango plausible del estimado ANTES de crear nada. Rechaza la confusión
+    // min↔seg típica (p.ej. 30 = 30s para una tarea de 30 min) con un mensaje claro, en vez de
+    // dejar que envenene el factor con un ratio 60×. Solo valida si vino estimado.
+    if let Some(estimado) = p.estimado_seg {
+        if !peers_core::estimado_en_rango(estimado) {
+            return Err(ErrorApp(anyhow::anyhow!(
+                "estimado_seg={estimado} fuera de rango plausible [{}s, {}s] (~30s a 30 días). \
+                 Recuerda: el estimado va en SEGUNDOS (1800 = 30 min).",
+                peers_core::ESTIMADO_MIN_SEG,
+                peers_core::ESTIMADO_MAX_SEG
+            )));
+        }
+    }
+
     let tarea_id = format!("tar-{}-{ahora}", p.instancia_id);
     // La sesión activa es la abierta más reciente de la instancia.
     let (sesiones, _) = e.almacen.jornada(&p.instancia_id).await?;
@@ -462,30 +476,125 @@ async fn tarea_reportar(
     Ok(Json(RespuestaOk { ok: true }))
 }
 
-/// Cierra una tarea (el broker mide el real con SU reloj), aprende el factor si la tarea tenía
-/// estimado y real > 0, y cierra la issue espejo en GitHub si procede. Lógica compartida por
-/// `/tarea/cerrar` y `/cerrar-tarea` (no se duplica). Devuelve la tarea ya cerrada.
+/// Aprendizaje unificado del factor al llegar una tarea a `Hecha` (#1/#3/#7/#8/#9). UN solo punto
+/// para las dos vías de cierre (`/cerrar-tarea` y `/tarea/estado`→Hecha): así no divergen las
+/// reglas. El real lo timbró SIEMPRE el broker (regla sagrada): se lee de `tarea.duracion_seg`.
 ///
-/// Aprendizaje (R3): `ratio = estimado_seg / real_seg`; `actualizar_factor(ratio, ahora)`. Una
-/// tarea SIN estimado o con `real <= 0` NO toca el factor (no lo contamina). El real lo timbra
-/// SIEMPRE el broker (regla sagrada): aquí se lee de `tarea.duracion_seg`, nunca del cliente.
-async fn cerrar_tarea_y_aprender(e: &Estado, tarea_id: &str, ahora: &str) -> Result<Tarea, ErrorApp> {
-    let tarea = jornada::cerrar_tarea(&e.almacen, tarea_id, ahora).await?;
+/// Gates (en orden):
+///   #3 idempotencia → solo aprende si `!tarea.factor_aprendido` (una tarea aporta UNA vez).
+///   estimado/real válidos → estimado presente y > 0, real presente y > 0.
+///   #4 rango → el estimado debe estar en `[ESTIMADO_MIN_SEG, ESTIMADO_MAX_SEG]` (no envenenar con min↔seg).
+///   #8 cierre sospechoso → si `cierre_sospechoso(real)` (real < UMBRAL_REAL_MINIMO_SEG): NO aprende
+///      y emite `TipoAlerta::CierreSospechoso` (sujeto = tarea_id).
+///   #9 por peer → SIEMPRE aprende el factor del peer (`actualizar_factor_peer`).
+///   #7 evidencia → SOLO si la tarea trae `evidencia`, además alimenta el factor GLOBAL. Sin
+///      evidencia, la tarea es "no-verificada": contribuye solo al factor del peer, no al global.
+///
+/// Al aprender (no sospechoso) marca `factor_aprendido = true` y lo persiste (idempotencia #3).
+/// Degrada: cualquier fallo de almacén deja la tarea Hecha igual (warn, sin panic).
+async fn aprender_factor_de_tarea(e: &Estado, tarea: &Tarea, ahora: &str) {
+    let (Some(estimado), Some(real)) = (tarea.estimado_seg, tarea.duracion_seg) else {
+        return;
+    };
+    if estimado <= 0 || real <= 0 {
+        return;
+    }
 
-    // Aprendizaje del factor: solo con estimado presente y real > 0 (R3/AC4).
-    if let (Some(estimado), Some(real)) = (tarea.estimado_seg, tarea.duracion_seg) {
-        if estimado > 0 && real > 0 {
-            let ratio = estimado as f64 / real as f64;
-            match e.almacen.actualizar_factor(ratio, ahora).await {
-                Ok(f) => info!(
-                    "factor aprendido: tarea {} ratio {:.2} → factor {:.2} ({} muestras)",
-                    tarea_id, ratio, f.factor, f.muestras
-                ),
-                // Degradación: si el almacén falla al aprender, la tarea queda cerrada igual.
-                Err(err) => warn!("no se pudo actualizar el factor (tarea cerrada igual): {err:#}"),
+    // #3: una tarea ya aprendida no vuelve a contar (reabrir+recerrar o doble cierre).
+    if tarea.factor_aprendido {
+        return;
+    }
+
+    // #4: estimado fuera de rango plausible no alimenta el factor (confusión min↔seg).
+    if !peers_core::estimado_en_rango(estimado) {
+        warn!(
+            "tarea {} con estimado {}s fuera de rango plausible: NO alimenta el factor (#4)",
+            tarea.id, estimado
+        );
+        return;
+    }
+
+    // #8: cierre instantáneo (real < UMBRAL_REAL_MINIMO_SEG) → alerta + NO aprende.
+    if peers_core::cierre_sospechoso(real) {
+        let alerta = Alerta {
+            tipo: TipoAlerta::CierreSospechoso,
+            sujeto: tarea.id.clone(),
+            detalle: format!(
+                "tarea '{}' de '{}' cerrada en {}s (< {}s): cierre sospechoso, NO alimenta el factor",
+                tarea.id, tarea.instancia_id, real, peers_core::UMBRAL_REAL_MINIMO_SEG
+            ),
+            creada_en: ahora.to_string(),
+        };
+        match e.almacen.alerta_emitir(&alerta).await {
+            Ok(true) => info!("alerta CIERRE_SOSPECHOSO emitida: {}", tarea.id),
+            Ok(false) => {}
+            Err(err) => warn!("no se pudo emitir alerta de cierre sospechoso: {err:#}"),
+        }
+        return;
+    }
+
+    let ratio = estimado as f64 / real as f64;
+
+    // #9: SIEMPRE aprende el factor del peer (un mentiroso solo se corrige a sí mismo).
+    match e.almacen.actualizar_factor_peer(&tarea.instancia_id, ratio, ahora).await {
+        Ok(f) => info!(
+            "factor PEER '{}' aprendido: tarea {} ratio {:.2} → factor {:.2} ({} muestras)",
+            tarea.instancia_id, tarea.id, ratio, f.factor, f.muestras
+        ),
+        Err(err) => warn!("no se pudo actualizar el factor por peer (tarea cerrada igual): {err:#}"),
+    }
+
+    // #7: solo con evidencia (prueba de trabajo) alimenta también el factor GLOBAL. Sin evidencia,
+    // la tarea es "no-verificada" y no contamina el número que Max confía para TODOS los peers.
+    if tarea.evidencia.is_some() {
+        match e.almacen.actualizar_factor(ratio, ahora).await {
+            Ok(f) => info!(
+                "factor GLOBAL aprendido (con evidencia): tarea {} ratio {:.2} → factor {:.2} ({} muestras)",
+                tarea.id, ratio, f.factor, f.muestras
+            ),
+            Err(err) => warn!("no se pudo actualizar el factor global (tarea cerrada igual): {err:#}"),
+        }
+    } else {
+        info!(
+            "tarea {} sin evidencia: no-verificada, alimenta solo el factor por peer (#7)",
+            tarea.id
+        );
+    }
+
+    // #3: marca la tarea como aprendida para que no vuelva a contar.
+    let mut aprendida = tarea.clone();
+    aprendida.factor_aprendido = true;
+    if let Err(err) = e.almacen.tarea_guardar(&aprendida).await {
+        warn!("no se pudo marcar factor_aprendido en la tarea {} (puede recontar): {err:#}", tarea.id);
+    }
+}
+
+/// Cierra una tarea (el broker mide el real con SU reloj), aprende el factor (#1/#3/#7/#8/#9) y
+/// cierra la issue espejo en GitHub si procede. Lógica compartida por `/tarea/cerrar` y
+/// `/cerrar-tarea` (no se duplica). Devuelve la tarea ya cerrada.
+///
+/// `evidencia`: prueba de trabajo opcional (#7). Si viene, se persiste en la tarea ANTES de
+/// aprender, para que el gate de evidencia la vea y alimente también el factor global.
+async fn cerrar_tarea_y_aprender(
+    e: &Estado,
+    tarea_id: &str,
+    evidencia: Option<&str>,
+    ahora: &str,
+) -> Result<Tarea, ErrorApp> {
+    let mut tarea = jornada::cerrar_tarea(&e.almacen, tarea_id, ahora).await?;
+
+    // #7: persiste la evidencia (prueba de trabajo) antes de aprender. Solo si vino y la tarea
+    // aún no la tenía (no la borramos en reintentos idempotentes sin evidencia).
+    if let Some(ev) = evidencia {
+        if tarea.evidencia.as_deref() != Some(ev) {
+            tarea.evidencia = Some(ev.to_string());
+            if let Err(err) = e.almacen.tarea_guardar(&tarea).await {
+                warn!("no se pudo persistir la evidencia de la tarea {tarea_id}: {err:#}");
             }
         }
     }
+
+    aprender_factor_de_tarea(e, &tarea, ahora).await;
 
     if let Some(gh) = &e.github {
         if let Some(n) = tarea.issue_number {
@@ -508,7 +617,7 @@ async fn tarea_cerrar(
     State(e): State<Estado>,
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
-    cerrar_tarea_y_aprender(&e, &p.tarea_id, &ahora_iso()).await?;
+    cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
     Ok(Json(RespuestaOk { ok: true }))
 }
 
@@ -529,9 +638,15 @@ async fn crear_tarea(
     let ahora = ahora_iso();
     let (tarea, issue_number) = abrir_tarea_con_estimado(&e, &p, &ahora).await?;
 
-    // Lee el factor vigente para corregir el estimado (R4). Default neutro (factor 1.0, 0
-    // muestras) si el almacén aún no tiene la clave — nunca panic.
-    let factor = e.almacen.factor_estimacion().await?;
+    // #9: usa el factor del PEER si tiene historial propio (muestras > 0); si no, cae al GLOBAL
+    // como fallback. Así un peer con sesgo conocido se corrige con SU número, y uno nuevo hereda
+    // el del equipo. Ambas lecturas degradan a neutro (factor 1.0, 0 muestras) — nunca panic.
+    let factor_peer = e.almacen.factor_estimacion_peer(&p.instancia_id).await?;
+    let factor = if factor_peer.muestras > 0 {
+        factor_peer
+    } else {
+        e.almacen.factor_estimacion().await?
+    };
     let estimado_corregido_seg = p
         .estimado_seg
         .map(|estimado| corregir_estimado(estimado, factor.factor));
@@ -552,7 +667,7 @@ async fn cerrar_tarea(
     State(e): State<Estado>,
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
-    cerrar_tarea_y_aprender(&e, &p.tarea_id, &ahora_iso()).await?;
+    cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
     Ok(Json(RespuestaOk { ok: true }))
 }
 
@@ -585,6 +700,17 @@ async fn tarea_editar(
     State(e): State<Estado>,
     Json(p): Json<PeticionEditarTarea>,
 ) -> Result<Json<Tarea>, ErrorApp> {
+    // #4: si la edición trae un estimado, valida el rango plausible (mismo gate que al crear).
+    if let Some(estimado) = p.estimado_seg {
+        if !peers_core::estimado_en_rango(estimado) {
+            return Err(ErrorApp(anyhow::anyhow!(
+                "estimado_seg={estimado} fuera de rango plausible [{}s, {}s] (~30s a 30 días). \
+                 El estimado va en SEGUNDOS (1800 = 30 min).",
+                peers_core::ESTIMADO_MIN_SEG,
+                peers_core::ESTIMADO_MAX_SEG
+            )));
+        }
+    }
     match e
         .almacen
         .tarea_editar(&p.tarea_id, p.descripcion.as_deref(), p.estimado_seg)
@@ -607,7 +733,7 @@ async fn tarea_estado(
     Json(p): Json<PeticionEstadoTarea>,
 ) -> Result<Json<Tarea>, ErrorApp> {
     let ahora = ahora_iso();
-    let Some(tarea) = e
+    let Some(mut tarea) = e
         .almacen
         .tarea_estado(&p.tarea_id, p.estado, p.motivo.as_deref(), &ahora)
         .await?
@@ -618,23 +744,23 @@ async fn tarea_estado(
         )));
     };
 
-    // Aprendizaje del factor: SOLO en Hecha, con estimado presente y real > 0 (R3/R5/AC2). El
-    // real lo timbró el broker en `tarea_estado` (regla sagrada): aquí se lee de la tarea, nunca
-    // del cliente. Cancelada/Bloqueada/etc. NO tocan el factor.
+    // Aprendizaje del factor: SOLO en Hecha (R3/R5/AC2). El real lo timbró el broker en
+    // `tarea_estado` (regla sagrada): se lee de la tarea, nunca del cliente. Cancelada/Bloqueada/
+    // etc. NO tocan el factor. La lógica (gates #3/#4/#7/#8/#9) vive en `aprender_factor_de_tarea`,
+    // exactamente igual que en `/cerrar-tarea` (una sola semántica de aprendizaje, #1).
     if p.estado == EstadoTarea::Hecha {
-        if let (Some(estimado), Some(real)) = (tarea.estimado_seg, tarea.duracion_seg) {
-            if estimado > 0 && real > 0 {
-                let ratio = estimado as f64 / real as f64;
-                match e.almacen.actualizar_factor(ratio, &ahora).await {
-                    Ok(f) => info!(
-                        "factor aprendido (tarea→Hecha): tarea {} ratio {:.2} → factor {:.2} ({} muestras)",
-                        p.tarea_id, ratio, f.factor, f.muestras
-                    ),
-                    // Degradación: si el aprendizaje falla, la tarea queda Hecha igual.
-                    Err(err) => warn!("no se pudo actualizar el factor (tarea Hecha igual): {err:#}"),
+        // #7: persiste la evidencia (prueba de trabajo) antes de aprender, si vino.
+        if let Some(ev) = p.evidencia.as_deref() {
+            if tarea.evidencia.as_deref() != Some(ev) {
+                tarea.evidencia = Some(ev.to_string());
+                if let Err(err) = e.almacen.tarea_guardar(&tarea).await {
+                    warn!("no se pudo persistir la evidencia de la tarea {}: {err:#}", p.tarea_id);
                 }
             }
         }
+
+        aprender_factor_de_tarea(&e, &tarea, &ahora).await;
+
         // Cierra la issue espejo en GitHub si procede (best-effort, igual que /cerrar-tarea).
         if let Some(gh) = &e.github {
             if let Some(n) = tarea.issue_number {
@@ -697,22 +823,34 @@ async fn tarea_asignar(
 }
 
 /// `POST /tarea/reasignar` { tarea_id, nuevo_instancia_id } → cambia el dueño de la tarea y
-/// notifica al nuevo (R7/AC4). `tarea_editar` no cubre el dueño, así que reusa
-/// `tarea_obtener` + `tarea_guardar` con el nuevo `instancia_id`. 404 si la tarea no existe.
+/// notifica al nuevo (R7/AC4). Usa `almacen.tarea_reasignar` (#11): quita el id de la lista del
+/// dueño VIEJO (LREM) y lo añade a la del nuevo (RPUSH) de forma atómica, para que la tarea no
+/// aparezca en DOS jornadas (el bug del guardar manual). 404 si la tarea no existe.
 async fn tarea_reasignar(
     State(e): State<Estado>,
     Json(p): Json<PeticionReasignarTarea>,
 ) -> Result<Json<Tarea>, ErrorApp> {
     let ahora = ahora_iso();
-    let Some(mut tarea) = e.almacen.tarea_obtener(&p.tarea_id).await? else {
+    // Capturamos el dueño anterior ANTES de reasignar (para el log de auditoría).
+    let dueno_anterior = match e.almacen.tarea_obtener(&p.tarea_id).await? {
+        Some(t) => t.instancia_id,
+        None => {
+            return Err(ErrorApp(anyhow::anyhow!(
+                "la tarea '{}' no existe",
+                p.tarea_id
+            )))
+        }
+    };
+    let Some(tarea) = e
+        .almacen
+        .tarea_reasignar(&p.tarea_id, &p.nuevo_instancia_id)
+        .await?
+    else {
         return Err(ErrorApp(anyhow::anyhow!(
             "la tarea '{}' no existe",
             p.tarea_id
         )));
     };
-    let dueno_anterior = tarea.instancia_id.clone();
-    tarea.instancia_id = p.nuevo_instancia_id.clone();
-    e.almacen.tarea_guardar(&tarea).await?;
 
     // Notifica al nuevo dueño (best-effort). El de_id es el broker/jefe.
     let texto = format!("📋 Tarea reasignada a ti: {}", tarea.descripcion);
@@ -792,6 +930,17 @@ async fn factor_estimacion(
     State(e): State<Estado>,
 ) -> Result<Json<FactorEstimacion>, ErrorApp> {
     Ok(Json(e.almacen.factor_estimacion().await?))
+}
+
+/// `GET /factor-estimacion-peer?instancia_id=<id>` → el factor aprendido SOLO de ese peer (#9).
+/// Es la pieza de accountability individual: un peer mentiroso sesga su PROPIO factor, no el
+/// global de los honestos. Default neutro si ese peer aún no tiene muestras.
+async fn factor_estimacion_peer(
+    State(e): State<Estado>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<FactorEstimacion>, ErrorApp> {
+    let id = q.get("instancia_id").map(String::as_str).unwrap_or_default();
+    Ok(Json(e.almacen.factor_estimacion_peer(id).await?))
 }
 
 /// Resuelve (owner, repo) del repo_github de una instancia. None si la instancia no existe
@@ -946,6 +1095,64 @@ async fn detectar_alertas(estado: &Estado, umbrales: Umbrales, ahora: &str) {
     if let Err(err) = detectar_ghosteo(estado, umbrales.ghosteo_seg, ahora).await {
         warn!("detector GHOSTEO falló (se sigue con los demás): {err:#}");
     }
+    if let Err(err) = detectar_cancelacion_excesiva(estado, ahora).await {
+        warn!("detector CANCELACION_EXCESIVA falló (se sigue con los demás): {err:#}");
+    }
+}
+
+/// #10 — Cancelación excesiva: por cada instancia VIVA, cuenta sus tareas Canceladas vs el total
+/// y, si el ratio supera `UMBRAL_CANCELACION` (regla pura `cancelacion_excesiva`), emite
+/// `TipoAlerta::CancelacionExcesiva` (sujeto = id del peer). Cancelar es la vía de escape para
+/// esconder fallos (Cancelada NO alimenta el factor), así que un ratio alto sesga la métrica por
+/// omisión. Cuando el ratio vuelve a bajar del umbral, se resuelve la alerta (AC2).
+async fn detectar_cancelacion_excesiva(estado: &Estado, ahora: &str) -> anyhow::Result<()> {
+    let vivas = estado
+        .almacen
+        .listar(
+            peers_core::Alcance::Maquina,
+            "",
+            None,
+            None,
+            &vencidas_antes_iso(),
+        )
+        .await?;
+
+    for inst in &vivas {
+        let (_sesiones, tareas) = estado.almacen.jornada(&inst.id).await?;
+        let total = u32::try_from(tareas.len()).unwrap_or(u32::MAX);
+        let canceladas = u32::try_from(
+            tareas
+                .iter()
+                .filter(|t| t.estado == EstadoTarea::Cancelada)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+
+        if peers_core::cancelacion_excesiva(canceladas, total) {
+            let alerta = Alerta {
+                tipo: TipoAlerta::CancelacionExcesiva,
+                sujeto: inst.id.clone(),
+                detalle: format!(
+                    "peer '{}' canceló {}/{} tareas (> {:.0}%): posible vía de escape",
+                    inst.id,
+                    canceladas,
+                    total,
+                    peers_core::UMBRAL_CANCELACION * 100.0
+                ),
+                creada_en: ahora.to_string(),
+            };
+            if estado.almacen.alerta_emitir(&alerta).await? {
+                info!("alerta CANCELACION_EXCESIVA emitida: {}", inst.id);
+            }
+        } else {
+            // La condición cesó (ratio bajo el umbral): resuelve la alerta activa (AC2).
+            estado
+                .almacen
+                .alerta_resolver("cancelacion_excesiva", &inst.id)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// R2 — Ocioso: por cada instancia VIVA (visto < VENCIMIENTO) sin tarea en curso, mira cuánto
@@ -1195,6 +1402,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/cerrar-tarea", post(cerrar_tarea))
         .route("/listar-tareas", post(listar_tareas))
         .route("/factor-estimacion", get(factor_estimacion))
+        .route("/factor-estimacion-peer", get(factor_estimacion_peer))
         // Admin (panel TUI): introspección protegida por el mismo token, nunca en /salud.
         .route("/admin/info", get(admin_info))
         .route("/admin/redis", get(admin_redis))

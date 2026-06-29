@@ -292,6 +292,8 @@ impl ClienteAdmin {
             tarea_id: tarea_id.to_string(),
             estado,
             motivo,
+            // La transición de estado desde la TUI no adjunta evidencia (es acción del jefe).
+            evidencia: None,
         };
         self.post("/tarea/estado", &p).await
     }

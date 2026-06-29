@@ -182,6 +182,8 @@ async fn redis_jornada_timbrada() {
         estimado_seg: None,
         estado: peers_core::EstadoTarea::Abierta,
         bloqueo_motivo: None,
+        factor_aprendido: false,
+        evidencia: None,
     };
     alm.tarea_guardar(&t).await.unwrap();
     // Cierre timbrado 90s después.
@@ -343,4 +345,110 @@ async fn redis_listar_filtra_alcance_y_vivos() {
     assert!(r.iter().any(|i| i.id == "it-b"));
     assert!(!r.iter().any(|i| i.id == "it-a"));
     limpiar(&alm, &["it-a", "it-b"]).await;
+}
+
+/// Borra las claves de tarea/lista/factor-peer que usan los tests de abajo (prefijo it-).
+async fn limpiar_tareas(alm: &AlmacenRedis, listas: &[&str], tareas: &[&str], peers: &[&str]) {
+    use deadpool_redis::redis::cmd;
+    let mut conn = alm_conn(alm).await;
+    for l in listas {
+        let _: () = cmd("DEL").arg(format!("cprs:tareas:{l}")).query_async(&mut conn).await.unwrap();
+    }
+    for t in tareas {
+        let _: () = cmd("DEL").arg(format!("cprs:tarea:{t}")).query_async(&mut conn).await.unwrap();
+    }
+    for p in peers {
+        let _: () = cmd("DEL").arg(format!("cprs:factor:{p}")).query_async(&mut conn).await.unwrap();
+    }
+}
+
+async fn alm_conn(_alm: &AlmacenRedis) -> deadpool_redis::Connection {
+    use deadpool_redis::{Config, Runtime};
+    let url = url_redis().unwrap();
+    let pool = Config::from_url(&url).create_pool(Some(Runtime::Tokio1)).unwrap();
+    pool.get().await.unwrap()
+}
+
+fn tarea_it(id: &str, inst: &str) -> peers_core::Tarea {
+    peers_core::Tarea {
+        id: id.into(),
+        instancia_id: inst.into(),
+        sesion_id: "it-s".into(),
+        descripcion: "x".into(),
+        inicio: "2026-01-01T00:00:00Z".into(),
+        fin: None,
+        duracion_seg: None,
+        issue_number: None,
+        estimado_seg: Some(600),
+        estado: peers_core::EstadoTarea::Abierta,
+        bloqueo_motivo: None,
+        factor_aprendido: false,
+        evidencia: None,
+    }
+}
+
+#[tokio::test]
+async fn redis_reabrir_limpia_y_retimbra() {
+    // #2 paridad Redis: reabrir desde Hecha limpia fin/duracion y re-timbra inicio.
+    use peers_core::EstadoTarea;
+    let Some(alm) = almacen_o_saltar().await else { return; };
+    limpiar_tareas(&alm, &["it-jor2"], &["it-rt"], &[]).await;
+    alm.tarea_guardar(&tarea_it("it-rt", "it-jor2")).await.unwrap();
+    alm.tarea_estado("it-rt", EstadoTarea::Hecha, None, "2026-01-01T00:01:30Z").await.unwrap();
+    let r = alm.tarea_estado("it-rt", EstadoTarea::Abierta, None, "2026-01-01T02:00:00Z").await.unwrap().unwrap();
+    assert!(r.fin.is_none());
+    assert!(r.duracion_seg.is_none());
+    assert_eq!(r.inicio, "2026-01-01T02:00:00Z");
+    assert!(!r.factor_aprendido);
+    limpiar_tareas(&alm, &["it-jor2"], &["it-rt"], &[]).await;
+}
+
+#[tokio::test]
+async fn redis_reasignar_limpia_dueno_viejo() {
+    // #11 paridad Redis: LREM en la lista vieja + RPUSH en la nueva (no aparece en 2 jornadas).
+    let Some(alm) = almacen_o_saltar().await else { return; };
+    limpiar_tareas(&alm, &["it-viejo", "it-nuevo"], &["it-re"], &[]).await;
+    alm.tarea_guardar(&tarea_it("it-re", "it-viejo")).await.unwrap();
+    assert_eq!(alm.jornada("it-viejo").await.unwrap().1.len(), 1);
+    let r = alm.tarea_reasignar("it-re", "it-nuevo").await.unwrap().unwrap();
+    assert_eq!(r.instancia_id, "it-nuevo");
+    assert_eq!(alm.jornada("it-viejo").await.unwrap().1.len(), 0, "fuera del dueño viejo");
+    assert_eq!(alm.jornada("it-nuevo").await.unwrap().1.len(), 1, "en el nuevo");
+    // Reasignar dos veces al mismo no duplica.
+    alm.tarea_reasignar("it-re", "it-nuevo").await.unwrap();
+    assert_eq!(alm.jornada("it-nuevo").await.unwrap().1.len(), 1);
+    limpiar_tareas(&alm, &["it-viejo", "it-nuevo"], &["it-re"], &[]).await;
+}
+
+#[tokio::test]
+async fn redis_factor_por_peer_independiente() {
+    // #9 paridad Redis: el factor por peer no toca el global ni a otro peer.
+    let Some(alm) = almacen_o_saltar().await else { return; };
+    limpiar_tareas(&alm, &[], &[], &["it-alice", "it-bob"]).await;
+    let pa = alm.actualizar_factor_peer("it-alice", 4.0, "2026-01-01T00:00:00Z").await.unwrap();
+    assert_eq!(pa.muestras, 1);
+    assert_eq!(alm.factor_estimacion_peer("it-bob").await.unwrap().muestras, 0);
+    let leido = alm.factor_estimacion_peer("it-alice").await.unwrap();
+    assert_eq!(leido.muestras, 1);
+    assert!((leido.factor - pa.factor).abs() < 1e-9);
+    limpiar_tareas(&alm, &[], &[], &["it-alice", "it-bob"]).await;
+}
+
+#[tokio::test]
+async fn redis_limpiar_vencidas_bloquea_huerfanas() {
+    // #12 paridad Redis: al limpiar un peer caído, su tarea viva pasa a Bloqueada('peer caído').
+    use peers_core::EstadoTarea;
+    let Some(alm) = almacen_o_saltar().await else { return; };
+    limpiar(&alm, &["it-muerto"]).await;
+    limpiar_tareas(&alm, &["it-muerto"], &["it-huerf"], &[]).await;
+    alm.registrar("it-muerto", 1, "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+    let mut viva = tarea_it("it-huerf", "it-muerto");
+    viva.estado = EstadoTarea::EnCurso;
+    alm.tarea_guardar(&viva).await.unwrap();
+    assert_eq!(alm.limpiar_vencidas("2026-01-01T00:00:00Z").await.unwrap(), 1);
+    let t = alm.tarea_obtener("it-huerf").await.unwrap().unwrap();
+    assert_eq!(t.estado, EstadoTarea::Bloqueada);
+    assert_eq!(t.bloqueo_motivo.as_deref(), Some("peer caído"));
+    limpiar(&alm, &["it-muerto"]).await;
+    limpiar_tareas(&alm, &["it-muerto"], &["it-huerf"], &[]).await;
 }

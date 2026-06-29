@@ -145,6 +145,8 @@ impl ClienteBroker {
             "/cerrar-tarea",
             &PeticionCerrarTarea {
                 tarea_id: tarea_id.to_string(),
+                // La tool MCP cierra sin evidencia explícita; el broker mide el tiempo real igual.
+                evidencia: None,
             },
         )
         .await

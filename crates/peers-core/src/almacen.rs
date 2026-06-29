@@ -197,6 +197,39 @@ pub trait Almacen: Send + Sync {
     /// nunca la IA) y persiste. Devuelve el factor ya actualizado.
     async fn actualizar_factor(&self, ratio: f64, ahora: &str) -> anyhow::Result<FactorEstimacion>;
 
+    /// Lee el factor de corrección POR PEER (#9). Clave `cprs:factor:{instancia_id}`. Si el peer
+    /// no tiene historial propio, devuelve el default neutro `{ muestras: 0, factor: 1.0, ... }`
+    /// (el handler decide caer al global como fallback cuando `muestras == 0`). Mantener el factor
+    /// por peer evita que un mentiroso contamine a los honestos: solo se corrige a sí mismo.
+    async fn factor_estimacion_peer(&self, instancia_id: &str) -> anyhow::Result<FactorEstimacion>;
+
+    /// Aprende el factor POR PEER (#9): igual que `actualizar_factor` pero sobre la clave del peer
+    /// `cprs:factor:{instancia_id}`. El reloj lo pone el broker (`ahora`), nunca la IA. Devuelve el
+    /// factor del peer ya actualizado. NO toca el global (el handler decide si además aprende el
+    /// global, p.ej. solo con evidencia — #7).
+    async fn actualizar_factor_peer(
+        &self,
+        instancia_id: &str,
+        ratio: f64,
+        ahora: &str,
+    ) -> anyhow::Result<FactorEstimacion>;
+
+    /// Reasigna una tarea a un nuevo dueño (#11) de forma ATÓMICA respecto a la integridad
+    /// referencial: quita el id de la lista del dueño viejo (`LREM cprs:tareas:{viejo}` en Redis /
+    /// `UPDATE instancia_id` en SQLite) y lo añade a la del nuevo (`RPUSH cprs:tareas:{nuevo}`),
+    /// y cambia `tarea.instancia_id`. Así la tarea deja de aparecer en DOS jornadas. Devuelve la
+    /// tarea ya reasignada; `None` si la tarea no existe. Reasignar al MISMO dueño es no-op seguro.
+    async fn tarea_reasignar(
+        &self,
+        tarea_id: &str,
+        nuevo_instancia_id: &str,
+    ) -> anyhow::Result<Option<Tarea>>;
+
+    /// Lista las tareas NO terminales (estado `Abierta`/`EnCurso`/`Bloqueada`) de una instancia
+    /// (#12). Lo usa `limpiar_vencidas` para bloquear las huérfanas de un peer caído sin alimentar
+    /// el factor. Devuelve vacío si la instancia no tiene tareas vivas.
+    async fn tareas_no_terminales(&self, instancia_id: &str) -> anyhow::Result<Vec<Tarea>>;
+
     // --- Supervisor (fase 5): alertas de ocioso/atascado/ghosteo ---
 
     /// Emite una alerta a la cola `cprs:alertas` (LIST acotada a `MAX_ALERTAS` con LTRIM)

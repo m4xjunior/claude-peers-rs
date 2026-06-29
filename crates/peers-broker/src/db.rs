@@ -43,6 +43,9 @@ fn tipo_alerta_a_texto(t: TipoAlerta) -> &'static str {
         TipoAlerta::Ocioso => "ocioso",
         TipoAlerta::Atascado => "atascado",
         TipoAlerta::Ghosteo => "ghosteo",
+        // #8/#10: variantes compuestas; cadena = `#[serde(rename)]` del enum en peers-core.
+        TipoAlerta::CierreSospechoso => "cierre_sospechoso",
+        TipoAlerta::CancelacionExcesiva => "cancelacion_excesiva",
     }
 }
 
@@ -51,6 +54,8 @@ fn texto_a_tipo_alerta(s: &str) -> TipoAlerta {
     match s {
         "atascado" => TipoAlerta::Atascado,
         "ghosteo" => TipoAlerta::Ghosteo,
+        "cierre_sospechoso" => TipoAlerta::CierreSospechoso,
+        "cancelacion_excesiva" => TipoAlerta::CancelacionExcesiva,
         _ => TipoAlerta::Ocioso,
     }
 }
@@ -141,7 +146,16 @@ impl AlmacenSqlite {
                 id TEXT PRIMARY KEY, instancia_id TEXT NOT NULL, sesion_id TEXT NOT NULL,
                 descripcion TEXT NOT NULL, inicio TEXT NOT NULL, fin TEXT,
                 duracion_seg INTEGER, issue_number INTEGER, estimado_seg INTEGER,
-                estado TEXT NOT NULL DEFAULT 'abierta', bloqueo_motivo TEXT
+                estado TEXT NOT NULL DEFAULT 'abierta', bloqueo_motivo TEXT,
+                -- #3 idempotencia del aprendizaje (0/1) y #7 prueba de trabajo (nullable).
+                factor_aprendido INTEGER NOT NULL DEFAULT 0, evidencia TEXT
+            );
+            -- #9 factor de corrección POR PEER (espejo del global, particionado por instancia_id).
+            CREATE TABLE IF NOT EXISTS factor_peer (
+                instancia_id TEXT PRIMARY KEY,
+                muestras INTEGER NOT NULL DEFAULT 0,
+                factor REAL NOT NULL DEFAULT 1.0,
+                actualizado_en TEXT NOT NULL DEFAULT ''
             );
             -- Historial de reportes de progreso por tarea (R9/AC5): el detalle de la TUI los lee
             -- de aquí (local), no de GitHub. `tarea_reportar` escribe; `tarea_reportes` lee.
@@ -179,6 +193,13 @@ impl AlmacenSqlite {
             [],
         );
         let _ = conexion.execute("ALTER TABLE tareas ADD COLUMN bloqueo_motivo TEXT", []);
+        // #3/#7: columnas nuevas en bases YA existentes. Idempotente (ignora "duplicate column").
+        // Filas viejas → factor_aprendido=0 (no aprendida) y evidencia=NULL (no-verificada).
+        let _ = conexion.execute(
+            "ALTER TABLE tareas ADD COLUMN factor_aprendido INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conexion.execute("ALTER TABLE tareas ADD COLUMN evidencia TEXT", []);
         Ok(Self {
             conexion: Mutex::new(conexion),
         })
@@ -485,6 +506,16 @@ impl Almacen for AlmacenSqlite {
             filas.filter_map(Result::ok).collect()
         };
         for id in &muertas {
+            // #12: bloquea las tareas NO terminales del peer caído (huérfanas) ANTES de borrar la
+            // instancia, para que no queden con fin=None ni envenenen el factor. Bloqueada NO
+            // alimenta el factor (lo gestiona el handler). Se hace inline en la MISMA conexión
+            // (re-lockear self.bloquear() aquí sería un deadlock del Mutex). NO toca fin/duracion
+            // (las parques quedan medibles si se reabren). Espeja `aplicar_transicion_tarea(Bloqueada)`.
+            conexion.execute(
+                "UPDATE tareas SET estado='bloqueada', bloqueo_motivo='peer caído'
+                 WHERE instancia_id=?1 AND estado NOT IN ('hecha','cancelada','bloqueada')",
+                params![id],
+            )?;
             conexion.execute("DELETE FROM instancias WHERE id=?1", params![id])?;
             // Saca de la bandeja ACTIVA los mensajes aún no procesados de la instancia muerta
             // (→ deadletter) pero los CONSERVA en la tabla = historial durable (R2.1), en vez
@@ -568,12 +599,13 @@ impl Almacen for AlmacenSqlite {
     async fn tarea_guardar(&self, t: &Tarea) -> anyhow::Result<()> {
         self.bloquear().execute(
             "INSERT OR REPLACE INTO tareas
-             (id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             (id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo,factor_aprendido,evidencia)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 t.id, t.instancia_id, t.sesion_id, t.descripcion, t.inicio, t.fin,
                 t.duracion_seg, t.issue_number.map(|n| n as i64), t.estimado_seg,
-                estado_tarea_a_texto(t.estado), t.bloqueo_motivo
+                estado_tarea_a_texto(t.estado), t.bloqueo_motivo,
+                t.factor_aprendido as i64, t.evidencia
             ],
         )?;
         Ok(())
@@ -583,7 +615,7 @@ impl Almacen for AlmacenSqlite {
         let conexion = self.bloquear();
         Ok(conexion
             .query_row(
-                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo,factor_aprendido,evidencia
                  FROM tareas WHERE id=?1",
                 params![tarea_id],
                 fila_a_tarea,
@@ -609,7 +641,7 @@ impl Almacen for AlmacenSqlite {
         };
         let tareas = {
             let mut stmt = conexion.prepare(
-                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo,factor_aprendido,evidencia
                  FROM tareas WHERE instancia_id=?1 ORDER BY inicio ASC",
             )?;
             let filas = stmt.query_map(params![instancia_id], fila_a_tarea)?;
@@ -722,6 +754,91 @@ impl Almacen for AlmacenSqlite {
         Ok(nuevo)
     }
 
+    async fn factor_estimacion_peer(&self, instancia_id: &str) -> anyhow::Result<FactorEstimacion> {
+        // #9: factor POR PEER. Tabla factor_peer (PK instancia_id). Default neutro si no hay fila.
+        let conexion = self.bloquear();
+        let fila: Option<(i64, f64, String)> = conexion
+            .query_row(
+                "SELECT muestras,factor,actualizado_en FROM factor_peer WHERE instancia_id=?1",
+                params![instancia_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        Ok(match fila {
+            Some((muestras, factor, actualizado_en)) => FactorEstimacion {
+                muestras: muestras.max(0) as u32,
+                factor,
+                actualizado_en,
+            },
+            None => FactorEstimacion {
+                muestras: 0,
+                factor: 1.0,
+                actualizado_en: String::new(),
+            },
+        })
+    }
+
+    async fn actualizar_factor_peer(
+        &self,
+        instancia_id: &str,
+        ratio: f64,
+        ahora: &str,
+    ) -> anyhow::Result<FactorEstimacion> {
+        // #9: misma media móvil que el global, sobre la fila del peer (UPSERT por instancia_id).
+        let actual = self.factor_estimacion_peer(instancia_id).await?;
+        let nuevo = FactorEstimacion {
+            muestras: actual.muestras.saturating_add(1),
+            factor: aplicar_media_movil(actual.factor, ratio),
+            actualizado_en: ahora.to_string(),
+        };
+        self.bloquear().execute(
+            "INSERT INTO factor_peer (instancia_id,muestras,factor,actualizado_en)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(instancia_id) DO UPDATE SET
+               muestras=excluded.muestras, factor=excluded.factor,
+               actualizado_en=excluded.actualizado_en",
+            params![instancia_id, nuevo.muestras as i64, nuevo.factor, nuevo.actualizado_en],
+        )?;
+        Ok(nuevo)
+    }
+
+    async fn tarea_reasignar(
+        &self,
+        tarea_id: &str,
+        nuevo_instancia_id: &str,
+    ) -> anyhow::Result<Option<Tarea>> {
+        // #11: en SQLite la "lista del dueño" se deriva de la columna instancia_id (la jornada
+        // filtra WHERE instancia_id=?). Cambiar la columna ya quita la tarea de la jornada vieja
+        // y la mete en la nueva — no hay lista que limpiar aparte. UPDATE atómico de una fila.
+        let Some(mut tarea) = self.tarea_obtener(tarea_id).await? else {
+            return Ok(None);
+        };
+        if tarea.instancia_id == nuevo_instancia_id {
+            return Ok(Some(tarea)); // no-op: mismo dueño.
+        }
+        tarea.instancia_id = nuevo_instancia_id.to_string();
+        self.bloquear().execute(
+            "UPDATE tareas SET instancia_id=?2 WHERE id=?1",
+            params![tarea_id, nuevo_instancia_id],
+        )?;
+        Ok(Some(tarea))
+    }
+
+    async fn tareas_no_terminales(&self, instancia_id: &str) -> anyhow::Result<Vec<Tarea>> {
+        // #12: tareas vivas (no terminales) de la instancia. Filtra por los estados terminales
+        // en SQL para no traer las cerradas; el filtro final reusa `es_terminal` por coherencia.
+        let conexion = self.bloquear();
+        let mut stmt = conexion.prepare(
+            "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo,factor_aprendido,evidencia
+             FROM tareas WHERE instancia_id=?1 AND estado NOT IN ('hecha','cancelada','bloqueada') ORDER BY inicio ASC",
+        )?;
+        let filas = stmt.query_map(params![instancia_id], fila_a_tarea)?;
+        Ok(filas
+            .filter_map(Result::ok)
+            .filter(|t| !t.estado.es_terminal())
+            .collect())
+    }
+
     // --- Supervisor (fase 5): alertas ---
 
     async fn alerta_emitir(&self, a: &Alerta) -> anyhow::Result<bool> {
@@ -823,6 +940,9 @@ fn fila_a_tarea(f: &rusqlite::Row<'_>) -> rusqlite::Result<Tarea> {
         // orden de los SELECT de tareas.
         estado: texto_a_estado_tarea(&f.get::<_, String>(9)?),
         bloqueo_motivo: f.get(10)?,
+        // #3/#7: factor_aprendido (0/1 → bool) y evidencia (TEXT nullable). Posiciones 11/12.
+        factor_aprendido: f.get::<_, i64>(11)? != 0,
+        evidencia: f.get(12)?,
     })
 }
 
@@ -1001,6 +1121,8 @@ mod pruebas {
             estimado_seg: None,
             estado: EstadoTarea::Abierta,
             bloqueo_motivo: None,
+            factor_aprendido: false,
+            evidencia: None,
         };
         b.tarea_guardar(&t).await.unwrap();
         // Cierre con tiempo del "broker": 90s después.
@@ -1111,6 +1233,8 @@ mod pruebas {
             estimado_seg: Some(432000),
             estado: EstadoTarea::Abierta,
             bloqueo_motivo: None,
+            factor_aprendido: false,
+            evidencia: None,
         };
         b.tarea_guardar(&t).await.unwrap();
         let leida = b.tarea_obtener("te").await.unwrap().unwrap();
@@ -1130,6 +1254,8 @@ mod pruebas {
             estimado_seg: Some(600),
             estado: EstadoTarea::Abierta,
             bloqueo_motivo: None,
+            factor_aprendido: false,
+            evidencia: None,
         }
     }
 
@@ -1226,5 +1352,154 @@ mod pruebas {
         assert_eq!(t.estado, EstadoTarea::Abierta);
         assert!(t.bloqueo_motivo.is_none());
         assert_eq!(t.estimado_seg, Some(300));
+        // #3/#7 compat: una fila vieja sin esas columnas se lee con los DEFAULT (no aprendida,
+        // sin evidencia) gracias al ALTER ... DEFAULT 0 y a evidencia NULL.
+        assert!(!t.factor_aprendido);
+        assert!(t.evidencia.is_none());
+    }
+
+    #[tokio::test]
+    async fn factor_aprendido_y_evidencia_roundtrip() {
+        // #3/#7: ambos campos se persisten y se releen (paridad con Redis vía JSON).
+        let b = base();
+        let mut t = tarea_base("t1");
+        t.factor_aprendido = true;
+        t.evidencia = Some("commit abc123".into());
+        b.tarea_guardar(&t).await.unwrap();
+        let leida = b.tarea_obtener("t1").await.unwrap().unwrap();
+        assert!(leida.factor_aprendido);
+        assert_eq!(leida.evidencia.as_deref(), Some("commit abc123"));
+    }
+
+    #[tokio::test]
+    async fn cierre_idempotente_no_remide_duracion() {
+        // #1: jornada::cerrar_tarea es idempotente. Primer cierre mide; un segundo cierre (ACK
+        // perdido) NO re-timbra ni re-mide aunque pase tiempo (no infla la duración).
+        use std::sync::Arc;
+        let almacen: Arc<dyn Almacen> = Arc::new(base());
+        almacen.tarea_guardar(&tarea_base("t1")).await.unwrap();
+        let c1 = crate::jornada::cerrar_tarea(&almacen, "t1", "2026-01-01T00:01:30Z").await.unwrap();
+        assert_eq!(c1.duracion_seg, Some(90));
+        assert_eq!(c1.estado, EstadoTarea::Hecha);
+        // Segundo cierre mucho más tarde → misma duración, mismo fin (idempotente).
+        let c2 = crate::jornada::cerrar_tarea(&almacen, "t1", "2026-01-01T05:00:00Z").await.unwrap();
+        assert_eq!(c2.duracion_seg, Some(90), "el segundo cierre NO re-mide");
+        assert_eq!(c2.fin.as_deref(), Some("2026-01-01T00:01:30Z"), "el fin no cambia");
+    }
+
+    #[tokio::test]
+    async fn reabrir_desde_terminal_limpia_y_retimbra() {
+        // #2: reabrir Hecha→Abierta limpia fin/duracion, re-timbra inicio y resetea factor_aprendido.
+        let b = base();
+        let mut t = tarea_base("t1");
+        t.factor_aprendido = true; // simula que ya contribuyó en el ciclo anterior.
+        b.tarea_guardar(&t).await.unwrap();
+        // Cierra (mide 90s).
+        b.tarea_estado("t1", EstadoTarea::Hecha, None, "2026-01-01T00:01:30Z").await.unwrap();
+        // Reabre: la vida anterior se descarta.
+        let r = b.tarea_estado("t1", EstadoTarea::Abierta, None, "2026-01-01T02:00:00Z").await.unwrap().unwrap();
+        assert_eq!(r.estado, EstadoTarea::Abierta);
+        assert!(r.fin.is_none(), "reabrir limpia fin");
+        assert!(r.duracion_seg.is_none(), "reabrir limpia duracion");
+        assert_eq!(r.inicio, "2026-01-01T02:00:00Z", "reabrir re-timbra inicio");
+        assert!(!r.factor_aprendido, "reabrir resetea factor_aprendido (#3)");
+        // El segundo cierre mide desde el NUEVO inicio (60s después), no arrastra el viejo.
+        let c = b.tarea_estado("t1", EstadoTarea::Hecha, None, "2026-01-01T02:01:00Z").await.unwrap().unwrap();
+        assert_eq!(c.duracion_seg, Some(60), "el segundo ciclo se mide desde cero");
+    }
+
+    #[tokio::test]
+    async fn hecha_idempotente_en_store() {
+        // #1 a nivel store: un segundo tarea_estado→Hecha no re-timbra (fin ya presente).
+        let b = base();
+        b.tarea_guardar(&tarea_base("t1")).await.unwrap();
+        b.tarea_estado("t1", EstadoTarea::Hecha, None, "2026-01-01T00:01:30Z").await.unwrap();
+        // Re-aplicar Hecha (idempotente por transicion_valida) con otro reloj → no re-mide.
+        let t = b.tarea_estado("t1", EstadoTarea::Hecha, None, "2026-01-01T09:00:00Z").await.unwrap().unwrap();
+        assert_eq!(t.duracion_seg, Some(90));
+        assert_eq!(t.fin.as_deref(), Some("2026-01-01T00:01:30Z"));
+    }
+
+    #[tokio::test]
+    async fn factor_por_peer_es_independiente_del_global() {
+        // #9: aprender en un peer no toca el global ni a otro peer.
+        let b = base();
+        let pa = b.actualizar_factor_peer("alice", 4.0, "2026-01-01T00:00:00Z").await.unwrap();
+        assert_eq!(pa.muestras, 1);
+        // El global sigue neutro.
+        assert_eq!(b.factor_estimacion().await.unwrap().muestras, 0);
+        // Otro peer también neutro.
+        assert_eq!(b.factor_estimacion_peer("bob").await.unwrap().muestras, 0);
+        // Releer el de alice: persiste.
+        let leido = b.factor_estimacion_peer("alice").await.unwrap();
+        assert_eq!(leido.muestras, 1);
+        assert!((leido.factor - pa.factor).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn reasignar_mueve_de_jornada_y_no_duplica() {
+        // #11: reasignar cambia el dueño → desaparece de la jornada vieja y aparece en la nueva.
+        let b = base();
+        let mut t = tarea_base("t1");
+        t.instancia_id = "viejo".into();
+        b.tarea_guardar(&t).await.unwrap();
+        assert_eq!(b.jornada("viejo").await.unwrap().1.len(), 1);
+        let r = b.tarea_reasignar("t1", "nuevo").await.unwrap().unwrap();
+        assert_eq!(r.instancia_id, "nuevo");
+        assert_eq!(b.jornada("viejo").await.unwrap().1.len(), 0, "ya no está en el dueño viejo");
+        assert_eq!(b.jornada("nuevo").await.unwrap().1.len(), 1, "aparece en el nuevo");
+        // Reasignar al mismo dueño es no-op (no duplica).
+        b.tarea_reasignar("t1", "nuevo").await.unwrap();
+        assert_eq!(b.jornada("nuevo").await.unwrap().1.len(), 1);
+        // Inexistente → None.
+        assert!(b.tarea_reasignar("fantasma", "x").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tareas_no_terminales_filtra() {
+        // #12: solo Abierta/EnCurso (las "vivas"). Hecha/Cancelada/Bloqueada cuentan como
+        // terminal/parado (`es_terminal`) → fuera: ya están paradas, no hay que re-bloquearlas.
+        let b = base();
+        for (id, est) in [
+            ("abierta", EstadoTarea::Abierta),
+            ("encurso", EstadoTarea::EnCurso),
+            ("bloq", EstadoTarea::Bloqueada),
+            ("hecha", EstadoTarea::Hecha),
+            ("canc", EstadoTarea::Cancelada),
+        ] {
+            let mut t = tarea_base(id);
+            t.estado = est;
+            b.tarea_guardar(&t).await.unwrap();
+        }
+        let vivas: Vec<String> = b.tareas_no_terminales("jefin").await.unwrap().into_iter().map(|t| t.id).collect();
+        assert_eq!(vivas.len(), 2, "solo Abierta y EnCurso son 'vivas'");
+        assert!(vivas.contains(&"abierta".to_string()));
+        assert!(vivas.contains(&"encurso".to_string()));
+        assert!(!vivas.contains(&"bloq".to_string()), "una ya Bloqueada no se re-bloquea");
+    }
+
+    #[tokio::test]
+    async fn limpiar_vencidas_bloquea_huerfanas() {
+        // #12: al limpiar un peer caído, sus tareas vivas pasan a Bloqueada('peer caído') y NO
+        // se quedan con fin=None apuntando a un peer que ya no existe. Las terminales no se tocan.
+        let b = base();
+        b.registrar("muerto", 1, "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        let mut viva = tarea_base("viva");
+        viva.instancia_id = "muerto".into();
+        viva.estado = EstadoTarea::EnCurso;
+        b.tarea_guardar(&viva).await.unwrap();
+        let mut hecha = tarea_base("ya_hecha");
+        hecha.instancia_id = "muerto".into();
+        hecha.estado = EstadoTarea::Hecha;
+        hecha.fin = Some("2020-01-01T00:00:30Z".into());
+        b.tarea_guardar(&hecha).await.unwrap();
+
+        assert_eq!(b.limpiar_vencidas("2026-01-01T00:00:00Z").await.unwrap(), 1);
+        let viva2 = b.tarea_obtener("viva").await.unwrap().unwrap();
+        assert_eq!(viva2.estado, EstadoTarea::Bloqueada);
+        assert_eq!(viva2.bloqueo_motivo.as_deref(), Some("peer caído"));
+        // La que ya estaba Hecha no se toca.
+        let hecha2 = b.tarea_obtener("ya_hecha").await.unwrap().unwrap();
+        assert_eq!(hecha2.estado, EstadoTarea::Hecha);
     }
 }

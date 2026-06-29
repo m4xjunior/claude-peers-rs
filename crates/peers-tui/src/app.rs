@@ -528,6 +528,9 @@ pub fn color_alerta(tipo: TipoAlerta) -> ratatui::style::Color {
         TipoAlerta::Ocioso => Color::Yellow,
         TipoAlerta::Atascado => Color::Rgb(255, 140, 0), // naranja
         TipoAlerta::Ghosteo => Color::Red,
+        // Las dos de accountability (honestidad del peer) son graves → magenta para destacar.
+        TipoAlerta::CierreSospechoso => Color::Magenta,
+        TipoAlerta::CancelacionExcesiva => Color::Magenta,
     }
 }
 
@@ -537,6 +540,8 @@ pub fn etiqueta_alerta(tipo: TipoAlerta) -> &'static str {
         TipoAlerta::Ocioso => "ocioso",
         TipoAlerta::Atascado => "atascado",
         TipoAlerta::Ghosteo => "ghosteo",
+        TipoAlerta::CierreSospechoso => "cierre sospechoso",
+        TipoAlerta::CancelacionExcesiva => "cancelación excesiva",
     }
 }
 
@@ -776,6 +781,8 @@ mod tests {
             estado: EstadoTarea::Hecha,
             bloqueo_motivo: None,
             issue_number: None,
+            factor_aprendido: false,
+            evidencia: None,
         };
         let f = fila_tarea(&t);
         assert_eq!(f[0], "implementar pantallas");

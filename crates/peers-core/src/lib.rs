@@ -279,6 +279,23 @@ impl Default for EstadoTarea {
     }
 }
 
+impl EstadoTarea {
+    /// ¿Es un estado terminal/parado (`Hecha`/`Cancelada`/`Bloqueada`)? (#1/#2/#12)
+    ///
+    /// INTENCIÓN: centralizar la noción de "ya no está viva" para los tres usos del store:
+    ///   - #1 cierre idempotente: si la tarea ya es terminal NO se re-timbra.
+    ///   - #2 reabrir: al ir a `Abierta` DESDE terminal se limpia fin/duracion y se re-timbra.
+    ///   - #12 huérfanas: `limpiar_vencidas` bloquea solo las NO terminales de un peer caído.
+    /// `Bloqueada` cuenta como "no viva" (parada): no se mide tiempo ni se aprende mientras lo esté.
+    #[must_use]
+    pub fn es_terminal(self) -> bool {
+        matches!(
+            self,
+            EstadoTarea::Hecha | EstadoTarea::Cancelada | EstadoTarea::Bloqueada
+        )
+    }
+}
+
 /// ¿Es válida la transición de estado `actual` → `nuevo`? Función PURA (sin reloj ni I/O).
 ///
 /// Tabla (R3): `Abierta ↔ EnCurso`; cualquiera → `Bloqueada`/`Hecha`/`Cancelada`;
@@ -327,6 +344,18 @@ pub struct Tarea {
     /// Número de la issue de GitHub espejo, si la integración está activa.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_number: Option<u64>,
+    /// IDEMPOTENCIA DEL APRENDIZAJE (#3). `true` cuando esta tarea YA contribuyó al factor de
+    /// corrección. El broker solo aprende si `!factor_aprendido` y lo pone a `true` al aprender,
+    /// en el mismo `tarea_guardar` atómico. Así reabrir+recerrar o un doble `cerrar_tarea` (ACK
+    /// perdido) NO mete el mismo ratio dos veces en la EMA ni infla `muestras` (falsa confianza).
+    /// `#[serde(default)]` → una tarea vieja nace `false` (aún no aprendida).
+    #[serde(default)]
+    pub factor_aprendido: bool,
+    /// PRUEBA DE TRABAJO (#7). Evidencia opcional del cierre (commit SHA, PR, nota). Las tareas
+    /// Hechas SIN evidencia se consideran "no-verificadas": alimentan el factor POR-PEER pero NO
+    /// el global (no contaminan la métrica que Max confía como objetiva). `None` = sin evidencia.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidencia: Option<String>,
 }
 
 /// Un ítem del outbox durable. Toda solicitud peer→peer que deba sobrevivir a un
@@ -380,6 +409,10 @@ pub struct PeticionReportarTarea {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeticionCerrarTarea {
     pub tarea_id: String,
+    /// PRUEBA DE TRABAJO (#7). Evidencia opcional del cierre (commit SHA, PR, nota). Si falta,
+    /// la tarea queda "no-verificada" y NO alimenta el factor global (solo el por-peer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidencia: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -548,6 +581,10 @@ pub struct PeticionEstadoTarea {
     /// Motivo del bloqueo (solo relevante al pasar a `Bloqueada`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motivo: Option<String>,
+    /// PRUEBA DE TRABAJO (#7). Evidencia opcional al pasar a `Hecha` (commit/PR/nota). Mismo
+    /// significado que en `PeticionCerrarTarea`: sin evidencia → tarea "no-verificada".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidencia: Option<String>,
 }
 
 /// `POST /tarea/asignar` (R6). Crea una tarea asignada a un peer (reusa `/crear-tarea`) Y
@@ -593,6 +630,13 @@ pub struct PeticionReportesTarea {
 /// INTENCIÓN: enum cerrado (no "stringly typed") para que la TUI y el broker
 /// compartan exactamente el mismo vocabulario de alerta. Serializa en minúsculas
 /// para encajar con el resto del protocolo (`ocioso`/`atascado`/`ghosteo`).
+///
+/// DECISIÓN DE NOMBRES (#8/#10): las variantes de una sola palabra siguen `rename_all =
+/// "lowercase"` (`ocioso`/`atascado`/`ghosteo`). Las NUEVAS variantes son compuestas; para no
+/// emitir un ilegible `cierresospechoso`, llevan `#[serde(rename = ...)]` EXPLÍCITO en
+/// snake_case (`cierre_sospechoso`/`cancelacion_excesiva`). Se elige snake_case (no la palabra
+/// única) porque es el separador idiomático y deja el JSON legible; queda documentado aquí para
+/// que el broker y la TUI usen exactamente esas cadenas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TipoAlerta {
@@ -602,6 +646,16 @@ pub enum TipoAlerta {
     Atascado,
     /// Mensaje en `Leido` (no `Procesado`) desde hace > `UMBRAL_GHOSTEO_SEG` (R4).
     Ghosteo,
+    /// Cierre con `real < UMBRAL_REAL_MINIMO_SEG`: tarea creada y cerrada casi al instante (#8).
+    /// NO alimenta el factor (envenenaría hacia el techo) y dispara esta alerta. `sujeto` = id
+    /// de la tarea. Serializa como `"cierre_sospechoso"`.
+    #[serde(rename = "cierre_sospechoso")]
+    CierreSospechoso,
+    /// Ratio canceladas/total del peer por encima de `UMBRAL_CANCELACION` (#10): el peer esconde
+    /// fallos en `Cancelada` para que el factor solo aprenda de sus aciertos. `sujeto` = id del
+    /// peer. Serializa como `"cancelacion_excesiva"`.
+    #[serde(rename = "cancelacion_excesiva")]
+    CancelacionExcesiva,
 }
 
 /// Una alerta emitida por el supervisor hacia `cprs:alertas` (R5).
@@ -628,6 +682,65 @@ pub const UMBRAL_GHOSTEO_SEG: i64 = 300;
 
 /// Tope de alertas retenidas en la LIST `cprs:alertas` (R5: últimas 50).
 pub const MAX_ALERTAS: usize = 50;
+
+// ===========================================================================
+// HONESTIDAD DEL FACTOR — umbrales y rangos plausibles (#4/#8/#10).
+// Constantes y funciones PURAS; el broker decide qué hacer con ellas (no contaminar
+// el factor, emitir alerta), pero la regla de "qué es plausible/sospechoso" vive aquí.
+// ===========================================================================
+
+/// Real mínimo (segundos) para que un cierre alimente el factor (#8). Un cierre por debajo de
+/// este umbral (tarea abierta y cerrada casi al instante, p.ej. un peer en bucle de tool-calls)
+/// produce un ratio enorme que empuja el factor al techo `FACTOR_MAX`: NO se aprende y se emite
+/// `TipoAlerta::CierreSospechoso`.
+pub const UMBRAL_REAL_MINIMO_SEG: i64 = 30;
+
+/// Estimado mínimo plausible (segundos) al crear/editar una tarea (#4). Por debajo se rechaza
+/// con warning y NO alimenta el factor: protege contra la confusión minutos↔segundos (una IA
+/// que manda `30` para una tarea de 30 min ensucia el factor con un ratio 60× equivocado).
+pub const ESTIMADO_MIN_SEG: i64 = 30;
+
+/// Estimado máximo plausible (segundos) al crear/editar una tarea (#4). 30 días. Por encima se
+/// rechaza con warning (un estimado de meses es casi siempre un error de unidad/dedo).
+pub const ESTIMADO_MAX_SEG: i64 = 2_592_000; // 30 días * 24h * 3600s
+
+/// Umbral del ratio canceladas/total por peer (#10) para emitir `TipoAlerta::CancelacionExcesiva`.
+/// Por encima de 0.4 (40% canceladas) se sospecha que el peer esconde fallos en `Cancelada` para
+/// que el factor solo aprenda de sus aciertos (sesgo de supervivencia → corrección optimista).
+pub const UMBRAL_CANCELACION: f64 = 0.4;
+
+/// ¿Está el estimado (segundos) dentro del rango plausible `[ESTIMADO_MIN_SEG, ESTIMADO_MAX_SEG]`? (#4)
+///
+/// Función PURA. El handler `crear_tarea`/`editar_tarea` la usa en la frontera: si devuelve
+/// `false`, rechaza el estimado con un warning y NO lo usa para aprender el factor. Inclusiva en
+/// ambos extremos (un estimado de exactamente 30s o de exactamente 30 días es válido).
+#[must_use]
+pub fn estimado_en_rango(seg: i64) -> bool {
+    (ESTIMADO_MIN_SEG..=ESTIMADO_MAX_SEG).contains(&seg)
+}
+
+/// ¿Es sospechosamente bajo el tiempo real de un cierre? (#8)
+///
+/// Función PURA: `true` si `real_seg < UMBRAL_REAL_MINIMO_SEG`. El broker, al cerrar una tarea,
+/// la consulta: si es `true`, NO alimenta el factor y emite `TipoAlerta::CierreSospechoso`. Un
+/// real negativo (reloj hacia atrás) también es sospechoso (cae por debajo del umbral).
+#[must_use]
+pub fn cierre_sospechoso(real_seg: i64) -> bool {
+    real_seg < UMBRAL_REAL_MINIMO_SEG
+}
+
+/// ¿El ratio de canceladas del peer supera `UMBRAL_CANCELACION`? (#10)
+///
+/// Función PURA: `canceladas / total > UMBRAL_CANCELACION`. Con `total == 0` devuelve `false`
+/// (sin tareas no hay nada que sospechar; además evita la división por cero). El broker la usa
+/// sobre el conteo por peer para decidir si emite `TipoAlerta::CancelacionExcesiva`.
+#[must_use]
+pub fn cancelacion_excesiva(canceladas: u32, total: u32) -> bool {
+    if total == 0 {
+        return false;
+    }
+    (f64::from(canceladas) / f64::from(total)) > UMBRAL_CANCELACION
+}
 
 /// ¿La distancia temporal entre `desde_iso` y `ahora_iso` supera `umbral_seg`?
 ///
@@ -973,6 +1086,8 @@ mod tests {
             estado: EstadoTarea::Bloqueada,
             bloqueo_motivo: Some("falta credencial Redis".into()),
             issue_number: Some(12),
+            factor_aprendido: false,
+            evidencia: None,
         };
         let json = serde_json::to_string(&original).expect("serializar");
         let vuelta: Tarea = serde_json::from_str(&json).expect("deserializar");
@@ -997,9 +1112,114 @@ mod tests {
             estado: EstadoTarea::Abierta,
             bloqueo_motivo: None,
             issue_number: None,
+            factor_aprendido: false,
+            evidencia: None,
         };
         let json = serde_json::to_string(&t).expect("serializar");
         assert!(!json.contains("bloqueo_motivo"), "no debe emitir bloqueo_motivo: {json}");
         assert!(json.contains("\"estado\":\"abierta\""), "debe emitir estado: {json}");
+        // evidencia None se omite (skip_serializing_if); factor_aprendido SÍ se emite (default).
+        assert!(!json.contains("evidencia"), "no debe emitir evidencia None: {json}");
+        assert!(json.contains("\"factor_aprendido\":false"), "debe emitir factor_aprendido: {json}");
+    }
+
+    // --- Honestidad del factor (#3/#4/#7/#8/#10): compat, rangos y sospecha ---
+
+    /// #3/#7 compat: una Tarea vieja (JSON sin `factor_aprendido` ni `evidencia`) deserializa con
+    /// `factor_aprendido = false` (aún no aprendida) y `evidencia = None`, sin romper.
+    #[test]
+    fn tarea_vieja_sin_factor_aprendido_ni_evidencia() {
+        let json_viejo = r#"{
+            "id": "tar-1",
+            "instancia_id": "claudio",
+            "sesion_id": "ses-1",
+            "descripcion": "feature vieja",
+            "inicio": "2026-01-01T00:00:00Z",
+            "fin": null,
+            "duracion_seg": null
+        }"#;
+        let t: Tarea = serde_json::from_str(json_viejo).expect("deser Tarea vieja");
+        assert!(!t.factor_aprendido, "una tarea vieja nace no-aprendida");
+        assert!(t.evidencia.is_none());
+    }
+
+    /// #7: una Tarea con evidencia hace roundtrip y la conserva.
+    #[test]
+    fn tarea_con_evidencia_roundtrip() {
+        let original = Tarea {
+            id: "tar-7".into(),
+            instancia_id: "claudia".into(),
+            sesion_id: "ses-2".into(),
+            descripcion: "fix bug".into(),
+            inicio: "2026-06-29T10:00:00Z".into(),
+            fin: Some("2026-06-29T11:00:00Z".into()),
+            duracion_seg: Some(3600),
+            estimado_seg: Some(1800),
+            estado: EstadoTarea::Hecha,
+            bloqueo_motivo: None,
+            issue_number: None,
+            factor_aprendido: true,
+            evidencia: Some("commit abc123".into()),
+        };
+        let json = serde_json::to_string(&original).expect("serializar");
+        let vuelta: Tarea = serde_json::from_str(&json).expect("deserializar");
+        assert!(vuelta.factor_aprendido);
+        assert_eq!(vuelta.evidencia.as_deref(), Some("commit abc123"));
+    }
+
+    /// #8: las nuevas variantes de TipoAlerta serializan en snake_case explícito; las viejas
+    /// siguen en minúsculas (palabra única).
+    #[test]
+    fn tipo_alerta_nuevas_variantes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TipoAlerta::CierreSospechoso).expect("serializar"),
+            "\"cierre_sospechoso\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TipoAlerta::CancelacionExcesiva).expect("serializar"),
+            "\"cancelacion_excesiva\""
+        );
+        let c: TipoAlerta = serde_json::from_str("\"cierre_sospechoso\"").expect("deser");
+        assert_eq!(c, TipoAlerta::CierreSospechoso);
+        let e: TipoAlerta = serde_json::from_str("\"cancelacion_excesiva\"").expect("deser");
+        assert_eq!(e, TipoAlerta::CancelacionExcesiva);
+        // Las viejas no cambiaron.
+        assert_eq!(
+            serde_json::to_string(&TipoAlerta::Ocioso).expect("serializar"),
+            "\"ocioso\""
+        );
+    }
+
+    /// #4: `estimado_en_rango` acepta el rango plausible inclusivo y rechaza fuera.
+    #[test]
+    fn estimado_en_rango_acepta_plausible_rechaza_extremos() {
+        assert!(estimado_en_rango(ESTIMADO_MIN_SEG)); // borde inferior inclusivo (30s)
+        assert!(estimado_en_rango(ESTIMADO_MAX_SEG)); // borde superior inclusivo (30 días)
+        assert!(estimado_en_rango(1800)); // 30 min
+        assert!(!estimado_en_rango(ESTIMADO_MIN_SEG - 1)); // 29s: la confusión min↔seg típica
+        assert!(!estimado_en_rango(ESTIMADO_MAX_SEG + 1)); // > 30 días
+        assert!(!estimado_en_rango(0));
+        assert!(!estimado_en_rango(-5)); // negativo nunca es plausible
+    }
+
+    /// #8: `cierre_sospechoso` marca los reales por debajo del umbral (incluido el borde).
+    #[test]
+    fn cierre_sospechoso_marca_reales_bajos() {
+        assert!(cierre_sospechoso(0)); // cierre instantáneo
+        assert!(cierre_sospechoso(2)); // 2s, el caso del bucle de tool-calls
+        assert!(cierre_sospechoso(UMBRAL_REAL_MINIMO_SEG - 1)); // 29s
+        assert!(cierre_sospechoso(-10)); // real negativo (reloj atrás) también sospechoso
+        assert!(!cierre_sospechoso(UMBRAL_REAL_MINIMO_SEG)); // 30s justo NO es sospechoso
+        assert!(!cierre_sospechoso(3600)); // 1h, normal
+    }
+
+    /// #10: `cancelacion_excesiva` dispara solo por encima del umbral; total 0 nunca dispara.
+    #[test]
+    fn cancelacion_excesiva_segun_umbral() {
+        assert!(!cancelacion_excesiva(0, 0)); // sin tareas no hay sospecha (ni div/0)
+        assert!(!cancelacion_excesiva(0, 10)); // 0% canceladas
+        assert!(!cancelacion_excesiva(4, 10)); // 40% justo NO supera (estricto >)
+        assert!(cancelacion_excesiva(5, 10)); // 50% supera 0.4
+        assert!(cancelacion_excesiva(10, 10)); // 100% canceladas
     }
 }
