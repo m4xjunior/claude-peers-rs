@@ -4,7 +4,7 @@
 
 use crate::cliente::ErrorBroker;
 use peers_core::{
-    Alerta, EstadoMensaje, FactorEstimacion, Instancia, Mensaje, RespuestaAdminInfo,
+    Alerta, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, Mensaje, RespuestaAdminInfo,
     RespuestaAdminRedis, RespuestaJornada, RespuestaSalud, Tarea, TipoAlerta,
 };
 
@@ -131,6 +131,22 @@ pub enum Input {
     ConfigToken,
     /// Editando el refresh_ms en Config.
     ConfigRefresh,
+    /// Editando la descripción de la tarea seleccionada (acción 'e' en Tareas, paso 1/2).
+    /// Tras confirmar la descripción se encadena `TareaEditarEstimado` para el estimado.
+    TareaEditarDescripcion { tarea_id: String },
+    /// Editando el estimado (en minutos) de la tarea seleccionada (acción 'e', paso 2/2).
+    /// `descripcion` ya capturada en el paso anterior; se manda todo junto en `/tarea/editar`.
+    TareaEditarEstimado { tarea_id: String, descripcion: String },
+    /// Ampliando el estimado de la tarea: minutos a SUMAR al estimado actual (acción '+').
+    /// El handler lee el estimado vigente y suma; reusa `/tarea/editar`.
+    TareaAmpliarEstimado { tarea_id: String, estimado_actual_seg: i64 },
+    /// Capturando el motivo del bloqueo al pasar a Bloqueada (acción 'b').
+    TareaBloquear { tarea_id: String },
+    /// Nueva tarea asignada al peer enfocado: descripción (acción 'n', paso 1/2).
+    TareaNuevaDescripcion { instancia_id: String },
+    /// Nueva tarea: estimado en minutos (acción 'n', paso 2/2). `instancia_id`/`descripcion`
+    /// ya capturados; se manda todo junto en `/tarea/asignar`.
+    TareaNuevaEstimado { instancia_id: String, descripcion: String },
 }
 
 impl Input {
@@ -147,6 +163,14 @@ impl Input {
             Input::ConfigUrl => "broker_url".to_string(),
             Input::ConfigToken => "token".to_string(),
             Input::ConfigRefresh => "refresh_ms".to_string(),
+            Input::TareaEditarDescripcion { .. } => "Editar descripción".to_string(),
+            Input::TareaEditarEstimado { .. } => "Editar estimado (minutos)".to_string(),
+            Input::TareaAmpliarEstimado { .. } => "Ampliar estimado (+minutos)".to_string(),
+            Input::TareaBloquear { .. } => "Motivo del bloqueo".to_string(),
+            Input::TareaNuevaDescripcion { instancia_id } => {
+                format!("Nueva tarea para '{instancia_id}' (descripción)")
+            }
+            Input::TareaNuevaEstimado { .. } => "Estimado de la tarea (minutos)".to_string(),
         }
     }
 }
@@ -212,6 +236,16 @@ pub struct App {
     /// cicla con `[`/`]`). Independiente de `seleccion` (que ahí indexa filas de datos, no peers).
     /// Permite ver la jornada/trazabilidad/tareas de CUALQUIER peer, no solo el de Peers.
     pub peer_foco: usize,
+    /// Tarea cuyo modal DETALLE está abierto (acción Enter en Tareas). `None` = sin modal.
+    /// Se guarda una copia (no un índice) para que el modal sobreviva a un refresco que
+    /// reordene/encoja la lista. Los reportes asociados viven en `tarea_reportes`.
+    pub tarea_detalle: Option<Tarea>,
+    /// Reportes de progreso de la tarea del modal DETALLE (`GET /tarea/reportes`). Se cargan al
+    /// abrir el modal; vacío si la tarea no tiene reportes o el broker no respondió.
+    pub tarea_reportes: Vec<String>,
+    /// Índice del peer destino para REASIGNAR (acción 'a'): se cicla con pulsaciones repetidas
+    /// de 'a' sobre la misma tarea. Se aplica al confirmar con Enter. Independiente de `peer_foco`.
+    pub reasignar_destino: usize,
 }
 
 impl App {
@@ -229,7 +263,21 @@ impl App {
             flash: None,
             traza_timeline: false,
             peer_foco: 0,
+            tarea_detalle: None,
+            tarea_reportes: Vec::new(),
+            reasignar_destino: 0,
         }
+    }
+
+    /// Tarea seleccionada en la pantalla Tareas (por la fila `seleccion`), si la hay.
+    pub fn tarea_seleccionada(&self) -> Option<&Tarea> {
+        self.datos.tareas.get(self.seleccion)
+    }
+
+    /// Cierra el modal DETALLE de tarea y limpia sus reportes cacheados.
+    pub fn cerrar_detalle_tarea(&mut self) {
+        self.tarea_detalle = None;
+        self.tarea_reportes.clear();
     }
 
     /// Resuelve qué peer enfoca las pantallas Jornada/Trazabilidad/Tareas: el peer en `peer_foco`
@@ -446,6 +494,30 @@ pub fn fila_tarea(t: &Tarea) -> [String; 4] {
         formatear_duracion(t.duracion_seg),
         estado,
     ]
+}
+
+/// Color del estado de una tarea (R11): Abierta/gris, EnCurso/cian, Bloqueada/naranja,
+/// Hecha/verde, Cancelada/rojo. Naranja no es `Color` nombrado → RGB. Función pura — testeada.
+pub fn color_estado_tarea(estado: EstadoTarea) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    match estado {
+        EstadoTarea::Abierta => Color::Gray,
+        EstadoTarea::EnCurso => Color::Cyan,
+        EstadoTarea::Bloqueada => Color::Rgb(255, 140, 0), // naranja
+        EstadoTarea::Hecha => Color::Green,
+        EstadoTarea::Cancelada => Color::Red,
+    }
+}
+
+/// Etiqueta legible del estado de una tarea para la columna "estado" y el modal. Función pura.
+pub fn etiqueta_estado_tarea(estado: EstadoTarea) -> &'static str {
+    match estado {
+        EstadoTarea::Abierta => "abierta",
+        EstadoTarea::EnCurso => "en curso",
+        EstadoTarea::Bloqueada => "bloqueada",
+        EstadoTarea::Hecha => "hecha",
+        EstadoTarea::Cancelada => "cancelada",
+    }
 }
 
 /// Color de una alerta según su tipo (R6): ocioso/amarillo, atascado/naranja, ghosteo/rojo.
@@ -701,6 +773,8 @@ mod tests {
             fin: Some("2026-06-29T09:00:00Z".to_string()),
             duracion_seg: Some(3600),
             estimado_seg: Some(600),
+            estado: EstadoTarea::Hecha,
+            bloqueo_motivo: None,
             issue_number: None,
         };
         let f = fila_tarea(&t);
@@ -730,6 +804,21 @@ mod tests {
         assert_eq!(etiqueta_alerta(TipoAlerta::Ocioso), "ocioso");
         assert_eq!(etiqueta_alerta(TipoAlerta::Atascado), "atascado");
         assert_eq!(etiqueta_alerta(TipoAlerta::Ghosteo), "ghosteo");
+    }
+
+    #[test]
+    fn estado_tarea_color_y_etiqueta() {
+        use ratatui::style::Color;
+        assert_eq!(color_estado_tarea(EstadoTarea::Abierta), Color::Gray);
+        assert_eq!(color_estado_tarea(EstadoTarea::EnCurso), Color::Cyan);
+        assert_eq!(color_estado_tarea(EstadoTarea::Bloqueada), Color::Rgb(255, 140, 0));
+        assert_eq!(color_estado_tarea(EstadoTarea::Hecha), Color::Green);
+        assert_eq!(color_estado_tarea(EstadoTarea::Cancelada), Color::Red);
+        assert_eq!(etiqueta_estado_tarea(EstadoTarea::Abierta), "abierta");
+        assert_eq!(etiqueta_estado_tarea(EstadoTarea::EnCurso), "en curso");
+        assert_eq!(etiqueta_estado_tarea(EstadoTarea::Bloqueada), "bloqueada");
+        assert_eq!(etiqueta_estado_tarea(EstadoTarea::Hecha), "hecha");
+        assert_eq!(etiqueta_estado_tarea(EstadoTarea::Cancelada), "cancelada");
     }
 
     #[test]

@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use deadpool_redis::redis::{cmd, AsyncCommands};
 use deadpool_redis::{Config, Pool, Runtime};
 use peers_core::{
-    aplicar_media_movil, Alcance, Alerta, Almacen, EstadoMensaje, FactorEstimacion, Instancia,
-    ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
+    aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, EstadoMensaje, EstadoTarea,
+    FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
 };
 
 const NS: &str = "cprs:";
@@ -72,6 +72,9 @@ fn k_tareas(inst: &str) -> String {
 }
 fn k_tarea(id: &str) -> String {
     format!("{NS}tarea:{id}")
+}
+fn k_reportes(tarea_id: &str) -> String {
+    format!("{NS}reportes:{tarea_id}")
 }
 fn k_factor() -> String {
     format!("{NS}factor_estimacion")
@@ -556,6 +559,61 @@ impl Almacen for AlmacenRedis {
         Ok((sesiones, tareas))
     }
 
+    async fn tarea_editar(
+        &self,
+        tarea_id: &str,
+        descripcion: Option<&str>,
+        estimado_seg: Option<i64>,
+    ) -> anyhow::Result<Option<Tarea>> {
+        // Lee, aplica solo los campos Some, reusa tarea_guardar para persistir (R4/AC1).
+        let Some(mut tarea) = self.tarea_obtener(tarea_id).await? else {
+            return Ok(None);
+        };
+        if let Some(d) = descripcion {
+            tarea.descripcion = d.to_string();
+        }
+        if let Some(est) = estimado_seg {
+            tarea.estimado_seg = Some(est);
+        }
+        self.tarea_guardar(&tarea).await?;
+        Ok(Some(tarea))
+    }
+
+    async fn tarea_estado(
+        &self,
+        tarea_id: &str,
+        estado: EstadoTarea,
+        motivo: Option<&str>,
+        ahora: &str,
+    ) -> anyhow::Result<Option<Tarea>> {
+        let Some(mut tarea) = self.tarea_obtener(tarea_id).await? else {
+            return Ok(None);
+        };
+        // Transición inválida: devuelve la tarea sin cambios (el handler decide el código). El
+        // store nunca aplica una transición prohibida.
+        if !transicion_valida(tarea.estado, estado) {
+            return Ok(Some(tarea));
+        }
+        aplicar_transicion_tarea(&mut tarea, estado, motivo, ahora);
+        self.tarea_guardar(&tarea).await?;
+        Ok(Some(tarea))
+    }
+
+    async fn tarea_reportar(&self, tarea_id: &str, texto: &str, ahora: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn().await?;
+        // Historial local del report (R9/AC5): el detalle de la TUI no depende de GitHub.
+        let _: () = conn
+            .rpush(k_reportes(tarea_id), format!("{ahora} — {texto}"))
+            .await?;
+        Ok(())
+    }
+
+    async fn tarea_reportes(&self, tarea_id: &str) -> anyhow::Result<Vec<String>> {
+        let mut conn = self.conn().await?;
+        let reportes: Vec<String> = conn.lrange(k_reportes(tarea_id), 0, -1).await?;
+        Ok(reportes)
+    }
+
     async fn factor_estimacion(&self) -> anyhow::Result<FactorEstimacion> {
         let mut conn = self.conn().await?;
         let clave = k_factor();
@@ -658,6 +716,34 @@ impl Almacen for AlmacenRedis {
             }
         }
         Ok(out)
+    }
+}
+
+/// Aplica una transición de estado YA validada sobre una `Tarea` en memoria (R5/AC2). Centraliza
+/// las reglas de timbrado para que Redis y SQLite no las dupliquen divergiendo:
+///   - `Hecha` sin `fin` previo → timbra `fin = ahora` y mide `duracion_seg = ahora - inicio`
+///     (el real lo pone SIEMPRE el broker vía `ahora`). El aprendizaje del factor lo hace el
+///     handler, no el store, y SOLO en `Hecha`.
+///   - `Bloqueada` → guarda `bloqueo_motivo = motivo`.
+///   - cualquier otro estado → solo cambia `estado`.
+pub(crate) fn aplicar_transicion_tarea(
+    tarea: &mut Tarea,
+    estado: EstadoTarea,
+    motivo: Option<&str>,
+    ahora: &str,
+) {
+    tarea.estado = estado;
+    match estado {
+        EstadoTarea::Hecha => {
+            if tarea.fin.is_none() {
+                tarea.fin = Some(ahora.to_string());
+                tarea.duracion_seg = Some(crate::jornada::diferencia_seg(&tarea.inicio, ahora));
+            }
+        }
+        EstadoTarea::Bloqueada => {
+            tarea.bloqueo_motivo = motivo.map(|m| m.to_string());
+        }
+        _ => {}
     }
 }
 

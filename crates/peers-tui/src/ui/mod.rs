@@ -110,7 +110,9 @@ fn dibujar_ayuda(f: &mut Frame, area: Rect, app: &App) {
         Pantalla::Config => "e editar campo activo · ↑↓ campo · s guardar",
         Pantalla::Trazabilidad => "[ ] cambiar peer · ↑↓ mover · Enter timeline · r reenviar",
         Pantalla::Jornada => "[ ] cambiar peer · (solo lectura — fichaje)",
-        Pantalla::Tareas => "[ ] cambiar peer · ↑↓ mover · (estimado vs real)",
+        Pantalla::Tareas => {
+            "[ ] peer · ↑↓ · Enter detalle · e editar · + ampliar · f forzar · n nueva · a reasignar · b/h/c bloq/hecha/cancel · R reabrir"
+        }
         Pantalla::Alertas => "↑↓ mover · (solo lectura)",
     };
     let linea = Line::from(vec![

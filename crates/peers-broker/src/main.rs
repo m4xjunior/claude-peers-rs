@@ -28,13 +28,15 @@ use axum::{
 use clap::Parser;
 use github::GitHub;
 use peers_core::{
-    corregir_estimado, supera_umbral, Alerta, Almacen, ColaResumen, EstadoMensaje,
-    FactorEstimacion, Mensaje, PeticionAbrirTarea, PeticionCerrarTarea, PeticionConfirmar,
-    PeticionDefinirResumen, PeticionEnviar, PeticionHistorial, PeticionJornada, PeticionLatido,
-    PeticionListar, PeticionPurgar, PeticionRecibir, PeticionRegistrar, PeticionReenviar,
-    PeticionReportarTarea, PeticionSalir, RespuestaAbrirTarea, RespuestaAdminInfo,
-    RespuestaAdminRedis, RespuestaEnviar, RespuestaJornada, RespuestaOk, RespuestaRegistrar,
-    RespuestaSalud, Tarea, TipoAlerta, PUERTO_DEFECTO, VENCIMIENTO_MS,
+    corregir_estimado, supera_umbral, Alerta, Almacen, ColaResumen, EstadoMensaje, EstadoTarea,
+    FactorEstimacion, Mensaje, PeticionAbrirTarea, PeticionAsignarTarea, PeticionCerrarTarea,
+    PeticionConfirmar, PeticionDefinirResumen, PeticionEditarTarea, PeticionEnviar,
+    PeticionEstadoTarea, PeticionForzarTarea, PeticionHistorial, PeticionJornada, PeticionLatido,
+    PeticionListar, PeticionPurgar, PeticionReasignarTarea, PeticionRecibir, PeticionRegistrar,
+    PeticionReenviar, PeticionReportarTarea, PeticionReportesTarea, PeticionSalir,
+    RespuestaAbrirTarea, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar,
+    RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, TipoAlerta,
+    PUERTO_DEFECTO, VENCIMIENTO_MS,
 };
 use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -440,7 +442,11 @@ async fn tarea_reportar(
     State(e): State<Estado>,
     Json(p): Json<PeticionReportarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
-    // Si la tarea tiene issue y hay GitHub, comenta. Degrada si falla.
+    // Persiste el report en el historial local SIEMPRE (R9/AC5): el detalle de la TUI lo lee de
+    // aquí, no de GitHub. El reloj lo pone el broker.
+    let ahora = ahora_iso();
+    e.almacen.tarea_reportar(&p.tarea_id, &p.texto, &ahora).await?;
+    // Si la tarea tiene issue y hay GitHub, comenta también. Degrada si falla.
     if let Some(gh) = &e.github {
         if let Some(tarea) = e.almacen.tarea_obtener(&p.tarea_id).await? {
             if let Some(n) = tarea.issue_number {
@@ -548,6 +554,227 @@ async fn cerrar_tarea(
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     cerrar_tarea_y_aprender(&e, &p.tarea_id, &ahora_iso()).await?;
     Ok(Json(RespuestaOk { ok: true }))
+}
+
+// --- Handlers de gestión interactiva de tareas (R4–R9): el jefe (TUI) dirige a sus peers ---
+//
+// Cuelgan de `rutas_protegidas` (token). Reusan lo existente: `tarea_editar`/`tarea_estado`/
+// `tarea_obtener`/`tarea_guardar` del almacén, `abrir_tarea_con_estimado` (= /crear-tarea),
+// `encolar_mensaje` (= /enviar) y `cerrar_tarea_y_aprender` (aprendizaje del factor). Nunca
+// reinventan. Degradan: notificaciones best-effort (warn + sigue), 404 si la tarea no existe.
+
+/// Formatea segundos a "~XhYY" / "~XXm" / "~XXs" para los textos de notificación. Solo presentación.
+fn humanizar_estimado(seg: i64) -> String {
+    if seg <= 0 {
+        return "sin estimar".to_string();
+    }
+    let h = seg / 3600;
+    let m = (seg % 3600) / 60;
+    if h > 0 {
+        format!("~{h}h{m:02}")
+    } else if m > 0 {
+        format!("~{m}m")
+    } else {
+        format!("~{seg}s")
+    }
+}
+
+/// `POST /tarea/editar` { tarea_id, descripcion?, estimado_seg? } → edita metadatos (R4/AC1).
+/// Parche parcial: `None` no toca el campo. 404 si la tarea no existe. NO toca estado/tiempos/factor.
+async fn tarea_editar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionEditarTarea>,
+) -> Result<Json<Tarea>, ErrorApp> {
+    match e
+        .almacen
+        .tarea_editar(&p.tarea_id, p.descripcion.as_deref(), p.estimado_seg)
+        .await?
+    {
+        Some(tarea) => Ok(Json(tarea)),
+        None => Err(ErrorApp(anyhow::anyhow!(
+            "la tarea '{}' no existe",
+            p.tarea_id
+        ))),
+    }
+}
+
+/// `POST /tarea/estado` { tarea_id, estado, motivo? } → transiciona (R5/AC2). El store valida
+/// con `transicion_valida` y timbra (Hecha → mide real con el reloj del broker; Bloqueada → motivo).
+/// SOLO al pasar a `Hecha` con estimado+real válidos se aprende el factor (Cancelada/otros NO lo
+/// contaminan): reusa la misma lógica de `cerrar_tarea_y_aprender`. Responde la tarea ya actualizada.
+async fn tarea_estado(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionEstadoTarea>,
+) -> Result<Json<Tarea>, ErrorApp> {
+    let ahora = ahora_iso();
+    let Some(tarea) = e
+        .almacen
+        .tarea_estado(&p.tarea_id, p.estado, p.motivo.as_deref(), &ahora)
+        .await?
+    else {
+        return Err(ErrorApp(anyhow::anyhow!(
+            "la tarea '{}' no existe",
+            p.tarea_id
+        )));
+    };
+
+    // Aprendizaje del factor: SOLO en Hecha, con estimado presente y real > 0 (R3/R5/AC2). El
+    // real lo timbró el broker en `tarea_estado` (regla sagrada): aquí se lee de la tarea, nunca
+    // del cliente. Cancelada/Bloqueada/etc. NO tocan el factor.
+    if p.estado == EstadoTarea::Hecha {
+        if let (Some(estimado), Some(real)) = (tarea.estimado_seg, tarea.duracion_seg) {
+            if estimado > 0 && real > 0 {
+                let ratio = estimado as f64 / real as f64;
+                match e.almacen.actualizar_factor(ratio, &ahora).await {
+                    Ok(f) => info!(
+                        "factor aprendido (tarea→Hecha): tarea {} ratio {:.2} → factor {:.2} ({} muestras)",
+                        p.tarea_id, ratio, f.factor, f.muestras
+                    ),
+                    // Degradación: si el aprendizaje falla, la tarea queda Hecha igual.
+                    Err(err) => warn!("no se pudo actualizar el factor (tarea Hecha igual): {err:#}"),
+                }
+            }
+        }
+        // Cierra la issue espejo en GitHub si procede (best-effort, igual que /cerrar-tarea).
+        if let Some(gh) = &e.github {
+            if let Some(n) = tarea.issue_number {
+                if let Some((owner, repo)) = repo_de_instancia(&e, &tarea.instancia_id).await {
+                    let cierre = format!(
+                        "Tarea marcada Hecha. Duración medida por el broker: {}s.",
+                        tarea.duracion_seg.unwrap_or(0)
+                    );
+                    if let Err(err) = gh.cerrar_issue(&owner, &repo, n, Some(&cierre)).await {
+                        warn!("GitHub no cerró la issue (no crítico): {err:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(tarea))
+}
+
+/// `POST /tarea/asignar` { instancia_id, descripcion, estimado_seg? } → crea una tarea asignada
+/// a un peer (reusa `abrir_tarea_con_estimado`, igual que /crear-tarea) Y le notifica por canal
+/// (R6/AC4). Responde `{ tarea_id }`. La notificación es best-effort: si el peer no existe, la
+/// tarea ya quedó creada (la verá al listar) — degradación graciosa.
+async fn tarea_asignar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionAsignarTarea>,
+) -> Result<Json<serde_json::Value>, ErrorApp> {
+    let ahora = ahora_iso();
+    let peticion = PeticionAbrirTarea {
+        instancia_id: p.instancia_id.clone(),
+        descripcion: p.descripcion.clone(),
+        area: None,
+        estimado_seg: p.estimado_seg,
+    };
+    let (tarea, _issue) = abrir_tarea_con_estimado(&e, &peticion, &ahora).await?;
+
+    // Notifica al peer dueño (el "de_id" es el broker/jefe). best-effort: si no existe, warn.
+    let texto = format!(
+        "📋 Nueva tarea asignada: {} (estimado {})",
+        p.descripcion,
+        humanizar_estimado(p.estimado_seg.unwrap_or(0))
+    );
+    if e.almacen.instancia_existe(&p.instancia_id).await? {
+        if let Err(err) = e
+            .almacen
+            .encolar_mensaje("broker", &p.instancia_id, &texto, &ahora)
+            .await
+        {
+            warn!("no se pudo notificar la tarea asignada a '{}': {err:#}", p.instancia_id);
+        }
+    } else {
+        warn!(
+            "tarea asignada a '{}' creada, pero el peer no está vivo: no se notifica (la verá al listar)",
+            p.instancia_id
+        );
+    }
+
+    info!("tarea {} asignada a '{}'", tarea.id, p.instancia_id);
+    Ok(Json(serde_json::json!({ "ok": true, "tarea_id": tarea.id })))
+}
+
+/// `POST /tarea/reasignar` { tarea_id, nuevo_instancia_id } → cambia el dueño de la tarea y
+/// notifica al nuevo (R7/AC4). `tarea_editar` no cubre el dueño, así que reusa
+/// `tarea_obtener` + `tarea_guardar` con el nuevo `instancia_id`. 404 si la tarea no existe.
+async fn tarea_reasignar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionReasignarTarea>,
+) -> Result<Json<Tarea>, ErrorApp> {
+    let ahora = ahora_iso();
+    let Some(mut tarea) = e.almacen.tarea_obtener(&p.tarea_id).await? else {
+        return Err(ErrorApp(anyhow::anyhow!(
+            "la tarea '{}' no existe",
+            p.tarea_id
+        )));
+    };
+    let dueno_anterior = tarea.instancia_id.clone();
+    tarea.instancia_id = p.nuevo_instancia_id.clone();
+    e.almacen.tarea_guardar(&tarea).await?;
+
+    // Notifica al nuevo dueño (best-effort). El de_id es el broker/jefe.
+    let texto = format!("📋 Tarea reasignada a ti: {}", tarea.descripcion);
+    if e.almacen.instancia_existe(&p.nuevo_instancia_id).await? {
+        if let Err(err) = e
+            .almacen
+            .encolar_mensaje("broker", &p.nuevo_instancia_id, &texto, &ahora)
+            .await
+        {
+            warn!("no se pudo notificar la reasignación a '{}': {err:#}", p.nuevo_instancia_id);
+        }
+    } else {
+        warn!(
+            "tarea {} reasignada a '{}', pero el peer no está vivo: no se notifica",
+            tarea.id, p.nuevo_instancia_id
+        );
+    }
+
+    info!(
+        "tarea {} reasignada: '{}' → '{}'",
+        tarea.id, dueno_anterior, p.nuevo_instancia_id
+    );
+    Ok(Json(tarea))
+}
+
+/// `POST /tarea/forzar` { tarea_id } → "tócale el hombro" (R8/AC3): empuja un recordatorio de
+/// la tarea a la sesión del peer dueño (reusa `encolar_mensaje`, igual que /enviar). 404 si la
+/// tarea no existe. La entrega es best-effort: si el peer no está vivo, warn (sin crash).
+async fn tarea_forzar(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionForzarTarea>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    let ahora = ahora_iso();
+    let Some(tarea) = e.almacen.tarea_obtener(&p.tarea_id).await? else {
+        return Err(ErrorApp(anyhow::anyhow!(
+            "la tarea '{}' no existe",
+            p.tarea_id
+        )));
+    };
+    let texto = format!("⏰ Recordatorio de tu tarea: {}", tarea.descripcion);
+    if e.almacen.instancia_existe(&tarea.instancia_id).await? {
+        e.almacen
+            .encolar_mensaje("broker", &tarea.instancia_id, &texto, &ahora)
+            .await?;
+        info!("tarea {} forzada al peer '{}'", tarea.id, tarea.instancia_id);
+        Ok(Json(RespuestaOk { ok: true }))
+    } else {
+        warn!(
+            "no se pudo forzar la tarea {}: el peer dueño '{}' no está vivo",
+            tarea.id, tarea.instancia_id
+        );
+        Ok(Json(RespuestaOk { ok: false }))
+    }
+}
+
+/// `GET /tarea/reportes?tarea_id=` → historial de reportes de progreso de la tarea (R9/AC5).
+/// Lo consume el modal DETALLE de la TUI. SOLO LECTURA. Vacío si no hay reportes.
+async fn tarea_reportes(
+    State(e): State<Estado>,
+    axum::extract::Query(p): axum::extract::Query<PeticionReportesTarea>,
+) -> Result<Json<Vec<String>>, ErrorApp> {
+    Ok(Json(e.almacen.tarea_reportes(&p.tarea_id).await?))
 }
 
 /// `POST /listar-tareas` { instancia_id } → las tareas de la jornada de esa instancia (R10).
@@ -955,6 +1182,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/tarea/abrir", post(tarea_abrir))
         .route("/tarea/reportar", post(tarea_reportar))
         .route("/tarea/cerrar", post(tarea_cerrar))
+        // Gestión interactiva de tareas (R4–R9): el jefe (TUI) dirige a sus peers.
+        .route("/tarea/editar", post(tarea_editar))
+        .route("/tarea/estado", post(tarea_estado))
+        .route("/tarea/asignar", post(tarea_asignar))
+        .route("/tarea/reasignar", post(tarea_reasignar))
+        .route("/tarea/forzar", post(tarea_forzar))
+        .route("/tarea/reportes", get(tarea_reportes))
         .route("/jornada", post(jornada_consolidada))
         // Tareas autogestionadas + aprendizaje (las que usan las tools MCP del peers-client).
         .route("/crear-tarea", post(crear_tarea))

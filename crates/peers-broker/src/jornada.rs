@@ -58,6 +58,9 @@ pub async fn abrir_tarea(
         // El estimado lo wirea el handler /crear-tarea (Fase 3); aquí queda neutro para no
         // alterar el comportamiento del fichaje existente.
         estimado_seg: None,
+        // Una tarea recién abierta nace Abierta y sin motivo de bloqueo (R2).
+        estado: peers_core::EstadoTarea::Abierta,
+        bloqueo_motivo: None,
     };
     almacen.tarea_guardar(&tarea).await?;
     Ok(tarea)

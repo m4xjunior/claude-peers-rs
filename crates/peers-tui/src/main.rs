@@ -20,6 +20,7 @@ use anyhow::Result;
 use app::{App, Input, Pantalla};
 use cliente::ClienteAdmin;
 use config::Config;
+use peers_core::EstadoTarea;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -311,6 +312,22 @@ async fn manejar_tecla(
         return;
     }
 
+    // Con el modal DETALLE de tarea abierto: Esc/Enter/q lo cierran; las teclas de acción
+    // (e/+/f/b/h/c/R) operan sobre la tarea del modal sin cerrarlo (salvo las que cambian de
+    // contexto). El resto se ignora — no se navega ni se sale de la app por accidente.
+    if app.pantalla == Pantalla::Tareas && app.tarea_detalle.is_some() {
+        match tecla.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.cerrar_detalle_tarea(),
+            KeyCode::Char('e') | KeyCode::Char('+') | KeyCode::Char('f')
+            | KeyCode::Char('b') | KeyCode::Char('h') | KeyCode::Char('c')
+            | KeyCode::Char('R') => {
+                accion_tarea(tecla, cliente, app, flash_desde).await;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match tecla.code {
         KeyCode::Char('q') | KeyCode::Esc => app.salir = true,
         KeyCode::Tab => {
@@ -380,7 +397,7 @@ async fn manejar_tecla(
 /// para no crear estados ambiguos. El cuerpo siempre arranca en y=4 (3 filas de tabs + 1 banner).
 fn manejar_mouse(evento: MouseEvent, app: &mut App) {
     // Con un input/modal abierto, el mouse no actúa (la edición es solo-teclado).
-    if app.input.esta_activo() || app.traza_timeline {
+    if app.input.esta_activo() || app.traza_timeline || app.tarea_detalle.is_some() {
         return;
     }
 
@@ -497,7 +514,162 @@ async fn manejar_accion(
         (Pantalla::Trazabilidad, KeyCode::Char('r')) => {
             reenviar_seleccionado(cliente, app, flash_desde).await;
         }
+        // --- Tareas ---
+        (Pantalla::Tareas, KeyCode::Enter) => {
+            // Abre el modal DETALLE de la tarea seleccionada y carga sus reportes (AC5).
+            abrir_detalle_tarea(cliente, app).await;
+        }
+        (Pantalla::Tareas, KeyCode::Char('n')) => {
+            // Nueva tarea asignada al PEER ENFOCADO (el de [ ]); arranca el input de descripción.
+            if let Some(id) = app.traza_peer_actual() {
+                app.abrir_input(Input::TareaNuevaDescripcion { instancia_id: id }, String::new());
+            }
+        }
+        (Pantalla::Tareas, KeyCode::Char('a')) => {
+            // Reasigna la tarea seleccionada al siguiente peer (cicla el destino con cada 'a').
+            reasignar_tarea(cliente, app, flash_desde).await;
+        }
+        (
+            Pantalla::Tareas,
+            KeyCode::Char('e') | KeyCode::Char('+') | KeyCode::Char('f') | KeyCode::Char('b')
+            | KeyCode::Char('h') | KeyCode::Char('c') | KeyCode::Char('R'),
+        ) => {
+            accion_tarea(tecla, cliente, app, flash_desde).await;
+        }
         _ => {}
+    }
+}
+
+/// Abre el modal DETALLE de la tarea seleccionada y carga sus reportes desde el broker.
+/// Si la carga de reportes falla (offline/401), el modal igual se abre con la lista vacía y el
+/// banner refleja el error — degradación graciosa (R13/AC7).
+async fn abrir_detalle_tarea(cliente: &ClienteAdmin, app: &mut App) {
+    let Some(tarea) = app.tarea_seleccionada().cloned() else {
+        return;
+    };
+    let r = cliente.tarea_reportes(&tarea.id).await;
+    app.marcar_resultado(&r);
+    app.tarea_reportes = r.unwrap_or_default();
+    app.tarea_detalle = Some(tarea);
+}
+
+/// Despacha las acciones que operan sobre la TAREA OBJETIVO (la del modal si está abierto, o la
+/// seleccionada en la tabla si no). Centraliza editar/ampliar/forzar/estado para que funcionen
+/// igual desde la tabla y desde el modal. Todas degradan offline/401 vía `marcar_resultado`.
+async fn accion_tarea(
+    tecla: KeyEvent,
+    cliente: &ClienteAdmin,
+    app: &mut App,
+    flash_desde: &mut Option<Instant>,
+) {
+    // La tarea objetivo: la del modal (copia) tiene prioridad; si no, la fila seleccionada.
+    let Some(tarea) = app
+        .tarea_detalle
+        .clone()
+        .or_else(|| app.tarea_seleccionada().cloned())
+    else {
+        return;
+    };
+
+    match tecla.code {
+        KeyCode::Char('e') => {
+            // Editar: paso 1/2 = descripción (precargada con la actual).
+            app.abrir_input(
+                Input::TareaEditarDescripcion { tarea_id: tarea.id.clone() },
+                tarea.descripcion.clone(),
+            );
+        }
+        KeyCode::Char('+') => {
+            // Ampliar estimado: input de minutos a SUMAR; el handler lee el estimado vigente.
+            app.abrir_input(
+                Input::TareaAmpliarEstimado {
+                    tarea_id: tarea.id.clone(),
+                    estimado_actual_seg: tarea.estimado_seg.unwrap_or(0),
+                },
+                String::new(),
+            );
+        }
+        KeyCode::Char('f') => {
+            // Forzar: "tócale el hombro". ok=false si el peer no está vivo (no es error).
+            let r = cliente.tarea_forzar(&tarea.id).await;
+            app.marcar_resultado(&r);
+            match r {
+                Ok(resp) if resp.ok => {
+                    poner_flash(app, flash_desde, format!("recordatorio enviado a '{}'", tarea.instancia_id));
+                }
+                Ok(_) => {
+                    poner_flash(app, flash_desde, format!("'{}' no está vivo: no se pudo forzar", tarea.instancia_id));
+                }
+                Err(_) => {}
+            }
+        }
+        KeyCode::Char('b') => {
+            // Bloquear: pide el motivo (input). El cambio de estado se hace al confirmar.
+            app.abrir_input(Input::TareaBloquear { tarea_id: tarea.id.clone() }, String::new());
+        }
+        KeyCode::Char('h') => {
+            cambiar_estado_tarea(cliente, app, flash_desde, &tarea.id, EstadoTarea::Hecha, None).await;
+        }
+        KeyCode::Char('c') => {
+            cambiar_estado_tarea(cliente, app, flash_desde, &tarea.id, EstadoTarea::Cancelada, None).await;
+        }
+        KeyCode::Char('R') => {
+            // Reabrir = volver a Abierta (el broker valida la transición).
+            cambiar_estado_tarea(cliente, app, flash_desde, &tarea.id, EstadoTarea::Abierta, None).await;
+        }
+        _ => {}
+    }
+}
+
+/// Aplica una transición de estado vía `POST /tarea/estado` y refleja el resultado. Si el modal
+/// detalle está abierto sobre esta tarea, lo actualiza con la `Tarea` devuelta (estado/motivo
+/// frescos) para que el cambio se vea al instante sin esperar al refresco. AC2.
+async fn cambiar_estado_tarea(
+    cliente: &ClienteAdmin,
+    app: &mut App,
+    flash_desde: &mut Option<Instant>,
+    tarea_id: &str,
+    estado: EstadoTarea,
+    motivo: Option<String>,
+) {
+    let r = cliente.tarea_estado(tarea_id, estado, motivo).await;
+    app.marcar_resultado(&r);
+    if let Ok(tarea) = r {
+        let etiqueta = app::etiqueta_estado_tarea(estado);
+        poner_flash(app, flash_desde, format!("tarea → {etiqueta}"));
+        // Si el modal mira esta tarea, refréscalo con el estado nuevo.
+        if app.tarea_detalle.as_ref().map(|t| t.id == tarea.id).unwrap_or(false) {
+            app.tarea_detalle = Some(tarea);
+        }
+    }
+}
+
+/// Reasigna la tarea seleccionada al SIGUIENTE peer de la lista (cicla con cada 'a'). El destino
+/// arranca tras el dueño actual y se mantiene en `reasignar_destino`. Notifica al nuevo dueño
+/// (lo hace el broker). Si no hay otro peer al que reasignar, no hace nada.
+async fn reasignar_tarea(cliente: &ClienteAdmin, app: &mut App, flash_desde: &mut Option<Instant>) {
+    let Some(tarea) = app.tarea_seleccionada().cloned() else {
+        return;
+    };
+    let peers = &app.datos.peers;
+    if peers.is_empty() {
+        return;
+    }
+    // Cicla el destino y evita reasignar al mismo dueño actual (salta una posición si coincide).
+    app.reasignar_destino = (app.reasignar_destino + 1) % peers.len();
+    let mut idx = app.reasignar_destino;
+    if peers[idx].id == tarea.instancia_id && peers.len() > 1 {
+        idx = (idx + 1) % peers.len();
+        app.reasignar_destino = idx;
+    }
+    let nuevo = peers[idx].id.clone();
+    if nuevo == tarea.instancia_id {
+        return; // único peer y es el dueño: nada que hacer.
+    }
+    let r = cliente.tarea_reasignar(&tarea.id, &nuevo).await;
+    app.marcar_resultado(&r);
+    if r.is_ok() {
+        poner_flash(app, flash_desde, format!("tarea reasignada a '{nuevo}'"));
     }
 }
 
@@ -585,7 +757,84 @@ async fn confirmar_input(cliente: &ClienteAdmin, app: &mut App, flash_desde: &mu
                 app.config.refresh_ms = ms.max(100);
             }
         }
+        // --- Tareas: editar descripción (paso 1/2) → encadena el estimado (paso 2/2) ---
+        Input::TareaEditarDescripcion { tarea_id } => {
+            let desc = valor.trim().to_string();
+            // Encadena el segundo paso: el estimado. Si la descripción quedó vacía, igual la
+            // mandamos como `None` más abajo (no se toca). El estimado se precarga vacío.
+            app.abrir_input(
+                Input::TareaEditarEstimado { tarea_id, descripcion: desc },
+                String::new(),
+            );
+        }
+        // --- Tareas: editar estimado (paso 2/2) → manda /tarea/editar con ambos campos ---
+        Input::TareaEditarEstimado { tarea_id, descripcion } => {
+            let descripcion = if descripcion.is_empty() { None } else { Some(descripcion) };
+            let estimado_seg = minutos_a_segundos(&valor);
+            // Si ambos son None, no hay nada que editar.
+            if descripcion.is_some() || estimado_seg.is_some() {
+                let r = cliente.tarea_editar(&tarea_id, descripcion, estimado_seg).await;
+                app.marcar_resultado(&r);
+                if let Ok(t) = r {
+                    sincronizar_detalle(app, t);
+                    poner_flash(app, flash_desde, "tarea editada".to_string());
+                }
+            }
+        }
+        // --- Tareas: ampliar estimado (suma minutos al estimado vigente) ---
+        Input::TareaAmpliarEstimado { tarea_id, estimado_actual_seg } => {
+            if let Some(extra) = minutos_a_segundos(&valor) {
+                let nuevo = estimado_actual_seg.saturating_add(extra);
+                let r = cliente.tarea_editar(&tarea_id, None, Some(nuevo)).await;
+                app.marcar_resultado(&r);
+                if let Ok(t) = r {
+                    sincronizar_detalle(app, t);
+                    poner_flash(app, flash_desde, "estimado ampliado".to_string());
+                }
+            }
+        }
+        // --- Tareas: bloquear con motivo ---
+        Input::TareaBloquear { tarea_id } => {
+            let motivo = if valor.trim().is_empty() { None } else { Some(valor.trim().to_string()) };
+            cambiar_estado_tarea(cliente, app, flash_desde, &tarea_id, EstadoTarea::Bloqueada, motivo).await;
+        }
+        // --- Tareas: nueva (paso 1/2) → encadena el estimado (paso 2/2) ---
+        Input::TareaNuevaDescripcion { instancia_id } => {
+            let desc = valor.trim().to_string();
+            if !desc.is_empty() {
+                app.abrir_input(
+                    Input::TareaNuevaEstimado { instancia_id, descripcion: desc },
+                    String::new(),
+                );
+            }
+        }
+        // --- Tareas: nueva (paso 2/2) → manda /tarea/asignar ---
+        Input::TareaNuevaEstimado { instancia_id, descripcion } => {
+            let estimado_seg = minutos_a_segundos(&valor);
+            let r = cliente.tarea_asignar(&instancia_id, &descripcion, estimado_seg).await;
+            app.marcar_resultado(&r);
+            if let Ok(resp) = r {
+                let id = resp.tarea_id.unwrap_or_default();
+                let sufijo = if id.is_empty() { String::new() } else { format!(" (#{id})") };
+                let estado = if resp.ok { "asignada" } else { "creada" };
+                poner_flash(app, flash_desde, format!("tarea {estado} a '{instancia_id}'{sufijo}"));
+            }
+        }
         Input::Ninguno => {}
+    }
+}
+
+/// Parsea minutos (texto del input) a segundos. Vacío o inválido → `None` (no toca el campo).
+/// Acepta enteros positivos; negativos/no-numéricos se descartan en silencio (sin crash).
+fn minutos_a_segundos(valor: &str) -> Option<i64> {
+    valor.trim().parse::<i64>().ok().filter(|m| *m >= 0).map(|m| m * 60)
+}
+
+/// Si el modal DETALLE está abierto sobre la tarea `t`, lo actualiza con la versión fresca
+/// (descripción/estimado recién editados) para que el cambio se vea al instante.
+fn sincronizar_detalle(app: &mut App, t: peers_core::Tarea) {
+    if app.tarea_detalle.as_ref().map(|d| d.id == t.id).unwrap_or(false) {
+        app.tarea_detalle = Some(t);
     }
 }
 

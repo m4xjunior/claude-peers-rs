@@ -180,6 +180,8 @@ async fn redis_jornada_timbrada() {
         duracion_seg: None,
         issue_number: None,
         estimado_seg: None,
+        estado: peers_core::EstadoTarea::Abierta,
+        bloqueo_motivo: None,
     };
     alm.tarea_guardar(&t).await.unwrap();
     // Cierre timbrado 90s después.

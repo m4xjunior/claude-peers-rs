@@ -1,0 +1,125 @@
+{
+  "resumen": "Sintetizados los 28 hallazgos de las 4 lentes en 15 edge cases deduplicados y priorizados. El núcleo es un cluster de 4 P0-bug que se refuerzan entre sí y envenenan EXACTAMENTE lo que el proyecto promete (matar la alucinación de estimación): (1) dos caminos de cierre con semánticas OPUESTAS — jornada::cerrar_tarea (jornada.rs:80-81, vía MCP /cerrar-tarea) reescribe fin/duracion SIEMPRE, mientras aplicar_transicion_tarea (store.rs:738, vía TUI tarea_estado→Hecha) respeta fin.is_none(); (2) reabrir Hecha→Abierta (transicion_valida lib.rs:300) NO limpia fin/duracion_seg; (3) el aprendizaje del factor (main.rs:479 y 624) NO es idempotente — no hay flag factor_aprendido por tarea_id, así que reabrir+recerrar o cerrar dos veces alimenta la EMA con el mismo o un ratio inflado y duplica el contador 'muestras' (falsa confianza estadística); (4) la TUI no cablea ninguna acción de gestión al teclado ni pinta el estado real del ciclo de vida (EstadoTarea existe pero ui/tareas.rs solo deriva abierta/fin). VERIFICADO sobre el repo en HEAD: el bug de unidad minutos/segundos de la lente datos-concurrencia YA está resuelto en el código actual — peers-tui compila (cargo build OK), minutos_a_segundos aplica ×60 (main.rs:830) y los brazos de match Input::Tarea* están cableados (main.rs:771-814). Lo incluyo igual por pedido explícito, reformulado al riesgo VIVO: crear_tarea por MCP recibe estimado_seg crudo del peer (mcp.rs:174, 'en segundos') sin validación de rango, y una IA que confunda min↔seg mete ratios 60× — el clamp FACTOR_MAX=50 solo tapa parcialmente. El segundo cluster (P1) son las fugas de honestidad del factor: cierre sin prueba de trabajo, cierre instantáneo (real=2s → ratio→techo), peer juez de su propio estimado, cancelación masiva como vía de escape, y factor GLOBAL (no por peer) que mezcla la honestidad de todos. Tercer cluster: integridad referencial (reasignar no quita el id de la lista vieja, IDs por timestamp colisionables, huérfanas de peer muerto, sin purga/retención de tareas). El bug de unidad y los 4 P0 deben ir primero; los P1 de honestidad son lo que diferencia 'un cronómetro' de 'un sistema que mata la alucinación'.",
+  "top15": [
+    {
+      "n": 1,
+      "titulo": "Dos caminos de cierre con semánticas OPUESTAS (MCP reescribe siempre, TUI respeta fin.is_none)",
+      "que_falta": "jornada::cerrar_tarea (jornada.rs:80-81), usada por la tool MCP cerrar_tarea y por cerrar_tarea_y_aprender (main.rs:473), reescribe fin=ahora y duracion_seg=ahora-inicio INCONDICIONALMENTE. En cambio aplicar_transicion_tarea (store.rs:738), usada por la TUI vía tarea_estado→Hecha, solo timbra si tarea.fin.is_none(). Coexisten dos puertas al mismo estado terminal con reglas contrarias. Un peer que reintenta cerrar_tarea (no vio el ACK), o que cierra una tarea ya cerrada por la TUI, RE-mide una duración que ahora incluye todo el tiempo que estuvo cerrada y vuelve a aprender el factor con un ratio inflado y falso.",
+      "fix": "Unificar las dos vías en una sola función idempotente: jornada::cerrar_tarea debe consultar el estado/fin actual y NO re-timbrar si la tarea ya está en terminal (fin.is_some() o estado Hecha/Cancelada) — devolver la tarea ya cerrada sin tocar duracion ni re-aprender. Hacer que cerrar_tarea_y_aprender delegue en aplicar_transicion_tarea (estado→Hecha) en vez de tener su propia lógica de timbrado, de modo que exista UN solo punto que mide y aprende.",
+      "prioridad": "P0-bug",
+      "esfuerzo": "medio"
+    },
+    {
+      "n": 2,
+      "titulo": "Reabrir Hecha→Abierta no limpia fin/duracion_seg → el segundo cierre ignora el tiempo real",
+      "que_falta": "transicion_valida permite Hecha→Abierta (lib.rs:300, REABRIR), pero aplicar_transicion_tarea (store.rs:735) solo cambia tarea.estado: NO resetea fin ni duracion_seg al volver de un terminal a Abierta. La tarea reabierta arrastra fin='ayer' y duracion_seg=3600 de la vida anterior. Al re-cerrarla por la TUI, como fin.is_none() es FALSE, no re-timbra nada: las horas del segundo ciclo desaparecen. El tiempo medido por el broker (regla sagrada del proyecto) miente.",
+      "fix": "En aplicar_transicion_tarea, en el brazo de transición a Abierta desde un estado terminal (Hecha/Cancelada/Bloqueada → Abierta), limpiar tarea.fin=None, tarea.duracion_seg=None y re-timbrar tarea.inicio=ahora (la nueva vida empieza ahora). Así el siguiente cierre vuelve a medir desde cero.",
+      "prioridad": "P0-bug",
+      "esfuerzo": "bajo"
+    },
+    {
+      "n": 3,
+      "titulo": "Aprendizaje del factor NO idempotente: reabrir+recerrar o doble cierre alimenta la EMA con el mismo dato",
+      "que_falta": "Tanto cerrar_tarea_y_aprender (main.rs:479) como tarea_estado→Hecha (main.rs:624) llaman actualizar_factor cada vez que se llega a Hecha con estimado>0 y real>0, sin marcar que esa tarea_id ya contribuyó. No hay flag factor_aprendido: bool en Tarea. Reabrir Hecha→Abierta→Hecha (o dos cerrar_tarea) mete el MISMO ratio en la media móvil exponencial otra vez e incrementa 'muestras' por tareas que no existen. El factor que 'mata la alucinación de estimación' queda sesgado y 'muestras' da falsa confianza estadística (Max confía más cuanto mayor es muestras).",
+      "fix": "Añadir campo factor_aprendido: bool (#[serde(default)]) a Tarea. En ambos puntos de aprendizaje: solo aprender si !tarea.factor_aprendido; al aprender, setearlo a true y persistirlo en el mismo tarea_guardar de forma atómica. Reabrir a Abierta NO lo resetea (el trabajo ya contó una vez) — o, si se decide que el segundo ciclo es trabajo nuevo legítimo, resetearlo SOLO junto con el reseteo de inicio/fin del item 2.",
+      "prioridad": "P0-bug",
+      "esfuerzo": "medio"
+    },
+    {
+      "n": 4,
+      "titulo": "Confusión de unidad minutos↔segundos: crear_tarea por MCP acepta estimado_seg crudo sin validar rango",
+      "que_falta": "VERIFICADO en HEAD: el bug original de la TUI (no compilaba, faltaba ×60) YA está resuelto — peers-tui compila, minutos_a_segundos aplica ×60 (main.rs:830) y los brazos Input::Tarea* están cableados (main.rs:771-814). PERO el riesgo vivo persiste por el otro lado: crear_tarea vía MCP (mcp.rs:174) recibe estimado_seg directamente del peer ('en segundos') y el broker lo persiste tal cual SIN validación de rango plausible. Una IA que confunda minutos con segundos manda 30 (=30s) para una tarea de 30 min, y el factor aprende un ratio 60× equivocado. El clamp FACTOR_MAX=50 solo lo tapa parcialmente y ya envenena.",
+      "fix": "En el handler crear_tarea/abrir_tarea_con_estimado, validar estimado_seg contra un rango plausible (p.ej. rechazar <30s o >30 días con un warning) y descartar del aprendizaje los estimados fuera de rango. Reforzar la descripción del inputSchema MCP ('en SEGUNDOS, p.ej. 1800 = 30 min'). Opcional: añadir test que verifique que un estimado absurdamente bajo no alimenta el factor.",
+      "prioridad": "P0-bug",
+      "esfuerzo": "bajo"
+    },
+    {
+      "n": 5,
+      "titulo": "Acciones de gestión de tareas no cableadas al teclado: la pantalla Tareas es solo-lectura",
+      "que_falta": "main.rs::manejar_accion no tiene rama para Pantalla::Tareas (editar/estado/asignar/reasignar/forzar) y Enter no abre tarea_detalle. La fontanería existe entera (cliente.rs: tarea_editar/tarea_estado/tarea_asignar/tarea_reasignar/tarea_forzar, e Input::Tarea* en app.rs) pero NADA la dispara desde la pantalla 8. El jefe no puede hacer nada sobre las tareas desde la TUI — es la feature central de 'Max dirige a sus empleados IA' y está desconectada.",
+      "fix": "Añadir en manejar_accion las ramas (Pantalla::Tareas, KeyCode) para: 'e' editar (encadena descripción→estimado), 'n' nueva, 's'/'c'/'b' estado (Hecha/Cancelada/Bloqueada), 'r' reasignar, '+' ampliar estimado, Enter → tarea_detalle. Reutilizar los Input::Tarea* ya definidos.",
+      "prioridad": "P0-bug",
+      "esfuerzo": "medio"
+    },
+    {
+      "n": 6,
+      "titulo": "La columna 'estado' no muestra el ciclo de vida real (EnCurso/Bloqueada/Hecha/Cancelada)",
+      "que_falta": "fila_tarea (app.rs:461-473) y fila_render (ui/tareas.rs:67-83) derivan el estado SOLO de si t.fin existe → pintan 'fin' o 'abierta'. El modelo ya tiene t.estado: EstadoTarea con 5 estados y t.bloqueo_motivo (lib.rs:321-326) pero la TUI los ignora. EnCurso, Bloqueada y recién Abierta se ven idénticos; una Cancelada aparece como 'abierta' eternamente. El jefe no distingue una tarea en marcha de una bloqueada esperándolo a él.",
+      "fix": "En fila_tarea/fila_render pintar t.estado directamente con color/icono por variante (Abierta gris, EnCurso azul, Bloqueada rojo + bloqueo_motivo, Hecha verde, Cancelada tachado/atenuado). Eliminar la derivación por t.fin.",
+      "prioridad": "P0-bug",
+      "esfuerzo": "bajo"
+    },
+    {
+      "n": 7,
+      "titulo": "Cerrar tarea no exige NINGUNA prueba de trabajo: el peer dice 'hecha' y el factor aprende de trabajo fantasma",
+      "que_falta": "El único gate para alimentar el factor es estimado>0 && real>0 (main.rs:479, 624). No hay evidencia obligatoria (commit SHA, diff, PR, reporte) ni confirmación del jefe. cerrar_tarea (mcp.rs:201) solo pide tarea_id y el ratio entra directo a la EMA. Si un peer declara 'hecha' sin haberla hecho, el factor aprende de mentiras y se vuelve un número 'objetivo' falsamente legitimado que Max confiará — peor que no tener factor.",
+      "fix": "Añadir campo evidencia opcional a cerrar_tarea (commit/PR/nota). Marcar las tareas sin evidencia como 'no-verificadas' y que alimenten el factor con peso reducido o no lo alimenten. Exponer en la TUI qué tareas Hechas no tienen evidencia para que el jefe las audite.",
+      "prioridad": "P1-alto",
+      "esfuerzo": "medio"
+    },
+    {
+      "n": 8,
+      "titulo": "Cierre instantáneo (real bajísimo) envenena el factor hacia el techo sin disparar alarma",
+      "que_falta": "diferencia_seg (jornada.rs:97) da real=2s para una tarea creada y cerrada en 2s; con estimado 3600s el ratio=1800 que aplicar_media_movil clampa a FACTOR_MAX=50, empujando el factor al techo en cada ráfaga. No existe UMBRAL_REAL_MINIMO ni detección de 'real sospechosamente bajo'. El supervisor solo detecta lo contrario (atascado = demasiado lento, UMBRAL_ATASCO_SEG); nada vigila el extremo rápido. Un peer en bucle de tool-calls corrompe el factor a 50× en pocos cierres y a partir de ahí todo estimado se corrige dividiendo por 50.",
+      "fix": "Definir UMBRAL_REAL_MINIMO (p.ej. 30-60s): si real < umbral, NO alimentar el factor y emitir TipoAlerta::CierreSospechoso. Además rechazar del aprendizaje ratios donde real << estimado_corregido de forma implausible.",
+      "prioridad": "P1-alto",
+      "esfuerzo": "bajo"
+    },
+    {
+      "n": 9,
+      "titulo": "Factor GLOBAL (no por peer): el peer controla su propio estimado y un mentiroso contamina a los honestos",
+      "que_falta": "estimado_seg viene del cliente (mcp.rs:174) y se persiste sin cuestionar; k_factor() es una sola clave global sin instancia_id. Un peer puede inflar/desinflar su estimado para manipular su ratio, y como el factor es único, su mentira corrige a TODOS los peers. No hay factor por peer ni rango plausible por tipo de tarea. Max no puede saber QUIÉN está alucinando.",
+      "fix": "Particionar el factor por instancia_id (k_factor:{inst}) manteniendo un factor global como fallback para peers sin historial. Así un peer mentiroso solo se corrige a sí mismo y Max ve el factor/muestras por empleado. Exponerlo en la TUI por peer.",
+      "prioridad": "P1-alto",
+      "esfuerzo": "alto"
+    },
+    {
+      "n": 10,
+      "titulo": "Cancelación masiva como vía de escape: el peer esconde sus fallos en Cancelada y nadie lo detecta",
+      "que_falta": "Por diseño Cancelada NO alimenta el factor (lib.rs:268; main.rs:624 solo aprende en Hecha). Un peer puede marcar Cancelada toda tarea que se le fue de tiempo, dejando que el factor solo aprenda de sus aciertos (selección de supervivencia del dato → corrección sistemáticamente optimista). No hay detector de tasa de cancelación anómala ni el ratio Hecha/Cancelada por peer es visible. La métrica miente por omisión.",
+      "fix": "Calcular ratio Hecha/Cancelada por peer y emitir TipoAlerta::CancelacionExcesiva cuando supere un umbral (p.ej. >40% canceladas en ventana). Exponer ese ratio en la pantalla de peers/jornada para que Max lo vea.",
+      "prioridad": "P1-alto",
+      "esfuerzo": "medio"
+    },
+    {
+      "n": 11,
+      "titulo": "Reasignar tarea no la quita de la lista del dueño viejo: aparece en DOS jornadas y ambos pueden cerrarla",
+      "que_falta": "tarea_reasignar cambia tarea.instancia_id y guarda, pero tarea_guardar solo hace RPUSH a cprs:tareas:{nuevo} y NUNCA LREM en cprs:tareas:{viejo}. Tras reasignar: el id sigue en la jornada del dueño anterior; el tarea_id embebe el id viejo (tar-{viejo}-{ts}) y queda mentiroso; el peer viejo aún conoce el tarea_id y puede cerrarlo, disparando el aprendizaje sobre una tarea ajena. Rompe la trazabilidad de quién hizo qué (núcleo del producto) y duplica horas.",
+      "fix": "En tarea_reasignar (o en tarea_guardar al detectar cambio de instancia_id) hacer LREM del id en cprs:tareas:{viejo} y RPUSH en cprs:tareas:{nuevo} de forma atómica (MULTI). Guardar instancia_original para auditoría. El tarea_id ya no debe usarse como prueba de propiedad: validar propiedad por tarea.instancia_id en el cierre.",
+      "prioridad": "P1-alto",
+      "esfuerzo": "medio"
+    },
+    {
+      "n": 12,
+      "titulo": "Tareas EnCurso/Bloqueadas huérfanas de un peer muerto nunca se cierran ni se miden",
+      "que_falta": "limpiar_vencidas (store.rs:425) borra el HASH de la instancia y su bandeja al no latir en 45s, pero NO toca cprs:tareas:{id} ni cprs:tarea:{id}. Una tarea EnCurso queda con fin=None para siempre, apuntando a una instancia que ya no está en el SET. El supervisor de ATASCO alerta pero nada la transiciona a terminal. Si algún día se cierra, duracion_seg incluye horas de peer muerto y envenena el factor; mientras, infla la jornada con tiempo fantasma.",
+      "fix": "En limpiar_vencidas, recorrer las tareas abiertas (no terminales) de la instancia vencida y transicionarlas a Bloqueada con bloqueo_motivo='peer caído' (o Cancelada), SIN alimentar el factor. Registrar el evento. Al re-registrarse el peer, esas tareas quedan claramente marcadas y no contaminan jornadas nuevas.",
+      "prioridad": "P1-alto",
+      "esfuerzo": "medio"
+    },
+    {
+      "n": 13,
+      "titulo": "Badge/alerta EN VIVO de overrun: tarea que ya superó su estimado mientras sigue abierta",
+      "que_falta": "En una tarea abierta fila_tarea muestra real='—' (app.rs:462) porque duracion_seg solo se timbra al cerrar. No se calcula transcurrido = ahora - t.inicio para compararlo contra estimado_seg ni se pinta un badge tipo '⚠ 3.2x / +47min'. El jefe se entera del desvío SOLO cuando la tarea ya cerró — demasiado tarde para intervenir. El valor del sistema (matar la alucinación) se desperdicia si el overrun no se ve en vivo.",
+      "fix": "En fila_tarea, si la tarea está EnCurso/Abierta y tiene estimado_seg, calcular transcurrido=ahora-inicio y pintar la columna real con el transcurrido vivo + badge de overrun (ratio transcurrido/estimado) en rojo cuando supere 1.0. No requiere cambio de backend, solo cómputo en la TUI con el reloj local.",
+      "prioridad": "P1-alto",
+      "esfuerzo": "bajo"
+    },
+    {
+      "n": 14,
+      "titulo": "Vista global de TODAS las tareas de TODOS los peers + filtro/orden (cuadro de mando del jefe)",
+      "que_falta": "ui/tareas.rs:17-19 solo muestra las tareas de UN peer (traza_peer_actual) y obliga a ciclar con '['/']'; el refresh (main.rs:244-266) solo pide /listar-tareas del peer enfocado. No hay vista agregada con columna 'peer', ni filtro (solo bloqueadas/abiertas, ocultar hechas), ni orden (mayor overrun, atascadas primero). Un jefe gestiona el equipo, no a un empleado a la vez; lo accionable queda enterrado bajo tareas cerradas.",
+      "fix": "Añadir un modo 'vista global' en la pantalla Tareas que pida la jornada de todas las instancias del SET, con columna peer, y controles de filtro (por estado) y orden (overrun/antigüedad, atascadas arriba). Cachear el agregado en el refresh para no degradar.",
+      "prioridad": "P2-medio",
+      "esfuerzo": "alto"
+    },
+    {
+      "n": 15,
+      "titulo": "IDs de tarea por timestamp colisionables + sin purga/retención: tareas perdidas y degradación lineal",
+      "que_falta": "abrir_tarea_con_estimado genera tarea_id = tar-{inst}-{Rfc3339}. Dos crear_tarea de la misma instancia en el mismo instante producen el MISMO id → el SET pisa la primera tarea (pérdida silenciosa, la 'frustração pela metade' que Max odia). msgseq ya demuestra el patrón correcto (INCR atómico, store.rs:263/385) pero las tareas no lo usan. Además NO hay purga de tareas: cprs:tareas:{inst} solo crece, jornada hace N GETs por refresco y el supervisor recorre todo en cada tick → degradación lineal y reportes inmanejables.",
+      "fix": "Generar tarea_id con INCR atómico (cprs:tareaseq) como los mensajes, en vez de derivarlo del timestamp. Añadir podar_tareas(RETENCION) en el loop de mantenimiento (espejo de podar_historial) que archive/elimine tareas terminales más viejas que la retención, y filtrar/paginar jornada y listar_tareas para devolver 'lo de hoy' por defecto.",
+      "prioridad": "P2-medio",
+      "esfuerzo": "medio"
+    }
+  ]
+}

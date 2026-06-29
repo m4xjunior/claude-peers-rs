@@ -7,8 +7,8 @@
 
 use async_trait::async_trait;
 use peers_core::{
-    aplicar_media_movil, Alcance, Alerta, Almacen, EstadoMensaje, FactorEstimacion, Instancia,
-    ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
+    aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, EstadoMensaje, EstadoTarea,
+    FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
 };
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
@@ -52,6 +52,30 @@ fn texto_a_tipo_alerta(s: &str) -> TipoAlerta {
         "atascado" => TipoAlerta::Atascado,
         "ghosteo" => TipoAlerta::Ghosteo,
         _ => TipoAlerta::Ocioso,
+    }
+}
+
+/// Serializa un `EstadoTarea` a su forma textual (lowercase) para la columna `estado` (coincide
+/// con el `rename_all` de serde del enum en peers-core).
+fn estado_tarea_a_texto(e: EstadoTarea) -> &'static str {
+    match e {
+        EstadoTarea::Abierta => "abierta",
+        EstadoTarea::EnCurso => "encurso",
+        EstadoTarea::Bloqueada => "bloqueada",
+        EstadoTarea::Hecha => "hecha",
+        EstadoTarea::Cancelada => "cancelada",
+    }
+}
+
+/// Parsea la columna `estado` a `EstadoTarea` (cae a `Abierta` si es desconocida/NULL — sostiene
+/// la compat AC6: una fila vieja sin estado se lee como Abierta).
+fn texto_a_estado_tarea(s: &str) -> EstadoTarea {
+    match s {
+        "encurso" => EstadoTarea::EnCurso,
+        "bloqueada" => EstadoTarea::Bloqueada,
+        "hecha" => EstadoTarea::Hecha,
+        "cancelada" => EstadoTarea::Cancelada,
+        _ => EstadoTarea::Abierta,
     }
 }
 
@@ -116,8 +140,16 @@ impl AlmacenSqlite {
             CREATE TABLE IF NOT EXISTS tareas (
                 id TEXT PRIMARY KEY, instancia_id TEXT NOT NULL, sesion_id TEXT NOT NULL,
                 descripcion TEXT NOT NULL, inicio TEXT NOT NULL, fin TEXT,
-                duracion_seg INTEGER, issue_number INTEGER, estimado_seg INTEGER
+                duracion_seg INTEGER, issue_number INTEGER, estimado_seg INTEGER,
+                estado TEXT NOT NULL DEFAULT 'abierta', bloqueo_motivo TEXT
             );
+            -- Historial de reportes de progreso por tarea (R9/AC5): el detalle de la TUI los lee
+            -- de aquí (local), no de GitHub. `tarea_reportar` escribe; `tarea_reportes` lee.
+            CREATE TABLE IF NOT EXISTS reportes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                tarea_id TEXT NOT NULL, texto TEXT NOT NULL, creado_en TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reportes_tarea ON reportes(tarea_id, seq);
             CREATE TABLE IF NOT EXISTS factor_estimacion (
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 muestras INTEGER NOT NULL DEFAULT 0,
@@ -138,6 +170,15 @@ impl AlmacenSqlite {
             );
             "#,
         )?;
+        // Migración para bases YA existentes (R10/AC6): `CREATE TABLE IF NOT EXISTS` no añade
+        // columnas a una tabla `tareas` antigua. Añadimos `estado`/`bloqueo_motivo` con ALTER e
+        // ignoramos el error "duplicate column name" (idempotente: ya migrada). Las filas viejas
+        // toman el DEFAULT 'abierta' → se leen como EstadoTarea::Abierta (compat AC6).
+        let _ = conexion.execute(
+            "ALTER TABLE tareas ADD COLUMN estado TEXT NOT NULL DEFAULT 'abierta'",
+            [],
+        );
+        let _ = conexion.execute("ALTER TABLE tareas ADD COLUMN bloqueo_motivo TEXT", []);
         Ok(Self {
             conexion: Mutex::new(conexion),
         })
@@ -527,11 +568,12 @@ impl Almacen for AlmacenSqlite {
     async fn tarea_guardar(&self, t: &Tarea) -> anyhow::Result<()> {
         self.bloquear().execute(
             "INSERT OR REPLACE INTO tareas
-             (id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+             (id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 t.id, t.instancia_id, t.sesion_id, t.descripcion, t.inicio, t.fin,
-                t.duracion_seg, t.issue_number.map(|n| n as i64), t.estimado_seg
+                t.duracion_seg, t.issue_number.map(|n| n as i64), t.estimado_seg,
+                estado_tarea_a_texto(t.estado), t.bloqueo_motivo
             ],
         )?;
         Ok(())
@@ -541,7 +583,7 @@ impl Almacen for AlmacenSqlite {
         let conexion = self.bloquear();
         Ok(conexion
             .query_row(
-                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo
                  FROM tareas WHERE id=?1",
                 params![tarea_id],
                 fila_a_tarea,
@@ -567,13 +609,74 @@ impl Almacen for AlmacenSqlite {
         };
         let tareas = {
             let mut stmt = conexion.prepare(
-                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg
+                "SELECT id,instancia_id,sesion_id,descripcion,inicio,fin,duracion_seg,issue_number,estimado_seg,estado,bloqueo_motivo
                  FROM tareas WHERE instancia_id=?1 ORDER BY inicio ASC",
             )?;
             let filas = stmt.query_map(params![instancia_id], fila_a_tarea)?;
             filas.filter_map(Result::ok).collect()
         };
         Ok((sesiones, tareas))
+    }
+
+    async fn tarea_editar(
+        &self,
+        tarea_id: &str,
+        descripcion: Option<&str>,
+        estimado_seg: Option<i64>,
+    ) -> anyhow::Result<Option<Tarea>> {
+        // Lee, aplica solo los campos Some, reusa tarea_guardar para persistir (R4/AC1).
+        let Some(mut tarea) = self.tarea_obtener(tarea_id).await? else {
+            return Ok(None);
+        };
+        if let Some(d) = descripcion {
+            tarea.descripcion = d.to_string();
+        }
+        if let Some(est) = estimado_seg {
+            tarea.estimado_seg = Some(est);
+        }
+        self.tarea_guardar(&tarea).await?;
+        Ok(Some(tarea))
+    }
+
+    async fn tarea_estado(
+        &self,
+        tarea_id: &str,
+        estado: EstadoTarea,
+        motivo: Option<&str>,
+        ahora: &str,
+    ) -> anyhow::Result<Option<Tarea>> {
+        let Some(mut tarea) = self.tarea_obtener(tarea_id).await? else {
+            return Ok(None);
+        };
+        // Transición inválida: devuelve la tarea sin cambios (el handler decide el código).
+        if !transicion_valida(tarea.estado, estado) {
+            return Ok(Some(tarea));
+        }
+        // Misma regla de timbrado que Redis (helper compartido del módulo store): el real lo pone
+        // SIEMPRE el broker vía `ahora`; el aprendizaje del factor lo hace el handler, no el store.
+        crate::store::aplicar_transicion_tarea(&mut tarea, estado, motivo, ahora);
+        self.tarea_guardar(&tarea).await?;
+        Ok(Some(tarea))
+    }
+
+    async fn tarea_reportar(&self, tarea_id: &str, texto: &str, ahora: &str) -> anyhow::Result<()> {
+        self.bloquear().execute(
+            "INSERT INTO reportes (tarea_id,texto,creado_en) VALUES (?1,?2,?3)",
+            params![tarea_id, texto, ahora],
+        )?;
+        Ok(())
+    }
+
+    async fn tarea_reportes(&self, tarea_id: &str) -> anyhow::Result<Vec<String>> {
+        let conexion = self.bloquear();
+        // Mismo formato textual que Redis ("<creado_en> — <texto>") para que la TUI no distinga
+        // el backend. Orden cronológico por seq.
+        let mut stmt = conexion
+            .prepare("SELECT creado_en,texto FROM reportes WHERE tarea_id=?1 ORDER BY seq ASC")?;
+        let filas = stmt.query_map(params![tarea_id], |r| {
+            Ok(format!("{} — {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(filas.filter_map(Result::ok).collect())
     }
 
     async fn factor_estimacion(&self) -> anyhow::Result<FactorEstimacion> {
@@ -716,6 +819,10 @@ fn fila_a_tarea(f: &rusqlite::Row<'_>) -> rusqlite::Result<Tarea> {
         duracion_seg: f.get(6)?,
         issue_number: f.get::<_, Option<i64>>(7)?.map(|n| n as u64),
         estimado_seg: f.get::<_, Option<i64>>(8)?,
+        // Columnas nuevas (R2): NULL/desconocido → Abierta (compat AC6). Posición 9/10 según el
+        // orden de los SELECT de tareas.
+        estado: texto_a_estado_tarea(&f.get::<_, String>(9)?),
+        bloqueo_motivo: f.get(10)?,
     })
 }
 
@@ -892,6 +999,8 @@ mod pruebas {
             duracion_seg: None,
             issue_number: None,
             estimado_seg: None,
+            estado: EstadoTarea::Abierta,
+            bloqueo_motivo: None,
         };
         b.tarea_guardar(&t).await.unwrap();
         // Cierre con tiempo del "broker": 90s después.
@@ -1000,9 +1109,122 @@ mod pruebas {
             duracion_seg: None,
             issue_number: None,
             estimado_seg: Some(432000),
+            estado: EstadoTarea::Abierta,
+            bloqueo_motivo: None,
         };
         b.tarea_guardar(&t).await.unwrap();
         let leida = b.tarea_obtener("te").await.unwrap().unwrap();
         assert_eq!(leida.estimado_seg, Some(432000));
+    }
+
+    fn tarea_base(id: &str) -> Tarea {
+        Tarea {
+            id: id.into(),
+            instancia_id: "jefin".into(),
+            sesion_id: "s1".into(),
+            descripcion: "original".into(),
+            inicio: "2026-01-01T00:00:00Z".into(),
+            fin: None,
+            duracion_seg: None,
+            issue_number: None,
+            estimado_seg: Some(600),
+            estado: EstadoTarea::Abierta,
+            bloqueo_motivo: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tarea_editar_aplica_solo_campos_some() {
+        // R4/AC1: editar persiste descripción/estimado; los None no tocan nada; None si no existe.
+        let b = base();
+        b.tarea_guardar(&tarea_base("t1")).await.unwrap();
+        // Solo descripción.
+        let e = b.tarea_editar("t1", Some("nueva desc"), None).await.unwrap().unwrap();
+        assert_eq!(e.descripcion, "nueva desc");
+        assert_eq!(e.estimado_seg, Some(600), "estimado intacto");
+        // Solo estimado.
+        let e = b.tarea_editar("t1", None, Some(1200)).await.unwrap().unwrap();
+        assert_eq!(e.descripcion, "nueva desc", "descripción intacta");
+        assert_eq!(e.estimado_seg, Some(1200));
+        // Relee de la base.
+        let leida = b.tarea_obtener("t1").await.unwrap().unwrap();
+        assert_eq!(leida.descripcion, "nueva desc");
+        assert_eq!(leida.estimado_seg, Some(1200));
+        // Inexistente → None.
+        assert!(b.tarea_editar("fantasma", Some("x"), None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tarea_estado_hecha_mide_real_y_bloqueada_guarda_motivo() {
+        // R5/AC2: Hecha timbra fin + mide real (broker); Bloqueada guarda motivo. El factor NO se
+        // toca aquí (lo hace el handler).
+        let b = base();
+        b.tarea_guardar(&tarea_base("t1")).await.unwrap();
+        // Abierta → EnCurso (válida).
+        let t = b.tarea_estado("t1", EstadoTarea::EnCurso, None, "2026-01-01T00:00:10Z").await.unwrap().unwrap();
+        assert_eq!(t.estado, EstadoTarea::EnCurso);
+        assert!(t.fin.is_none());
+        // EnCurso → Hecha: timbra fin y mide real = 90s desde inicio.
+        let t = b.tarea_estado("t1", EstadoTarea::Hecha, None, "2026-01-01T00:01:30Z").await.unwrap().unwrap();
+        assert_eq!(t.estado, EstadoTarea::Hecha);
+        assert_eq!(t.fin.as_deref(), Some("2026-01-01T00:01:30Z"));
+        assert_eq!(t.duracion_seg, Some(90), "real MEDIDO por el broker, no estimado");
+
+        // Otra tarea: Bloqueada guarda motivo.
+        b.tarea_guardar(&tarea_base("t2")).await.unwrap();
+        let t = b.tarea_estado("t2", EstadoTarea::Bloqueada, Some("falta credencial"), "2026-01-01T00:02:00Z").await.unwrap().unwrap();
+        assert_eq!(t.estado, EstadoTarea::Bloqueada);
+        assert_eq!(t.bloqueo_motivo.as_deref(), Some("falta credencial"));
+        // Persiste al releer.
+        let leida = b.tarea_obtener("t2").await.unwrap().unwrap();
+        assert_eq!(leida.estado, EstadoTarea::Bloqueada);
+        assert_eq!(leida.bloqueo_motivo.as_deref(), Some("falta credencial"));
+    }
+
+    #[tokio::test]
+    async fn tarea_estado_transicion_invalida_no_cambia() {
+        // R3/R5: Hecha → EnCurso es inválida (hay que reabrir a Abierta primero). Devuelve la
+        // tarea SIN cambios.
+        let b = base();
+        b.tarea_guardar(&tarea_base("t1")).await.unwrap();
+        b.tarea_estado("t1", EstadoTarea::Hecha, None, "2026-01-01T00:01:00Z").await.unwrap();
+        let t = b.tarea_estado("t1", EstadoTarea::EnCurso, None, "2026-01-01T00:02:00Z").await.unwrap().unwrap();
+        assert_eq!(t.estado, EstadoTarea::Hecha, "transición inválida no aplica");
+        // Reabrir a Abierta sí es válida.
+        let t = b.tarea_estado("t1", EstadoTarea::Abierta, None, "2026-01-01T00:03:00Z").await.unwrap().unwrap();
+        assert_eq!(t.estado, EstadoTarea::Abierta);
+    }
+
+    #[tokio::test]
+    async fn reportes_persisten_y_se_leen_en_orden() {
+        // R9/AC5: los reportes se persisten localmente y se leen en orden cronológico.
+        let b = base();
+        b.tarea_guardar(&tarea_base("t1")).await.unwrap();
+        assert!(b.tarea_reportes("t1").await.unwrap().is_empty());
+        b.tarea_reportar("t1", "arranqué", "2026-01-01T00:00:01Z").await.unwrap();
+        b.tarea_reportar("t1", "voy por la mitad", "2026-01-01T00:05:00Z").await.unwrap();
+        let reportes = b.tarea_reportes("t1").await.unwrap();
+        assert_eq!(reportes.len(), 2);
+        assert_eq!(reportes[0], "2026-01-01T00:00:01Z — arranqué");
+        assert_eq!(reportes[1], "2026-01-01T00:05:00Z — voy por la mitad");
+    }
+
+    #[tokio::test]
+    async fn tarea_vieja_sin_estado_se_lee_abierta() {
+        // AC6: una fila escrita por el esquema viejo (sin columnas estado/bloqueo_motivo) se lee
+        // como Abierta. Simulamos insertando directo sin esas columnas (DEFAULT 'abierta').
+        let b = base();
+        {
+            let c = b.bloquear();
+            c.execute(
+                "INSERT INTO tareas (id,instancia_id,sesion_id,descripcion,inicio,estimado_seg)
+                 VALUES ('vieja','jefin','s1','legacy','2026-01-01T00:00:00Z',300)",
+                [],
+            ).unwrap();
+        }
+        let t = b.tarea_obtener("vieja").await.unwrap().unwrap();
+        assert_eq!(t.estado, EstadoTarea::Abierta);
+        assert!(t.bloqueo_motivo.is_none());
+        assert_eq!(t.estimado_seg, Some(300));
     }
 }

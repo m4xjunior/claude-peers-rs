@@ -9,7 +9,8 @@
 //! en pánico; el handler traduce el error a un 500 con JSON.
 
 use crate::{
-    Alcance, Alerta, EstadoMensaje, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea,
+    Alcance, Alerta, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox, Mensaje,
+    Sesion, Tarea,
 };
 use async_trait::async_trait;
 
@@ -142,6 +143,46 @@ pub trait Almacen: Send + Sync {
     async fn tarea_guardar(&self, tarea: &Tarea) -> anyhow::Result<()>;
     async fn tarea_obtener(&self, tarea_id: &str) -> anyhow::Result<Option<Tarea>>;
     async fn jornada(&self, instancia_id: &str) -> anyhow::Result<(Vec<Sesion>, Vec<Tarea>)>;
+
+    // --- Gestión interactiva de tareas (R4/R5/R9) ---
+
+    /// Edita campos de una tarea (R4/AC1): lee la tarea, aplica solo los campos `Some`
+    /// (`descripcion`/`estimado_seg`), reusa `tarea_guardar` para persistir y devuelve la tarea
+    /// actualizada. `None` si la tarea no existe (el handler responde 404). NO toca estado,
+    /// tiempos ni factor: editar es solo metadatos.
+    async fn tarea_editar(
+        &self,
+        tarea_id: &str,
+        descripcion: Option<&str>,
+        estimado_seg: Option<i64>,
+    ) -> anyhow::Result<Option<Tarea>>;
+
+    /// Transiciona el estado de una tarea (R5/AC2). Valida con `transicion_valida`; si la
+    /// transición es inválida devuelve la tarea SIN cambios (el handler decide el código). Reglas
+    /// de timbrado (el reloj lo pone el broker vía `ahora`):
+    ///   - `Hecha` y la tarea aún no tenía `fin` → timbra `fin = ahora` y mide
+    ///     `duracion_seg = ahora - inicio` (el aprendizaje del factor lo hace el handler, NUNCA
+    ///     el store, y SOLO en `Hecha`).
+    ///   - `Bloqueada` → guarda `bloqueo_motivo = motivo`.
+    ///   - otros estados → solo cambia `estado`.
+    /// Devuelve la tarea ya actualizada; `None` si no existe.
+    async fn tarea_estado(
+        &self,
+        tarea_id: &str,
+        estado: EstadoTarea,
+        motivo: Option<&str>,
+        ahora: &str,
+    ) -> anyhow::Result<Option<Tarea>>;
+
+    /// Persiste una nota de progreso (report) de una tarea y devuelve el historial actualizado
+    /// (R9/AC5). Lo llama `tarea_reportar` además de comentar en GitHub: el historial local es la
+    /// fuente para el detalle de la TUI (no depende de GitHub). Redis: `RPUSH cprs:reportes:{id}`.
+    /// SQLite: `INSERT INTO reportes`.
+    async fn tarea_reportar(&self, tarea_id: &str, texto: &str, ahora: &str) -> anyhow::Result<()>;
+
+    /// Historial de reportes de progreso de una tarea, en orden cronológico (R9/AC5). Cada
+    /// entrada es una línea `"<ahora> — <texto>"`. Vacío si la tarea no tiene reportes.
+    async fn tarea_reportes(&self, tarea_id: &str) -> anyhow::Result<Vec<String>>;
 
     // --- Aprendizaje de estimación (factor global) ---
 

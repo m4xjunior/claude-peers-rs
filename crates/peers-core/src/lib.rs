@@ -246,6 +246,62 @@ pub struct Sesion {
     pub duracion_seg: Option<i64>,
 }
 
+/// Estado del ciclo de vida de una tarea, gestionado por Max como jefe (kanban).
+///
+/// INTENCIÓN: enum cerrado (no "stringly typed") compartido entre broker y TUI, igual que
+/// `EstadoMensaje`/`TipoAlerta`. Serializa en minúsculas para encajar con el protocolo.
+/// `#[serde(default)]` en `Tarea::estado` nace `Abierta` (de ahí el `impl Default`), para
+/// que una tarea vieja (JSON sin `estado`) deserialice como `Abierta` sin romper (AC6/R2).
+///
+/// REGLA DEL FACTOR (R3): SOLO `Hecha` con estimado+real válidos alimenta el factor de
+/// corrección. `Cancelada` y las demás NO lo contaminan — esa decisión vive en el broker
+/// (`actualizar_factor` se llama solo en la transición a `Hecha`), aquí solo es el vocabulario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EstadoTarea {
+    /// Recién creada/asignada; nadie la ha empezado. Estado por defecto (compat).
+    Abierta,
+    /// El peer está trabajando en ella activamente.
+    EnCurso,
+    /// Parada por un impedimento; `Tarea::bloqueo_motivo` explica por qué.
+    Bloqueada,
+    /// Terminada con éxito. Única transición que alimenta el factor (R3).
+    Hecha,
+    /// Abortada sin completar. NO contamina el factor de estimación.
+    Cancelada,
+}
+
+/// Por defecto una tarea nace `Abierta`. Soporta `#[serde(default)]` en `Tarea::estado`
+/// para que las tareas viejas (sin el campo) deserialicen como `Abierta` (AC6/R2).
+impl Default for EstadoTarea {
+    fn default() -> Self {
+        EstadoTarea::Abierta
+    }
+}
+
+/// ¿Es válida la transición de estado `actual` → `nuevo`? Función PURA (sin reloj ni I/O).
+///
+/// Tabla (R3): `Abierta ↔ EnCurso`; cualquiera → `Bloqueada`/`Hecha`/`Cancelada`;
+/// los terminales/parados (`Bloqueada`/`Hecha`/`Cancelada`) → `Abierta` (REABRIR).
+/// Quedarse en el mismo estado es un no-op válido (idempotente). El broker valida con esto
+/// ANTES de timbrar el cambio; la TUI puede usarla para decidir qué acciones ofrecer.
+#[must_use]
+pub fn transicion_valida(actual: EstadoTarea, nuevo: EstadoTarea) -> bool {
+    use EstadoTarea::{Abierta, Bloqueada, Cancelada, EnCurso, Hecha};
+    if actual == nuevo {
+        return true; // idempotente: re-aplicar el mismo estado no es un error.
+    }
+    match (actual, nuevo) {
+        // Flujo activo: empezar y volver a la cola.
+        (Abierta, EnCurso) | (EnCurso, Abierta) => true,
+        // Desde cualquier estado se puede bloquear, completar o cancelar.
+        (_, Bloqueada) | (_, Hecha) | (_, Cancelada) => true,
+        // Reabrir desde un estado parado/terminal vuelve al inicio del flujo.
+        (Bloqueada | Hecha | Cancelada, Abierta) => true,
+        _ => false,
+    }
+}
+
 /// Una tarea dentro de una sesión. Igual que la sesión, el tiempo lo timbra el broker.
 /// Si hay integración GitHub activa, `issue_number` guarda la issue espejo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +318,12 @@ pub struct Tarea {
     /// el factor de corrección (ADR-002). `#[serde(default)]` para compat con tareas viejas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimado_seg: Option<i64>,
+    /// Estado del ciclo de vida (R2). Si falta en el JSON (tarea vieja), nace `Abierta`.
+    #[serde(default)]
+    pub estado: EstadoTarea,
+    /// Motivo del bloqueo cuando `estado == Bloqueada` (R5). None en el resto de estados.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bloqueo_motivo: Option<String>,
     /// Número de la issue de GitHub espejo, si la integración está activa.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_number: Option<u64>,
@@ -458,6 +520,66 @@ pub struct PeticionHistorial {
     pub desde: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estado: Option<EstadoMensaje>,
+}
+
+// ===========================================================================
+// GESTIÓN DE TAREAS (jefe ↔ empleados IA) — peticiones de la pantalla Tareas (R4-R9).
+// Todos bajo el middleware de token. Reusan jornada/tarea_guardar/enviar/crear-tarea.
+// ===========================================================================
+
+/// `POST /tarea/editar` (R4). Edita campos de una tarea (reusa `tarea_guardar`). Los campos
+/// son opcionales: `None` = no tocar ese campo (parche parcial, no reemplazo total).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionEditarTarea {
+    pub tarea_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descripcion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimado_seg: Option<i64>,
+}
+
+/// `POST /tarea/estado` (R5). Transiciona el estado de una tarea (validado con
+/// `transicion_valida`). Si pasa a `Hecha`, el broker mide el real y aprende el factor;
+/// si pasa a `Bloqueada`, guarda `motivo` en `Tarea::bloqueo_motivo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionEstadoTarea {
+    pub tarea_id: String,
+    pub estado: EstadoTarea,
+    /// Motivo del bloqueo (solo relevante al pasar a `Bloqueada`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motivo: Option<String>,
+}
+
+/// `POST /tarea/asignar` (R6). Crea una tarea asignada a un peer (reusa `/crear-tarea`) Y
+/// le notifica por canal ("Tienes una tarea nueva: ..."). El dueño es `instancia_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionAsignarTarea {
+    pub instancia_id: String,
+    pub descripcion: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimado_seg: Option<i64>,
+}
+
+/// `POST /tarea/reasignar` (R7). Cambia el dueño de una tarea existente al peer
+/// `nuevo_instancia_id` y le notifica.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionReasignarTarea {
+    pub tarea_id: String,
+    pub nuevo_instancia_id: String,
+}
+
+/// `POST /tarea/forzar` (R8). Empuja la tarea como `<channel>` a la sesión del peer dueño
+/// (reusa `/enviar` con texto formateado). Es el "tócale el hombro" de Max.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionForzarTarea {
+    pub tarea_id: String,
+}
+
+/// `GET /tarea/reportes` (R9). Pide el historial de reportes de progreso de una tarea
+/// (`reportar_tarea` ya los guarda). El detalle de la TUI los muestra (AC5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionReportesTarea {
+    pub tarea_id: String,
 }
 
 // ===========================================================================
@@ -757,5 +879,127 @@ mod tests {
             "2026-06-29T15:00:00Z",
             UMBRAL_OCIOSO_SEG
         ));
+    }
+
+    // --- Gestión de tareas (R1-R5): estado, transiciones y compat ---
+
+    /// R1: EstadoTarea serializa en minúsculas, igual que el resto del protocolo.
+    #[test]
+    fn estado_tarea_serializa_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&EstadoTarea::EnCurso).expect("serializar"),
+            "\"encurso\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EstadoTarea::Bloqueada).expect("serializar"),
+            "\"bloqueada\""
+        );
+        let h: EstadoTarea = serde_json::from_str("\"hecha\"").expect("deser");
+        assert_eq!(h, EstadoTarea::Hecha);
+        let c: EstadoTarea = serde_json::from_str("\"cancelada\"").expect("deser");
+        assert_eq!(c, EstadoTarea::Cancelada);
+    }
+
+    /// El Default de EstadoTarea es Abierta (sostiene el `#[serde(default)]` de `Tarea::estado`).
+    #[test]
+    fn estado_tarea_default_es_abierta() {
+        assert_eq!(EstadoTarea::default(), EstadoTarea::Abierta);
+    }
+
+    /// R3: tabla de transiciones válidas. Abierta↔EnCurso; cualquiera→Bloqueada/Hecha/Cancelada;
+    /// terminal/parado→Abierta (reabrir); mismo estado es idempotente.
+    #[test]
+    fn transiciones_validas_segun_tabla() {
+        use EstadoTarea::{Abierta, Bloqueada, Cancelada, EnCurso, Hecha};
+        // Flujo activo bidireccional.
+        assert!(transicion_valida(Abierta, EnCurso));
+        assert!(transicion_valida(EnCurso, Abierta));
+        // Cualquiera → Bloqueada / Hecha / Cancelada.
+        for actual in [Abierta, EnCurso, Bloqueada, Hecha, Cancelada] {
+            assert!(transicion_valida(actual, Bloqueada), "{actual:?}→Bloqueada");
+            assert!(transicion_valida(actual, Hecha), "{actual:?}→Hecha");
+            assert!(transicion_valida(actual, Cancelada), "{actual:?}→Cancelada");
+        }
+        // Reabrir: parado/terminal → Abierta.
+        assert!(transicion_valida(Bloqueada, Abierta));
+        assert!(transicion_valida(Hecha, Abierta));
+        assert!(transicion_valida(Cancelada, Abierta));
+        // Idempotente: mismo estado.
+        for e in [Abierta, EnCurso, Bloqueada, Hecha, Cancelada] {
+            assert!(transicion_valida(e, e), "{e:?}→{e:?} debe ser idempotente");
+        }
+    }
+
+    /// R3: transiciones INVÁLIDAS. No se puede ir de un terminal/parado directo a EnCurso
+    /// (hay que reabrir a Abierta primero).
+    #[test]
+    fn transiciones_invalidas_rechazadas() {
+        use EstadoTarea::{Bloqueada, Cancelada, EnCurso, Hecha};
+        assert!(!transicion_valida(Bloqueada, EnCurso));
+        assert!(!transicion_valida(Hecha, EnCurso));
+        assert!(!transicion_valida(Cancelada, EnCurso));
+    }
+
+    /// AC6/R2 compat: una Tarea vieja (JSON sin `estado` ni `bloqueo_motivo`) deserializa
+    /// con `estado = Abierta` y `bloqueo_motivo = None`, sin romper.
+    #[test]
+    fn tarea_vieja_sin_estado_deserializa_abierta() {
+        let json_viejo = r#"{
+            "id": "tar-1",
+            "instancia_id": "claudio",
+            "sesion_id": "ses-1",
+            "descripcion": "feature vieja",
+            "inicio": "2026-01-01T00:00:00Z",
+            "fin": null,
+            "duracion_seg": null
+        }"#;
+        let t: Tarea = serde_json::from_str(json_viejo).expect("deser Tarea vieja");
+        assert_eq!(t.estado, EstadoTarea::Abierta);
+        assert!(t.bloqueo_motivo.is_none());
+    }
+
+    /// Roundtrip de una Tarea bloqueada con motivo: serializa y vuelve sin pérdida.
+    #[test]
+    fn tarea_bloqueada_roundtrip() {
+        let original = Tarea {
+            id: "tar-9".into(),
+            instancia_id: "claudia".into(),
+            sesion_id: "ses-3".into(),
+            descripcion: "migrar store".into(),
+            inicio: "2026-06-29T10:00:00Z".into(),
+            fin: None,
+            duracion_seg: None,
+            estimado_seg: Some(3600),
+            estado: EstadoTarea::Bloqueada,
+            bloqueo_motivo: Some("falta credencial Redis".into()),
+            issue_number: Some(12),
+        };
+        let json = serde_json::to_string(&original).expect("serializar");
+        let vuelta: Tarea = serde_json::from_str(&json).expect("deserializar");
+        assert_eq!(vuelta.estado, EstadoTarea::Bloqueada);
+        assert_eq!(vuelta.bloqueo_motivo.as_deref(), Some("falta credencial Redis"));
+        assert_eq!(vuelta.estimado_seg, Some(3600));
+        assert_eq!(vuelta.issue_number, Some(12));
+    }
+
+    /// bloqueo_motivo None NO se serializa (skip_serializing_if), igual que el resto de Option.
+    #[test]
+    fn tarea_sin_motivo_omite_campo() {
+        let t = Tarea {
+            id: "t".into(),
+            instancia_id: "i".into(),
+            sesion_id: "s".into(),
+            descripcion: "x".into(),
+            inicio: "2026-06-29T10:00:00Z".into(),
+            fin: None,
+            duracion_seg: None,
+            estimado_seg: None,
+            estado: EstadoTarea::Abierta,
+            bloqueo_motivo: None,
+            issue_number: None,
+        };
+        let json = serde_json::to_string(&t).expect("serializar");
+        assert!(!json.contains("bloqueo_motivo"), "no debe emitir bloqueo_motivo: {json}");
+        assert!(json.contains("\"estado\":\"abierta\""), "debe emitir estado: {json}");
     }
 }

@@ -47,6 +47,17 @@ pub struct RespuestaReenviar {
     pub error: Option<String>,
 }
 
+/// Respuesta de `POST /tarea/asignar`. El broker responde `{ "ok": true, "tarea_id": "<id>" }`
+/// (JSON ad-hoc). La modelamos tipada para que la TUI extraiga el `tarea_id` sin tocar
+/// `serde_json`. Si el broker no incluyera `tarea_id`, queda `None` (degrada sin crash).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RespuestaAsignar {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub tarea_id: Option<String>,
+}
+
 /// Cliente del broker para la TUI: URL base, token opcional y cliente HTTP reutilizable.
 #[derive(Clone)]
 pub struct ClienteAdmin {
@@ -248,5 +259,88 @@ impl ClienteAdmin {
     /// broker no responde, el banner muestra el motivo y la pantalla mantiene su última lista.
     pub async fn alertas(&self) -> ResultadoBroker<Vec<Alerta>> {
         self.get("/admin/alertas").await
+    }
+
+    // --- Gestión interactiva de tareas (pantalla Tareas, R4-R9) ---
+
+    /// `POST /tarea/editar {tarea_id, descripcion?, estimado_seg?}` → parche parcial de la tarea
+    /// (R4/AC1). `None` en un campo = no tocarlo. Devuelve la `Tarea` actualizada. Tecla `e`/`+`.
+    pub async fn tarea_editar(
+        &self,
+        tarea_id: &str,
+        descripcion: Option<String>,
+        estimado_seg: Option<i64>,
+    ) -> ResultadoBroker<Tarea> {
+        let p = PeticionEditarTarea {
+            tarea_id: tarea_id.to_string(),
+            descripcion,
+            estimado_seg,
+        };
+        self.post("/tarea/editar", &p).await
+    }
+
+    /// `POST /tarea/estado {tarea_id, estado, motivo?}` → transiciona el ciclo de vida (R5/AC2).
+    /// El broker valida la transición y, SOLO al pasar a `Hecha`, mide el real y aprende el
+    /// factor. Devuelve la `Tarea` actualizada. Teclas `b`/`h`/`c`/`R`.
+    pub async fn tarea_estado(
+        &self,
+        tarea_id: &str,
+        estado: EstadoTarea,
+        motivo: Option<String>,
+    ) -> ResultadoBroker<Tarea> {
+        let p = PeticionEstadoTarea {
+            tarea_id: tarea_id.to_string(),
+            estado,
+            motivo,
+        };
+        self.post("/tarea/estado", &p).await
+    }
+
+    /// `POST /tarea/asignar {instancia_id, descripcion, estimado_seg?}` → crea una tarea nueva
+    /// asignada a un peer y lo notifica (R6/AC4). Devuelve `{ ok, tarea_id }`. Tecla `n`.
+    pub async fn tarea_asignar(
+        &self,
+        instancia_id: &str,
+        descripcion: &str,
+        estimado_seg: Option<i64>,
+    ) -> ResultadoBroker<RespuestaAsignar> {
+        let p = PeticionAsignarTarea {
+            instancia_id: instancia_id.to_string(),
+            descripcion: descripcion.to_string(),
+            estimado_seg,
+        };
+        self.post("/tarea/asignar", &p).await
+    }
+
+    /// `POST /tarea/reasignar {tarea_id, nuevo_instancia_id}` → cambia el dueño y notifica al
+    /// nuevo (R7/AC4). Devuelve la `Tarea` con el nuevo dueño. Tecla `a`.
+    pub async fn tarea_reasignar(
+        &self,
+        tarea_id: &str,
+        nuevo_instancia_id: &str,
+    ) -> ResultadoBroker<Tarea> {
+        let p = PeticionReasignarTarea {
+            tarea_id: tarea_id.to_string(),
+            nuevo_instancia_id: nuevo_instancia_id.to_string(),
+        };
+        self.post("/tarea/reasignar", &p).await
+    }
+
+    /// `POST /tarea/forzar {tarea_id}` → "tócale el hombro": empuja un recordatorio a la sesión
+    /// del peer dueño (R8/AC3). `ok=false` si el peer no está vivo (no es error). Tecla `f`.
+    pub async fn tarea_forzar(&self, tarea_id: &str) -> ResultadoBroker<RespuestaOk> {
+        let p = PeticionForzarTarea {
+            tarea_id: tarea_id.to_string(),
+        };
+        self.post("/tarea/forzar", &p).await
+    }
+
+    /// `GET /tarea/reportes?tarea_id=` → historial de reportes de progreso de la tarea (R9/AC5).
+    /// SOLO LECTURA; vacío si no hay reportes. Lo consume el modal DETALLE.
+    pub async fn tarea_reportes(&self, tarea_id: &str) -> ResultadoBroker<Vec<String>> {
+        let q = PeticionReportesTarea {
+            tarea_id: tarea_id.to_string(),
+        };
+        self.get_con_query("/tarea/reportes", &q).await
     }
 }
