@@ -5,10 +5,13 @@
 //! fuera (loop principal), de modo que un render nunca puede colgar la UI.
 
 mod acceso;
+mod alertas;
 mod broker;
 mod config;
+mod jornada;
 mod peers;
 mod redis;
+mod tareas;
 mod trazabilidad;
 
 use crate::app::{App, EstadoRed, Pantalla};
@@ -90,12 +93,15 @@ fn dibujar_cuerpo(f: &mut Frame, area: Rect, app: &App) {
         Pantalla::Broker => broker::dibujar(f, area, app),
         Pantalla::Config => config::dibujar(f, area, app),
         Pantalla::Trazabilidad => trazabilidad::dibujar(f, area, app),
+        Pantalla::Jornada => jornada::dibujar(f, area, app),
+        Pantalla::Tareas => tareas::dibujar(f, area, app),
+        Pantalla::Alertas => alertas::dibujar(f, area, app),
     }
 }
 
 /// Barra de ayuda contextual al pie. Cambia las teclas según la pantalla.
 fn dibujar_ayuda(f: &mut Frame, area: Rect, app: &App) {
-    let comun = "Tab cambia · 1-5 pantalla · q/Esc salir";
+    let comun = "Tab cambia · 1-9 pantalla · q/Esc salir";
     let especifico = match app.pantalla {
         Pantalla::Peers => "↑↓ mover · m mensaje · k kick · r resumen",
         Pantalla::Acceso => "(solo lectura — edita en Config)",
@@ -103,6 +109,9 @@ fn dibujar_ayuda(f: &mut Frame, area: Rect, app: &App) {
         Pantalla::Broker => "(solo lectura)",
         Pantalla::Config => "e editar campo activo · ↑↓ campo · s guardar",
         Pantalla::Trazabilidad => "↑↓ mover · Enter timeline · r reenviar",
+        Pantalla::Jornada => "(solo lectura — fichaje del peer seleccionado en Peers)",
+        Pantalla::Tareas => "↑↓ mover · (solo lectura — peer seleccionado en Peers)",
+        Pantalla::Alertas => "↑↓ mover · (solo lectura)",
     };
     let linea = Line::from(vec![
         Span::styled(format!(" {especifico}"), Style::default().fg(Color::Cyan)),

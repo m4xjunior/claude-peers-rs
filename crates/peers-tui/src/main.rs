@@ -1,8 +1,8 @@
 //! peers-tui — panel de control de la red claude-peers.
 //!
 //! Habla con el broker SOLO por HTTP (cliente reqwest con X-Peers-Token); NUNCA toca Redis.
-//! 5 pantallas (Peers, Red/Acceso, Redis, Broker, Config) conmutables con Tab o 1-5, todas
-//! con refresco asíncrono según `refresh_ms`.
+//! 9 pantallas (Peers, Red/Acceso, Redis, Broker, Config, Trazabilidad, Jornada, Tareas,
+//! Alertas) conmutables con Tab o 1-9, todas con refresco asíncrono según `refresh_ms`.
 //!
 //! ROBUSTEZ (criterio de diseño): si el broker cae o devuelve 401, la TUI NO crashea —
 //! levanta un banner ("broker offline" / "token inválido (401)") y sigue reintentando. No hay
@@ -20,7 +20,12 @@ use anyhow::Result;
 use app::{App, Input, Pantalla};
 use cliente::ClienteAdmin;
 use config::Config;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
+use std::io::stdout;
 use std::time::{Duration, Instant};
 
 /// Guarda RAII de la terminal: al construirse entra en raw mode + pantalla alternativa
@@ -34,12 +39,29 @@ struct GuardaTerminal {
 
 impl GuardaTerminal {
     fn nueva() -> Self {
-        Self { terminal: ratatui::init() }
+        let terminal = ratatui::init();
+        // ratatui::init NO habilita la captura de mouse: lo hacemos aquí explícitamente.
+        // Si falla (terminal sin soporte), seguimos solo-teclado — NUNCA crasheamos por esto.
+        if let Err(e) = execute!(stdout(), EnableMouseCapture) {
+            eprintln!("aviso: no se pudo habilitar el mouse ({e}); solo-teclado");
+        }
+        // Con panic=abort el Drop NO corre, y el panic hook de ratatui::init restaura la
+        // pantalla pero NO deshabilita el mouse → la terminal quedaría capturando mouse tras
+        // un panic. Encadenamos ANTES del hook actual un DisableMouseCapture para cerrar ese gap.
+        let hook_previo = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(stdout(), DisableMouseCapture);
+            hook_previo(info);
+        }));
+        Self { terminal }
     }
 }
 
 impl Drop for GuardaTerminal {
     fn drop(&mut self) {
+        // Deshabilitamos la captura de mouse ANTES de restaurar (orden inverso al setup).
+        // Ignoramos el error: si el stdout ya está roto, igualmente vamos a restaurar.
+        let _ = execute!(stdout(), DisableMouseCapture);
         ratatui::restore();
     }
 }
@@ -91,15 +113,24 @@ async fn correr(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Resu
         // Poll de eventos con timeout corto: mantiene la UI responsiva sin busy-loop.
         // `event::poll` es síncrono; el timeout breve (120ms) acota el bloqueo del worker.
         if event::poll(Duration::from_millis(120))? {
-            if let Event::Key(tecla) = event::read()? {
-                // En Windows llegan eventos Press y Release; solo procesamos Press.
-                if tecla.kind == KeyEventKind::Press {
-                    manejar_tecla(tecla, &cliente, &mut app, &mut flash_desde).await;
-                    // Si se editó la config (al guardar), reconstruimos el cliente con la nueva URL/token.
-                    if app.pantalla == Pantalla::Config {
-                        cliente = ClienteAdmin::nuevo(app.config.broker_url.clone(), app.config.token.clone());
+            match event::read()? {
+                Event::Key(tecla) => {
+                    // En Windows llegan eventos Press y Release; solo procesamos Press.
+                    if tecla.kind == KeyEventKind::Press {
+                        manejar_tecla(tecla, &cliente, &mut app, &mut flash_desde).await;
+                        // Si se editó la config (al guardar), reconstruimos el cliente con la nueva URL/token.
+                        if app.pantalla == Pantalla::Config {
+                            cliente = ClienteAdmin::nuevo(
+                                app.config.broker_url.clone(),
+                                app.config.token.clone(),
+                            );
+                        }
                     }
                 }
+                Event::Mouse(evento) => {
+                    manejar_mouse(evento, &mut app);
+                }
+                _ => {}
             }
         }
 
@@ -190,6 +221,60 @@ async fn refrescar(cliente: &ClienteAdmin, app: &mut App) {
                 }
             }
         }
+        Pantalla::Jornada => {
+            // Foco = peer seleccionado en Peers. Pedimos peers primero (barato) para resolverlo.
+            let lp = cliente.listar().await;
+            if let Ok(peers) = &lp {
+                app.datos.peers = peers.clone();
+            }
+            match app.traza_peer_actual() {
+                Some(id) => {
+                    let r = cliente.jornada(&id).await;
+                    app.marcar_resultado(&r);
+                    if let Ok(j) = r {
+                        app.datos.jornada = Some(j);
+                    }
+                }
+                None => {
+                    app.marcar_resultado(&lp);
+                    app.datos.jornada = None;
+                }
+            }
+        }
+        Pantalla::Tareas => {
+            let lp = cliente.listar().await;
+            if let Ok(peers) = &lp {
+                app.datos.peers = peers.clone();
+            }
+            match app.traza_peer_actual() {
+                Some(id) => {
+                    let r = cliente.listar_tareas(&id).await;
+                    app.marcar_resultado(&r);
+                    if let Ok(t) = r {
+                        let n = t.len();
+                        app.datos.tareas = t;
+                        if app.seleccion >= n {
+                            app.seleccion = n.saturating_sub(1);
+                        }
+                    }
+                }
+                None => {
+                    app.marcar_resultado(&lp);
+                    app.datos.tareas.clear();
+                }
+            }
+        }
+        Pantalla::Alertas => {
+            let r = cliente.alertas().await;
+            app.marcar_resultado(&r);
+            if let Ok(a) = r {
+                let n = a.len();
+                app.datos.alertas = a;
+                if app.seleccion >= n {
+                    app.seleccion = n.saturating_sub(1);
+                }
+            }
+        }
         // Acceso y Config son locales (no piden red); aun así verificamos vida del broker
         // para que el banner siga reflejando el estado real.
         Pantalla::Acceso | Pantalla::Config => {
@@ -236,7 +321,7 @@ async fn manejar_tecla(
             app.pantalla = app.pantalla.anterior();
             app.seleccion = 0;
         }
-        KeyCode::Char(c @ '1'..='6') => {
+        KeyCode::Char(c @ '1'..='9') => {
             if let Some(p) = Pantalla::desde_tecla(c) {
                 app.pantalla = p;
                 app.seleccion = 0;
@@ -249,6 +334,8 @@ async fn manejar_tecla(
                 app.seleccion_abajo(n);
             }
             Pantalla::Trazabilidad => app.seleccion_abajo(app.datos.historial.len()),
+            Pantalla::Tareas => app.seleccion_abajo(app.datos.tareas.len()),
+            Pantalla::Alertas => app.seleccion_abajo(app.datos.alertas.len()),
             Pantalla::Config => {
                 app.config_campo = (app.config_campo + 1).min(2);
             }
@@ -264,6 +351,73 @@ async fn manejar_tecla(
         }
         KeyCode::Up => app.seleccion_arriba(),
         _ => manejar_accion(tecla, cliente, app, flash_desde).await,
+    }
+}
+
+/// Despacha un evento de MOUSE. Navegación complementaria al teclado (que sigue 100% activo).
+///
+/// Mapeo de clicks (no rompe la robustez: offline/401/RAII intactos — esto solo muta estado local):
+///   (a) Click izquierdo en la barra de pestañas (y < 3) → cambia de pantalla según la columna x,
+///       reproduciendo el layout del widget Tabs (ver `Pantalla::pantalla_en_x_tabs`). Resetea
+///       la selección, igual que Tab / teclas 1-6.
+///   (b) Click izquierdo en una fila del cuerpo (tabla) → selecciona esa fila (índice por la y
+///       relativa al área del cuerpo, descontando borde + encabezado). Solo en pantallas con
+///       tabla seleccionable (Peers / Redis / Trazabilidad); clicks en zona muerta se ignoran.
+///   (c) ScrollUp/ScrollDown en cualquier parte → mueve la selección como ↑/↓.
+///
+/// Con un input modal abierto, ignoramos el mouse: el modal se cierra con teclado (Esc/Enter),
+/// para no crear estados ambiguos. El cuerpo siempre arranca en y=4 (3 filas de tabs + 1 banner).
+fn manejar_mouse(evento: MouseEvent, app: &mut App) {
+    // Con un input/modal abierto, el mouse no actúa (la edición es solo-teclado).
+    if app.input.esta_activo() || app.traza_timeline {
+        return;
+    }
+
+    // Coordenada absoluta del borde superior del cuerpo (tras tabs[3] + banner[1]).
+    const CUERPO_Y: u16 = 4;
+    // Altura de la barra de pestañas (Constraint::Length(3) → filas y=0,1,2).
+    const TABS_ALTO: u16 = 3;
+
+    match evento.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if evento.row < TABS_ALTO {
+                // (a) Click sobre la barra de pestañas.
+                if let Some(p) = Pantalla::pantalla_en_x_tabs(evento.column) {
+                    app.pantalla = p;
+                    app.seleccion = 0;
+                }
+            } else {
+                // (b) Click sobre el cuerpo: seleccionar fila si la pantalla tiene tabla.
+                let total = filas_pantalla(app);
+                if total > 0 {
+                    if let Some(idx) = app::fila_en_y_cuerpo(evento.row, CUERPO_Y, total) {
+                        app.seleccion = idx;
+                    }
+                }
+            }
+        }
+        // (c) Scroll → mover selección como flechas, acotado al total de la pantalla actual.
+        MouseEventKind::ScrollDown => {
+            let total = filas_pantalla(app);
+            app.seleccion_abajo(total);
+        }
+        MouseEventKind::ScrollUp => {
+            app.seleccion_arriba();
+        }
+        _ => {}
+    }
+}
+
+/// Número de filas seleccionables de la pantalla activa (las que tienen tabla navegable).
+/// Centraliza la cuenta que el teclado hacía inline, para reusarla en el mouse.
+fn filas_pantalla(app: &App) -> usize {
+    match app.pantalla {
+        Pantalla::Peers => app.datos.peers.len(),
+        Pantalla::Redis => app.datos.redis.as_ref().map(|r| r.colas.len()).unwrap_or(0),
+        Pantalla::Trazabilidad => app.datos.historial.len(),
+        Pantalla::Tareas => app.datos.tareas.len(),
+        Pantalla::Alertas => app.datos.alertas.len(),
+        _ => 0,
     }
 }
 

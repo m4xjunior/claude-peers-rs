@@ -223,4 +223,30 @@ impl ClienteAdmin {
     pub async fn reenviar(&self, msg_id: i64) -> ResultadoBroker<RespuestaReenviar> {
         self.post("/admin/reenviar", &PeticionReenviar { msg_id }).await
     }
+
+    /// `POST /jornada {instancia_id}` → vista consolidada (sesiones + tareas) de la jornada de
+    /// una instancia (R10/R11). Pantalla Jornada. Degrada como el resto: si el broker está
+    /// offline o devuelve 401, el banner lo refleja y la pantalla conserva su último estado.
+    pub async fn jornada(&self, instancia_id: &str) -> ResultadoBroker<RespuestaJornada> {
+        let p = PeticionJornada {
+            instancia_id: instancia_id.to_string(),
+        };
+        self.post("/jornada", &p).await
+    }
+
+    /// `POST /listar-tareas {instancia_id}` → solo las tareas de la jornada de esa instancia
+    /// (R10). Comparte cuerpo con `/jornada` (`PeticionJornada`); el broker devuelve únicamente
+    /// el vector de tareas, sin sesiones, para vistas que no necesitan los tiempos de sesión.
+    pub async fn listar_tareas(&self, instancia_id: &str) -> ResultadoBroker<Vec<Tarea>> {
+        let p = PeticionJornada {
+            instancia_id: instancia_id.to_string(),
+        };
+        self.post("/listar-tareas", &p).await
+    }
+
+    /// `GET /admin/alertas` → alertas vigentes (R6), SOLO LECTURA. Pantalla de alertas. Si el
+    /// broker no responde, el banner muestra el motivo y la pantalla mantiene su última lista.
+    pub async fn alertas(&self) -> ResultadoBroker<Vec<Alerta>> {
+        self.get("/admin/alertas").await
+    }
 }
