@@ -166,7 +166,12 @@ pub fn resultado_initialize(version_cliente: Option<&str>, id_efectivo: &str) ->
             "experimental": { "claude/channel": {} }
         },
         "serverInfo": {
-            "name": "claude-peers-rs",
+            // CRÍTICO: debe ser "claude-peers" (NO "claude-peers-rs"). El harness de Claude usa
+            // este nombre como el `source` del bloque <channel> y para asociar el push al server
+            // del flag --dangerously-load-development-channels server:claude-peers. Si no coincide
+            // con el nombre del MCP en la config (claude-peers) y con el flag, el push se DESCARTA
+            // y el mensaje nunca aparece en la sesión. Regla documentada en docs/protocolo-mcp.md.
+            "name": "claude-peers",
             "version": env!("CARGO_PKG_VERSION")
         },
         "instructions": instrucciones(id_efectivo)
