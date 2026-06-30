@@ -26,6 +26,7 @@ pub trait Almacen: Send + Sync {
         &self,
         id: &str,
         pid: i64,
+        hostname: &str,
         directorio: &str,
         repo_git: Option<&str>,
         repo_github: Option<&str>,

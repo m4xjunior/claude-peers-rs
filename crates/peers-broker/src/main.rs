@@ -33,7 +33,8 @@ use peers_core::{
     PeticionConfirmar, PeticionDefinirResumen, PeticionEditarTarea, PeticionEnviar,
     PeticionEstadoTarea, PeticionForzarTarea, PeticionHistorial, PeticionJornada, PeticionLatido,
     PeticionListar, PeticionPurgar, PeticionReasignarTarea, PeticionRecibir, PeticionRegistrar,
-    PeticionReenviar, PeticionReportarTarea, PeticionReportesTarea, PeticionSalir,
+    PeticionReenviar, PeticionReportarTarea, PeticionReportesTarea, PeticionResolverAlerta,
+    PeticionSalir,
     RespuestaAbrirTarea, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar,
     RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, TipoAlerta,
     PUERTO_DEFECTO, VENCIMIENTO_MS,
@@ -213,18 +214,23 @@ async fn salud(State(e): State<Estado>) -> Result<Json<RespuestaSalud>, ErrorApp
 /// el mismo id, p.ej. dos Claude en la misma carpeta sin --id): el id pedido existe con OTRO
 /// PID que sigue vivo → se sufija -2, -3… hasta encontrar uno libre. Sin id_preferido →
 /// id aleatorio (sin colisión posible).
-async fn resolver_id_sin_colision(e: &Estado, id_preferido: Option<&str>, pid_nuevo: i64) -> String {
+async fn resolver_id_sin_colision(
+    e: &Estado,
+    id_preferido: Option<&str>,
+    pid_nuevo: i64,
+    host_nuevo: &str,
+) -> String {
     let Some(base) = id_preferido else {
         return generar_id();
     };
-    // ¿El id base está ocupado por un peer DISTINTO y vivo?
-    if !id_ocupado_por_otro_vivo(e, base, pid_nuevo).await {
+    // ¿El id base está ocupado por un peer DISTINTO y vivo? (distingue local vs remoto por host)
+    if !id_ocupado_por_otro_vivo(e, base, pid_nuevo, host_nuevo).await {
         return base.to_string();
     }
     // Colisión real: busca el primer sufijo libre (-2, -3, …). Cota defensiva en 99.
     for n in 2..=99 {
         let candidato = format!("{base}-{n}");
-        if !id_ocupado_por_otro_vivo(e, &candidato, pid_nuevo).await {
+        if !id_ocupado_por_otro_vivo(e, &candidato, pid_nuevo, host_nuevo).await {
             warn!("id '{base}' ocupado por otro peer vivo; esta instancia usa '{candidato}'");
             return candidato;
         }
@@ -233,11 +239,42 @@ async fn resolver_id_sin_colision(e: &Estado, id_preferido: Option<&str>, pid_nu
     generar_id()
 }
 
-/// true si `id` ya está registrado por un peer con PID distinto a `pid_nuevo` y ese PID
-/// sigue vivo en esta máquina. (PID muerto o mismo PID → NO es colisión: es re-registro.)
-async fn id_ocupado_por_otro_vivo(e: &Estado, id: &str, pid_nuevo: i64) -> bool {
+/// true si `id` ya está registrado por OTRO peer que sigue vivo → colisión real (hay que sufijar).
+/// false si está libre o es un re-registro del mismo peer (reusa el id para heredar la cola).
+///
+/// CROSS-HOST (fix 2026-06-30): el broker solo puede comprobar `pid_vivo` para peers de SU
+/// PROPIA máquina (kill -0). Para un peer remoto el PID no existe localmente y se tomaría por
+/// "muerto" → DOS sesiones remotas distintas del mismo dir pisaban el mismo id (bug real: 3
+/// sesiones del server registradas como "aistudio", robándose la cola). Ahora distinguimos por
+/// hostname:
+///   - Mismo host que el registrante → es local: la liveness por PID es válida.
+///   - Host distinto (remoto) → el PID es inverificable aquí; lo tratamos como VIVO si el latido
+///     es reciente (no vencido). Así dos sesiones remotas distintas SÍ colisionan y se sufijan.
+///   - hostname vacío en ambos lados (clients viejos) → degradación a la lógica previa (solo PID).
+async fn id_ocupado_por_otro_vivo(
+    e: &Estado,
+    id: &str,
+    pid_nuevo: i64,
+    host_nuevo: &str,
+) -> bool {
     match e.almacen.instancia_obtener(id).await {
-        Ok(Some(inst)) => inst.pid != pid_nuevo && pid_vivo(inst.pid),
+        Ok(Some(inst)) => {
+            // Re-registro del MISMO peer (mismo host + mismo pid) → NO es colisión: hereda la cola.
+            let mismo_host = !host_nuevo.is_empty()
+                && !inst.hostname.is_empty()
+                && inst.hostname == host_nuevo;
+            if mismo_host && inst.pid == pid_nuevo {
+                return false;
+            }
+            // Host conocido y DISTINTO → peer remoto distinto: colisión si su latido sigue fresco.
+            // RFC3339 con misma zona (UTC) es comparable lexicográficamente: visto_en >= límite
+            // de vencimiento ⇒ latido reciente ⇒ el otro peer remoto sigue vivo ⇒ colisión real.
+            if !host_nuevo.is_empty() && !inst.hostname.is_empty() && inst.hostname != host_nuevo {
+                return inst.visto_en.as_str() >= vencidas_antes_iso().as_str();
+            }
+            // Mismo host (o host desconocido): la verificación por PID local es válida/única opción.
+            inst.pid != pid_nuevo && pid_vivo(inst.pid)
+        }
         // No existe, o error de lectura → tratamos como libre (no bloqueamos el registro).
         _ => false,
     }
@@ -258,12 +295,13 @@ async fn registrar(
     State(e): State<Estado>,
     Json(p): Json<PeticionRegistrar>,
 ) -> Result<Json<RespuestaRegistrar>, ErrorApp> {
-    let id = resolver_id_sin_colision(&e, p.id_preferido.as_deref(), p.pid).await;
+    let id = resolver_id_sin_colision(&e, p.id_preferido.as_deref(), p.pid, &p.hostname).await;
     let ahora = ahora_iso();
     e.almacen
         .registrar(
             &id,
             p.pid,
+            &p.hostname,
             &p.directorio,
             p.repo_git.as_deref(),
             p.repo_github.as_deref(),
@@ -1087,6 +1125,19 @@ async fn admin_alertas(State(e): State<Estado>) -> Result<Json<Vec<Alerta>>, Err
     Ok(Json(e.almacen.alertas().await?))
 }
 
+/// `POST /admin/alerta-resolver` → el jefe descarta una alerta a mano desde la TUI. Reusa
+/// `alerta_resolver(tipo, sujeto)` (el mismo que el supervisor llama cuando la condición se
+/// resuelve sola). Idempotente: descartar una alerta ya inexistente no es error. Va en
+/// `rutas_protegidas` (token); nunca en /salud.
+async fn admin_alerta_resolver(
+    State(e): State<Estado>,
+    Json(p): Json<PeticionResolverAlerta>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    e.almacen.alerta_resolver(&p.tipo, &p.sujeto).await?;
+    info!("admin: alerta '{}' / '{}' descartada manualmente", p.tipo, p.sujeto);
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
 /// `GET /admin/tareas` → vista global del jefe: TODAS las tareas de TODAS las instancias, cada
 /// una con su `instancia_id`, ordenadas por inicio desc (#14/R1/AC1). SOLO LECTURA. Lo consume
 /// la TUI en "vista global" (tecla `g`), que las filtra por estado y pone overrun-primero. Va en
@@ -1439,6 +1490,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/reenviar", post(admin_reenviar))
         // Supervisor (fase 5): alertas vigentes para el banner de la TUI (R6/AC3).
         .route("/admin/alertas", get(admin_alertas))
+        .route("/admin/alerta-resolver", post(admin_alerta_resolver))
         // #14/R1: vista global de todas las tareas (cuadro de mando del jefe).
         .route("/admin/tareas", get(admin_tareas))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));

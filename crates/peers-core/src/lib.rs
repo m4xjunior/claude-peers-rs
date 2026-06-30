@@ -26,6 +26,14 @@ pub struct Instancia {
     /// Identificador estable por papel (ej. "claudia"). Es la identidad persistente.
     pub id: String,
     pub pid: i64,
+    /// Hostname de la máquina donde corre el peer. CLAVE para la anti-colisión cross-host:
+    /// el broker solo puede verificar si un PID está vivo en SU PROPIA máquina (kill -0); para
+    /// un peer remoto el PID no existe localmente y se tomaría por "muerto", permitiendo que
+    /// dos sesiones remotas distintas pisen el mismo id. Comparando el hostname el broker sabe
+    /// si el PID es verificable (mismo host) o si debe distinguir por identidad (host distinto).
+    /// `#[serde(default)]`: un client viejo que no lo mande deja "" → degradación a la lógica previa.
+    #[serde(default)]
+    pub hostname: String,
     pub directorio: String,
     pub repo_git: Option<String>,
     /// Repositorio GitHub donde la instancia trabaja ("owner/repo"), derivado del remote
@@ -143,6 +151,10 @@ fn estado_por_defecto() -> EstadoMensaje {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeticionRegistrar {
     pub pid: i64,
+    /// Hostname del peer (ver `Instancia::hostname`). El broker lo usa para la anti-colisión
+    /// cross-host. `#[serde(default)]` para compat con clients viejos (mandan "" → lógica previa).
+    #[serde(default)]
+    pub hostname: String,
     pub directorio: String,
     pub repo_git: Option<String>,
     /// "owner/repo" del remote origin del git_root, resuelto por el client. None si no-GitHub.
@@ -527,6 +539,14 @@ pub struct RespuestaAdminRedis {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeticionPurgar {
     pub id: String,
+}
+
+/// Resuelve/descarta manualmente una alerta desde la TUI (el jefe). Identifica la alerta por
+/// su clave única `(tipo, sujeto)` — la misma que usa el supervisor para idempotencia.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionResolverAlerta {
+    pub tipo: String,
+    pub sujeto: String,
 }
 
 // ===========================================================================

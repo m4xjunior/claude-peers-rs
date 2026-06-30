@@ -115,6 +115,7 @@ impl Almacen for AlmacenRedis {
         &self,
         id: &str,
         pid: i64,
+        hostname: &str,
         directorio: &str,
         repo_git: Option<&str>,
         repo_github: Option<&str>,
@@ -131,6 +132,7 @@ impl Almacen for AlmacenRedis {
             cmd("HSET")
                 .arg(&clave)
                 .arg("pid").arg(pid)
+                .arg("hostname").arg(hostname)
                 .arg("directorio").arg(directorio)
                 .arg("repo_git").arg(repo_git.unwrap_or(""))
                 .arg("repo_github").arg(repo_github.unwrap_or(""))
@@ -143,6 +145,7 @@ impl Almacen for AlmacenRedis {
                 .arg(&clave)
                 .arg("id").arg(id)
                 .arg("pid").arg(pid)
+                .arg("hostname").arg(hostname)
                 .arg("directorio").arg(directorio)
                 .arg("repo_git").arg(repo_git.unwrap_or(""))
                 .arg("repo_github").arg(repo_github.unwrap_or(""))
@@ -1026,6 +1029,7 @@ async fn leer_instancia(
     Ok(Some(Instancia {
         id: h.get("id").cloned().unwrap_or_else(|| id.to_string()),
         pid: h.get("pid").and_then(|s| s.parse().ok()).unwrap_or(0),
+        hostname: h.get("hostname").cloned().unwrap_or_default(),
         directorio: h.get("directorio").cloned().unwrap_or_default(),
         repo_git: opt("repo_git"),
         repo_github: opt("repo_github"),
