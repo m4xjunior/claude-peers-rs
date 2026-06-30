@@ -240,6 +240,9 @@ pub struct App {
     /// Se guarda una copia (no un índice) para que el modal sobreviva a un refresco que
     /// reordene/encoja la lista. Los reportes asociados viven en `tarea_reportes`.
     pub tarea_detalle: Option<Tarea>,
+    /// Alerta abierta en el modal DETALLE (Enter en pantalla Alertas). Copia, no índice, para
+    /// sobrevivir a un refresco que reordene/encoja la lista (igual criterio que `tarea_detalle`).
+    pub alerta_detalle: Option<Alerta>,
     /// Reportes de progreso de la tarea del modal DETALLE (`GET /tarea/reportes`). Se cargan al
     /// abrir el modal; vacío si la tarea no tiene reportes o el broker no respondió.
     pub tarea_reportes: Vec<String>,
@@ -275,6 +278,7 @@ impl App {
             traza_timeline: false,
             peer_foco: 0,
             tarea_detalle: None,
+            alerta_detalle: None,
             tarea_reportes: Vec::new(),
             reasignar_destino: 0,
             vista_global: false,
@@ -648,7 +652,7 @@ mod tests {
     fn ciclar_peer_foco_envuelve_y_resetea_seleccion() {
         let mut app = App::nueva(crate::config::Config::default());
         let mk = |id: &str| Instancia {
-            id: id.into(), pid: 1, directorio: "/x".into(), repo_git: None,
+            id: id.into(), pid: 1, hostname: String::new(), directorio: "/x".into(), repo_git: None,
             repo_github: None, tty: None, resumen: String::new(),
             registrada_en: String::new(), visto_en: String::new(),
         };
@@ -779,6 +783,7 @@ mod tests {
         let i = Instancia {
             id: "claudia".to_string(),
             pid: 123,
+            hostname: String::new(),
             directorio: "/Users/max/proyecto".to_string(),
             repo_git: None,
             repo_github: None,
@@ -800,6 +805,7 @@ mod tests {
         let i = Instancia {
             id: "p".to_string(),
             pid: 1,
+            hostname: String::new(),
             directorio: String::new(),
             repo_git: None,
             repo_github: None,

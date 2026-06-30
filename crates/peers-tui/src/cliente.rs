@@ -261,6 +261,15 @@ impl ClienteAdmin {
         self.get("/admin/alertas").await
     }
 
+    /// `POST /admin/alerta-resolver` → el jefe descarta una alerta a mano (tecla `d` en la TUI).
+    pub async fn alerta_resolver(&self, tipo: &str, sujeto: &str) -> ResultadoBroker<RespuestaOk> {
+        let p = PeticionResolverAlerta {
+            tipo: tipo.to_string(),
+            sujeto: sujeto.to_string(),
+        };
+        self.post("/admin/alerta-resolver", &p).await
+    }
+
     /// `GET /admin/tareas` → TODAS las tareas de TODAS las instancias (R1/#14), cada `Tarea`
     /// con su `instancia_id`, ya ordenadas por inicio desc por el broker (sin KEYS). Alimenta
     /// la VISTA GLOBAL de la pantalla Tareas (tecla `g`). Degrada como el resto: si el broker

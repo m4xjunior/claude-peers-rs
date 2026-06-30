@@ -345,6 +345,18 @@ async fn manejar_tecla(
         return;
     }
 
+    // Con el modal DETALLE de alerta abierto: Esc/Enter/q cierran; `d` descarta la alerta (la
+    // resuelve en el broker) y cierra; `g` salta al sujeto en su pantalla. El resto se ignora.
+    if app.pantalla == Pantalla::Alertas && app.alerta_detalle.is_some() {
+        match tecla.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.alerta_detalle = None,
+            KeyCode::Char('d') => accion_descartar_alerta(cliente, app, flash_desde).await,
+            KeyCode::Char('g') => saltar_al_sujeto_alerta(app),
+            _ => {}
+        }
+        return;
+    }
+
     // VISTA GLOBAL de Tareas (#14): la tecla `g` la alterna en cualquier momento dentro de la
     // pantalla Tareas. Resetea la selección porque la lista mostrada cambia por completo.
     if app.pantalla == Pantalla::Tareas && tecla.code == KeyCode::Char('g') {
@@ -560,6 +572,24 @@ async fn manejar_accion(
         (Pantalla::Trazabilidad, KeyCode::Char('r')) => {
             reenviar_seleccionado(cliente, app, flash_desde).await;
         }
+        // --- Alertas ---
+        (Pantalla::Alertas, KeyCode::Enter) => {
+            // Abre el modal DETALLE de la alerta seleccionada (detalle completo, sin recorte).
+            if let Some(a) = app.datos.alertas.get(app.seleccion) {
+                app.alerta_detalle = Some(a.clone());
+            }
+        }
+        (Pantalla::Alertas, KeyCode::Char('d')) => {
+            // Descarta la alerta seleccionada (sin abrir el modal): resuelve en el broker.
+            accion_descartar_alerta(cliente, app, flash_desde).await;
+        }
+        (Pantalla::Alertas, KeyCode::Char('g')) => {
+            // Salta al sujeto de la alerta seleccionada en su pantalla (Peers/Tareas/Trazabilidad).
+            if app.datos.alertas.get(app.seleccion).is_some() {
+                app.alerta_detalle = app.datos.alertas.get(app.seleccion).cloned();
+                saltar_al_sujeto_alerta(app);
+            }
+        }
         // --- Tareas ---
         (Pantalla::Tareas, KeyCode::Enter) => {
             // Abre el modal DETALLE de la tarea seleccionada y carga sus reportes (AC5).
@@ -597,6 +627,57 @@ async fn abrir_detalle_tarea(cliente: &ClienteAdmin, app: &mut App) {
     app.marcar_resultado(&r);
     app.tarea_reportes = r.unwrap_or_default();
     app.tarea_detalle = Some(tarea);
+}
+
+/// Tipo de alerta → string del wire (lo que el broker guarda y `alerta_resolver` espera).
+/// Reusa la serialización serde (lowercase + renames) para no duplicar el mapeo.
+fn tipo_alerta_str(tipo: peers_core::TipoAlerta) -> String {
+    serde_json::to_value(tipo)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Descarta (resuelve a mano) la alerta OBJETIVO: la del modal si está abierto, o la
+/// seleccionada en la tabla. Llama al broker (`/admin/alerta-resolver`) y cierra el modal.
+/// Degrada offline/401 vía `marcar_resultado` (no crashea, muestra flash).
+async fn accion_descartar_alerta(
+    cliente: &ClienteAdmin,
+    app: &mut App,
+    flash_desde: &mut Option<Instant>,
+) {
+    let objetivo = app
+        .alerta_detalle
+        .clone()
+        .or_else(|| app.datos.alertas.get(app.seleccion).cloned());
+    let Some(a) = objetivo else {
+        return;
+    };
+    let r = cliente.alerta_resolver(&tipo_alerta_str(a.tipo), &a.sujeto).await;
+    app.marcar_resultado(&r);
+    match r {
+        Ok(_) => poner_flash(app, flash_desde, format!("alerta '{}' descartada", a.sujeto)),
+        Err(e) => poner_flash(app, flash_desde, format!("no se pudo descartar: {e}")),
+    }
+    app.alerta_detalle = None;
+}
+
+/// Salta al SUJETO de la alerta del modal en su pantalla natural para actuar ahí:
+///   - Ocioso / CancelacionExcesiva → Peers (sujeto = id de peer).
+///   - Atascado / CierreSospechoso  → Tareas (sujeto = id de tarea).
+///   - Ghosteo                       → Trazabilidad (sujeto = "msg:<id>").
+/// Cierra el modal y deja al jefe en la pantalla del sujeto. No selecciona la fila exacta
+/// (las listas se refrescan async); cambiar de pantalla ya es el atajo útil pedido.
+fn saltar_al_sujeto_alerta(app: &mut App) {
+    use peers_core::TipoAlerta::*;
+    if let Some(a) = app.alerta_detalle.take() {
+        app.pantalla = match a.tipo {
+            Ocioso | CancelacionExcesiva => Pantalla::Peers,
+            Atascado | CierreSospechoso => Pantalla::Tareas,
+            Ghosteo => Pantalla::Trazabilidad,
+        };
+        app.seleccion = 0;
+    }
 }
 
 /// Despacha las acciones que operan sobre la TAREA OBJETIVO (la del modal si está abierto, o la
