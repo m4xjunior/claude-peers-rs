@@ -67,6 +67,10 @@ pub fn rama_git(directorio: &str) -> Option<String> {
 }
 
 /// tty del proceso padre (la terminal donde corre Claude). Best-effort.
+///
+/// PORTABILIDAD: el concepto de tty (y `os::unix::process::parent_id` + `ps`) es POSIX. En
+/// Windows no aplica → devolvemos None (el campo tty es opcional; la TUI lo muestra vacío).
+#[cfg(unix)]
 pub fn tty() -> Option<String> {
     let ppid = std::os::unix::process::parent_id();
     let salida = Command::new("ps")
@@ -79,6 +83,31 @@ pub fn tty() -> Option<String> {
     } else {
         Some(t)
     }
+}
+
+#[cfg(windows)]
+pub fn tty() -> Option<String> {
+    None
+}
+
+/// Hostname de la máquina donde corre el peer. El broker lo usa para la anti-colisión
+/// cross-host (distinguir un peer remoto de uno local muerto; ver `Instancia::hostname`).
+///
+/// INTENCIÓN: con broker central (Mac) y peers en varios hosts, dos sesiones remotas del
+/// mismo directorio pedían el mismo id y el broker no las distinguía (el PID remoto no es
+/// verificable con kill -0 desde el Mac). Mandar el hostname cierra esa grieta. Sin deps
+/// nuevas: `hostname` (portable Mac/Linux) y, si falla, las env HOSTNAME/HOST; "" como
+/// último recurso → el broker degrada a la verificación por PID local (comportamiento previo).
+pub fn hostname() -> String {
+    if let Some(salida) = Command::new("hostname").output().ok() {
+        let h = String::from_utf8_lossy(&salida.stdout).trim().to_string();
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_default()
 }
 
 /// Id estable derivado del directorio de trabajo, para el caso "sin --id".

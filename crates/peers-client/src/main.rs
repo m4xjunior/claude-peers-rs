@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
     let id_asignado = match broker
         .registrar(&PeticionRegistrar {
             pid: std::process::id() as i64,
+            hostname: contexto::hostname(),
             directorio: directorio.clone(),
             repo_git: repo_git.clone(),
             repo_github: repo_github.clone(),
@@ -638,6 +639,7 @@ async fn reintentar_registro(estado: &Arc<EstadoCliente>, id_preferido: Option<S
         .broker
         .registrar(&PeticionRegistrar {
             pid: std::process::id() as i64,
+            hostname: contexto::hostname(),
             directorio: estado.directorio.clone(),
             repo_git: estado.repo_git.clone(),
             repo_github: estado.repo_github.clone(),
@@ -748,7 +750,13 @@ async fn dar_de_baja(estado: &Arc<EstadoCliente>) {
     }
 }
 
-/// Instala los manejadores de SIGINT/SIGTERM para dar de baja antes de salir.
+/// Instala los manejadores de señal de cierre para dar de baja antes de salir.
+///
+/// PORTABILIDAD (cross-host: el client también compila para Windows). En Unix escuchamos
+/// SIGINT+SIGTERM (señales POSIX); en Windows esas señales no existen → usamos `ctrl_c()`,
+/// que tokio implementa sobre el handler de consola de Windows. El resto (dar de baja + exit)
+/// es idéntico.
+#[cfg(unix)]
 fn lanzar_limpieza_senales(estado: Arc<EstadoCliente>) {
     tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
@@ -758,6 +766,17 @@ fn lanzar_limpieza_senales(estado: Arc<EstadoCliente>) {
             _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
         }
+        info!("señal de cierre recibida, dando de baja");
+        dar_de_baja(&estado).await;
+        std::process::exit(0);
+    });
+}
+
+#[cfg(windows)]
+fn lanzar_limpieza_senales(estado: Arc<EstadoCliente>) {
+    tokio::spawn(async move {
+        // En Windows no hay SIGTERM; ctrl_c cubre el cierre interactivo del proceso.
+        let _ = tokio::signal::ctrl_c().await;
         info!("señal de cierre recibida, dando de baja");
         dar_de_baja(&estado).await;
         std::process::exit(0);
