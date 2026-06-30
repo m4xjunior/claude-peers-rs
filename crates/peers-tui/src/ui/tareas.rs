@@ -49,6 +49,9 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // Offset de scroll: mantiene la fila seleccionada dentro del viewport (fix scroll 2026-06-30).
+    let offset = crate::ui::offset_scroll(app.seleccion, visibles.len(), area.height);
+
     // En vista global añadimos la columna PEER (dueño de la tarea) — el jefe ve de quién es cada una.
     if app.vista_global {
         let encabezado = Row::new(["peer", "tarea", "estado", "estimado", "real"])
@@ -56,6 +59,7 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
         let filas: Vec<Row> = visibles
             .iter()
             .enumerate()
+            .skip(offset) // viewport: solo desde la primera fila visible
             .map(|(idx, t)| fila_render_global(idx, t, app.seleccion, &app.ahora))
             .collect();
         let tabla = Table::new(
@@ -77,6 +81,7 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
         let filas: Vec<Row> = visibles
             .iter()
             .enumerate()
+            .skip(offset) // viewport: solo desde la primera fila visible
             .map(|(idx, t)| fila_render(idx, t, app.seleccion))
             .collect();
         let tabla = Table::new(

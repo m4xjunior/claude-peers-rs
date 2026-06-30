@@ -165,3 +165,60 @@ fn centrar(ancho: u16, alto: u16, area: Rect) -> Rect {
     let y = area.y + (area.height.saturating_sub(alto)) / 2;
     Rect { x, y, width: ancho, height: alto }
 }
+
+/// Offset de scroll del viewport de una tabla: primera fila a mostrar para que `seleccion`
+/// quede siempre visible. BUG arreglado (2026-06-30): las tablas usaban `render_widget` con
+/// TODAS las filas desde la 0 → cuando la lista superaba el alto visible, ratatui recortaba por
+/// abajo y la selección "bajaba" pero el viewport no la seguía ("no desce, não mostra nada").
+///
+/// Estrategia: mantener la selección dentro de la ventana [offset, offset+capacidad). Si la
+/// selección cae por debajo del borde inferior, se desplaza el offset para que quede en la
+/// última fila visible. `area_alto` es la altura del bloque; se descuentan 2 del borde y 1 del
+/// encabezado de la tabla para obtener las filas de datos realmente visibles.
+pub fn offset_scroll(seleccion: usize, total: usize, area_alto: u16) -> usize {
+    // Filas de datos visibles = alto del área − borde superior/inferior (2) − encabezado (1).
+    let capacidad = (area_alto as usize).saturating_sub(3).max(1);
+    if total <= capacidad || seleccion < capacidad {
+        0
+    } else {
+        // La selección debe quedar como ÚLTIMA fila visible: offset = seleccion − capacidad + 1.
+        (seleccion + 1).saturating_sub(capacidad)
+    }
+}
+
+#[cfg(test)]
+mod pruebas {
+    use super::offset_scroll;
+
+    #[test]
+    fn lista_corta_no_scrollea() {
+        // 5 filas en un área de alto 20 (capacidad ~17) → todo cabe, offset 0.
+        assert_eq!(offset_scroll(4, 5, 20), 0);
+    }
+
+    #[test]
+    fn seleccion_dentro_del_viewport_no_scrollea() {
+        // área alto 10 → capacidad 7. Selección 3 < 7 → visible sin desplazar.
+        assert_eq!(offset_scroll(3, 100, 10), 0);
+    }
+
+    #[test]
+    fn seleccion_mas_alla_desplaza_el_viewport() {
+        // área alto 10 → capacidad 7. Selección 20 → offset = 20+1−7 = 14
+        // (filas 14..=20 visibles, la 20 queda como última). ESTE es el caso del bug.
+        assert_eq!(offset_scroll(20, 100, 10), 14);
+    }
+
+    #[test]
+    fn ultima_fila_de_lista_larga_queda_visible() {
+        // 50 filas, área alto 10 (cap 7), selección en la última (49) → offset 43.
+        assert_eq!(offset_scroll(49, 50, 10), 43);
+    }
+
+    #[test]
+    fn area_diminuta_no_panica() {
+        // alto 0/1/2 → capacidad mínima 1, sin overflow.
+        assert_eq!(offset_scroll(0, 0, 0), 0);
+        assert_eq!(offset_scroll(5, 10, 1), 5);
+    }
+}

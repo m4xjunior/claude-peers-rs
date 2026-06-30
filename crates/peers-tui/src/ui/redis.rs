@@ -18,9 +18,12 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Tabla izquierda: colas de mensajes (seleccionable).
+    // Offset de scroll: mantiene la fila seleccionada dentro del viewport (fix scroll 2026-06-30).
+    let offset = crate::ui::offset_scroll(app.seleccion, colas.len(), area.height);
     let filas_colas: Vec<Row> = colas
         .iter()
         .enumerate()
+        .skip(offset) // viewport: solo desde la primera fila visible
         .map(|(idx, c)| {
             let estilo = if idx == app.seleccion {
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)

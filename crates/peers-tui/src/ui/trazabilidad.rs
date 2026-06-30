@@ -43,11 +43,14 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
     let encabezado = Row::new(["id", "de", "texto", "estado", "enviado"])
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 
+    // Offset de scroll: mantiene la fila seleccionada dentro del viewport (fix scroll 2026-06-30).
+    let offset = crate::ui::offset_scroll(app.seleccion, app.datos.historial.len(), area.height);
     let filas: Vec<Row> = app
         .datos
         .historial
         .iter()
         .enumerate()
+        .skip(offset) // viewport: solo desde la primera fila visible
         .map(|(idx, m)| fila_render(idx, m, app.seleccion))
         .collect();
 
