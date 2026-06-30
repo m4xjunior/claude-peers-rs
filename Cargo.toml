@@ -10,6 +10,15 @@ members = [
     "crates/peers-tui",
 ]
 
+# Metadatos compartidos. `license-file` (no `license`) porque es propietaria, no SPDX OSI.
+# `publish = false`: nunca subir a crates.io (herramienta privada). Ver LICENSE.
+[workspace.package]
+version = "0.1.0"
+authors = ["Max Meireles <max@lexusfx.com>"]
+edition = "2021"
+license-file = "LICENSE"
+publish = false
+
 # Dependencias compartidas centralizadas — una sola fuente de versiones para los 3 crates.
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

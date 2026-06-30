@@ -115,6 +115,32 @@ export CLAUDE_PEERS_TOKEN=lexusfx-peers-2026
 El `peers-client` lee ambas (clap env). Reinicia el `claude` del server y `listar_instancias`
 mostrará los peers del Mac; los mensajes cruzan en ambos sentidos.
 
+> ⚠️ **REGLA CRÍTICA DEL ORDEN (verificado 2026-06-30 — por qué "ayer funcionó y hoy no").**
+> Las variables DEBEN estar exportadas **ANTES** de arrancar `claude`. No basta con
+> escribirlas en `~/.bashrc` si la sesión de `claude` ya está corriendo: el plugin las lee
+> **una sola vez al lanzar el MCP**, heredándolas del entorno del proceso `claude`.
+> El motivo está en el `.mcp.json` del plugin:
+> ```json
+> { "mcpServers": { "claude-peers": {
+>     "command": "${CLAUDE_PLUGIN_ROOT}/bin/peers-client-launcher",
+>     "env": {}            ← VACÍO: el launcher hereda el entorno del proceso `claude`
+> }}}
+> ```
+> Como `env` está vacío, el `peers-client-launcher` toma `CLAUDE_PEERS_BROKER_URL`/`_TOKEN`
+> del shell que lanzó `claude`. Si no están en ese momento → cae al **default `127.0.0.1:7899`**
+> y, si hay un broker local en el server, se registra en **esa isla** (no en el Mac). Por eso
+> aistudio "desaparecía" de la TUI del Mac.
+>
+> **Receta correcta en el server (en este orden):**
+> ```bash
+> export CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899
+> export CLAUDE_PEERS_TOKEN=lexusfx-peers-2026
+> claude                       # arrancar DESPUÉS de exportar
+> ```
+> Y **no debe haber un `peers-broker` local en el server** (la topología es 1 broker central
+> en el Mac). Si quedó uno corriendo de una sesión vieja: `pkill -f peers-broker-linux`
+> antes de relanzar `claude` con las variables ya exportadas.
+
 > Requiere que el server alcance `10.0.1.60:7899` (misma LAN, sin firewall bloqueando). Probar
 > desde el server: `curl -s -o /dev/null -w "%{http_code}\n" http://10.0.1.60:7899/salud` → 200.
 
