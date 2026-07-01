@@ -4,8 +4,8 @@ Guía para conectar una máquina **Windows** a la red claude-peers. Dos partes:
 (A) generar el binario `peers-client.exe` (una vez, desde macOS/Linux), y
 (B) instalarlo como MCP en el Claude Code de Windows.
 
-El broker sigue siendo central (p. ej. el Mac de Max en la LAN); Windows es solo un cliente
-más que se conecta a ese broker.
+El broker sigue siendo central (una máquina de la LAN, macOS/Linux); Windows es solo un
+cliente más que se conecta a ese broker.
 
 ---
 
@@ -33,9 +33,9 @@ PATH="/opt/homebrew/opt/llvm/bin:$PATH" \
 ### Distribuir el `.exe`
 No se versiona en git (`/target` está en `.gitignore`). Vías para llevarlo a Windows:
 - **GitHub Releases** (recomendado para el producto).
-- **Servidor HTTP temporal** desde el Mac (rápido para pruebas), y descargar con PowerShell:
+- **Servidor HTTP temporal** desde la máquina que compiló (rápido para pruebas):
   ```bash
-  # en el Mac, sirviendo la carpeta del .exe:
+  # sirviendo la carpeta del .exe en la LAN:
   cd target/x86_64-pc-windows-msvc/release && python3 -m http.server 8899 --bind 0.0.0.0
   ```
 - Carpeta compartida / pendrive.
@@ -52,20 +52,20 @@ Con Claude Code ya instalado en la máquina Windows. Todos los pasos en **PowerS
 ### 1. Colocar el `.exe`
 ```powershell
 mkdir C:\peers -Force
-# ejemplo con descarga por HTTP desde el Mac (ajusta la IP/puerto):
-Invoke-WebRequest -Uri "http://10.0.1.60:8899/peers-client.exe" -OutFile "C:\peers\peers-client.exe"
+# ejemplo con descarga por HTTP desde la máquina que compiló (ajusta IP/puerto):
+Invoke-WebRequest -Uri "http://<IP-DEL-BROKER>:8899/peers-client.exe" -OutFile "C:\peers\peers-client.exe"
 ```
 
 ### 2. Verificar que Windows alcanza el broker
 ```powershell
-Test-NetConnection 10.0.1.60 -Port 7899
+Test-NetConnection <IP-DEL-BROKER> -Port 7899
 ```
 Debe dar **`TcpTestSucceeded : True`**. Si es `False`: firewall del equipo del broker o ruteo
-entre subredes (Windows y broker en `10.0.5.x` vs `10.0.1.x` → distinta subred, requiere ruta).
+entre subredes (Windows y broker en subredes distintas, requiere ruta).
 
 ### 3. Registrar el MCP (scope user / global)
 ```powershell
-claude mcp add claude-peers -s user -e CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899 -e CLAUDE_PEERS_TOKEN=lexusfx-peers-2026 -- C:\peers\peers-client.exe
+claude mcp add claude-peers -s user -e CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899 -e CLAUDE_PEERS_TOKEN=<TU-TOKEN> -- C:\peers\peers-client.exe
 ```
 
 > **Sintaxis:** Claude Code ≥ 2.1.x usa `-s` (scope) y `-e` (env). Versiones viejas usaban

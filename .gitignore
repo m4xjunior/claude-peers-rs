@@ -1,2 +1,5 @@
 /target
 /dist
+
+# Documentación de diseño interno (no va en el repo público — datos y decisiones privadas)
+/docs/INTERNO/

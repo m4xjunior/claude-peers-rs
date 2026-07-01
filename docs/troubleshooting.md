@@ -7,14 +7,14 @@ Runbook operativo de los 6 casos reales donde nos trabamos el **2026-06-30** mon
 | Pieza | Valor |
 |---|---|
 | Broker central | **Mac** |
-| IP:puerto del broker | `10.0.1.60:7899` |
-| Token de la red | `lexusfx-peers-2026` |
-| URL del broker | `http://10.0.1.60:7899` |
-| Endpoint de salud | `http://10.0.1.60:7899/salud` |
+| IP:puerto del broker | `<IP-DEL-BROKER>:7899` |
+| Token de la red | `<TU-TOKEN>` |
+| URL del broker | `http://<IP-DEL-BROKER>:7899` |
+| Endpoint de salud | `http://<IP-DEL-BROKER>:7899/salud` |
 | Default si NO hay env | `127.0.0.1:7899` (broker LOCAL — isla, NO sirve para cross-host) |
 | Versión Claude Code | `2.1.196` (cambió sintaxis de `mcp add` y exige `command claude` por la función shell) |
 
-> **Regla mental:** el Mac es el único broker. Todo lo demás (servidor incluido) es **cliente** y debe apuntar a `10.0.1.60:7899` con el token. Si una máquina cae al default `127.0.0.1:7899`, se aísla en su propio broker local y no la ve nadie.
+> **Regla mental:** el Mac es el único broker. Todo lo demás (servidor incluido) es **cliente** y debe apuntar a `<IP-DEL-BROKER>:7899` con el token. Si una máquina cae al default `127.0.0.1:7899`, se aísla en su propio broker local y no la ve nadie.
 
 ---
 
@@ -58,7 +58,7 @@ tr '\0' '\n' < /proc/$pid/environ | grep -E 'CLAUDE_PEERS_(BROKER_URL|TOKEN)'
 # Vacío = está cayendo al default local → ESTE es el problema
 
 # 2) ¿El server alcanza el broker del Mac? (debe dar 200)
-curl -s -o /dev/null -w "%{http_code}\n" http://10.0.1.60:7899/salud
+curl -s -o /dev/null -w "%{http_code}\n" http://<IP-DEL-BROKER>:7899/salud
 ```
 
 Interpretación:
@@ -70,11 +70,11 @@ Exportar las dos vars **y DESPUÉS** arrancar `claude` (orden estricto):
 
 ```bash
 # En el server, en la MISMA shell, en este orden:
-export CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899
-export CLAUDE_PEERS_TOKEN=lexusfx-peers-2026
+export CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899
+export CLAUDE_PEERS_TOKEN=<TU-TOKEN>
 
 # Verifica alcance ANTES de arrancar (debe imprimir 200)
-curl -s -o /dev/null -w "%{http_code}\n" http://10.0.1.60:7899/salud
+curl -s -o /dev/null -w "%{http_code}\n" http://<IP-DEL-BROKER>:7899/salud
 
 # Ahora sí, arranca claude (hereda el entorno correcto)
 claude
@@ -84,8 +84,8 @@ Para que persista en shells nuevos (no afecta a procesos ya vivos), añádelo al
 
 ```bash
 cat >> ~/.bashrc <<'EOF'
-export CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899
-export CLAUDE_PEERS_TOKEN=lexusfx-peers-2026
+export CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899
+export CLAUDE_PEERS_TOKEN=<TU-TOKEN>
 EOF
 ```
 
@@ -121,13 +121,13 @@ claude mcp list | grep -i peers
 ```
 
 ### Fix
-Registrar el MCP en **user scope** (global) con la sintaxis nueva de 2.1.196. Sustituye `~/.claude/plugins/cache/lexusfx/claude-peers-rs/0.1.10/bin/peers-client-launcher` por la ruta real del launcher del `peers-client`:
+Registrar el MCP en **user scope** (global) con la sintaxis nueva de 2.1.196. Sustituye `~/.claude/plugins/cache/<tu-marketplace>/claude-peers-rs/<version>/bin/peers-client-launcher` por la ruta real del launcher del `peers-client`:
 
 ```bash
 command claude mcp add claude-peers -s user \
-  -e CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899 \
-  -e CLAUDE_PEERS_TOKEN=lexusfx-peers-2026 \
-  -- ~/.claude/plugins/cache/lexusfx/claude-peers-rs/0.1.10/bin/peers-client-launcher
+  -e CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899 \
+  -e CLAUDE_PEERS_TOKEN=<TU-TOKEN> \
+  -- ~/.claude/plugins/cache/<tu-marketplace>/claude-peers-rs/<version>/bin/peers-client-launcher
 ```
 
 Verificar:
@@ -225,9 +225,9 @@ Aplicado al peers-client (idéntico al Caso 2):
 
 ```bash
 command claude mcp add claude-peers -s user \
-  -e CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899 \
-  -e CLAUDE_PEERS_TOKEN=lexusfx-peers-2026 \
-  -- ~/.claude/plugins/cache/lexusfx/claude-peers-rs/0.1.10/bin/peers-client-launcher
+  -e CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899 \
+  -e CLAUDE_PEERS_TOKEN=<TU-TOKEN> \
+  -- ~/.claude/plugins/cache/<tu-marketplace>/claude-peers-rs/<version>/bin/peers-client-launcher
 ```
 
 ---
@@ -298,9 +298,9 @@ Asegurar las tres condiciones que dependen de nosotros, en orden:
 1. **MCP configurado + conectado** (puerta #1) → [Caso 2](#caso-2--ni-llega-el-mensaje-al-peer-ayer-llegaba-hoy-no):
    ```bash
    command claude mcp add claude-peers -s user \
-     -e CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899 \
-     -e CLAUDE_PEERS_TOKEN=lexusfx-peers-2026 \
-     -- ~/.claude/plugins/cache/lexusfx/claude-peers-rs/0.1.10/bin/peers-client-launcher
+     -e CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899 \
+     -e CLAUDE_PEERS_TOKEN=<TU-TOKEN> \
+     -- ~/.claude/plugins/cache/<tu-marketplace>/claude-peers-rs/<version>/bin/peers-client-launcher
    claude mcp list | grep -i peers   # Connected
    ```
 
@@ -317,27 +317,27 @@ Asegurar las tres condiciones que dependen de nosotros, en orden:
 
 ## Checklist de instalación plug-and-play (server nuevo)
 
-Pasos en orden para enchufar un server nuevo a la red del Mac. Sustituye `~/.claude/plugins/cache/lexusfx/claude-peers-rs/0.1.10/bin/peers-client-launcher` por la ruta real.
+Pasos en orden para enchufar un server nuevo a la red. Sustituye `~/.claude/plugins/cache/<tu-marketplace>/claude-peers-rs/<version>/bin/peers-client-launcher` por la ruta real.
 
 ```bash
 # 1) Exportar env del broker ANTES de arrancar claude (Caso 1)
-export CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899
-export CLAUDE_PEERS_TOKEN=lexusfx-peers-2026
+export CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899
+export CLAUDE_PEERS_TOKEN=<TU-TOKEN>
 
 # 2) Verificar alcance al broker del Mac (debe dar 200) (Caso 1)
-curl -s -o /dev/null -w "%{http_code}\n" http://10.0.1.60:7899/salud
+curl -s -o /dev/null -w "%{http_code}\n" http://<IP-DEL-BROKER>:7899/salud
 
 # 3) Persistir env en el rc (solo afecta a shells NUEVOS) (Caso 1)
 cat >> ~/.bashrc <<'EOF'
-export CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899
-export CLAUDE_PEERS_TOKEN=lexusfx-peers-2026
+export CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899
+export CLAUDE_PEERS_TOKEN=<TU-TOKEN>
 EOF
 
 # 4) Registrar el MCP en user scope, sintaxis 2.1.196 + bypass función shell (Casos 2 y 4)
 command claude mcp add claude-peers -s user \
-  -e CLAUDE_PEERS_BROKER_URL=http://10.0.1.60:7899 \
-  -e CLAUDE_PEERS_TOKEN=lexusfx-peers-2026 \
-  -- ~/.claude/plugins/cache/lexusfx/claude-peers-rs/0.1.10/bin/peers-client-launcher
+  -e CLAUDE_PEERS_BROKER_URL=http://<IP-DEL-BROKER>:7899 \
+  -e CLAUDE_PEERS_TOKEN=<TU-TOKEN> \
+  -- ~/.claude/plugins/cache/<tu-marketplace>/claude-peers-rs/<version>/bin/peers-client-launcher
 
 # 5) Verificar que el MCP está Connected (Caso 2)
 claude mcp list | grep -i peers     # claude-peers ... Connected
