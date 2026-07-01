@@ -8,6 +8,8 @@ en cualquier servidor.
 > **Licencia:** software propietario privado (uso personal). No es código abierto.
 > Ver [LICENSE](LICENSE). **Troubleshooting:** si los mensajes no llegan, consulta
 > [docs/troubleshooting.md](docs/troubleshooting.md) (los 6 casos comunes con su fix).
+> **Windows:** para conectar una máquina Windows (cross-compilar el `.exe` + registrar el
+> MCP en PowerShell), consulta [docs/windows.md](docs/windows.md).
 
 ## Por qué Rust
 
