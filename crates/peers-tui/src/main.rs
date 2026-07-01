@@ -322,7 +322,12 @@ async fn manejar_tecla(
     // 'r' reenvía el mensaje del timeline; el resto de teclas se ignora hasta cerrarlo.
     if app.pantalla == Pantalla::Trazabilidad && app.traza_timeline {
         match tecla.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.traza_timeline = false,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.traza_timeline = false;
+                app.modal_scroll = 0;
+            }
+            KeyCode::PageDown => app.modal_scroll_abajo(),
+            KeyCode::PageUp => app.modal_scroll_arriba(),
             KeyCode::Char('r') => reenviar_seleccionado(cliente, app, flash_desde).await,
             _ => {}
         }
@@ -335,6 +340,8 @@ async fn manejar_tecla(
     if app.pantalla == Pantalla::Tareas && app.tarea_detalle.is_some() {
         match tecla.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.cerrar_detalle_tarea(),
+            KeyCode::PageDown => app.modal_scroll_abajo(),
+            KeyCode::PageUp => app.modal_scroll_arriba(),
             KeyCode::Char('e') | KeyCode::Char('+') | KeyCode::Char('f')
             | KeyCode::Char('b') | KeyCode::Char('h') | KeyCode::Char('c')
             | KeyCode::Char('R') => {
@@ -349,7 +356,12 @@ async fn manejar_tecla(
     // resuelve en el broker) y cierra; `g` salta al sujeto en su pantalla. El resto se ignora.
     if app.pantalla == Pantalla::Alertas && app.alerta_detalle.is_some() {
         match tecla.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.alerta_detalle = None,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.alerta_detalle = None;
+                app.modal_scroll = 0;
+            }
+            KeyCode::PageDown => app.modal_scroll_abajo(),
+            KeyCode::PageUp => app.modal_scroll_arriba(),
             KeyCode::Char('d') => accion_descartar_alerta(cliente, app, flash_desde).await,
             KeyCode::Char('g') => saltar_al_sujeto_alerta(app),
             _ => {}
@@ -567,6 +579,7 @@ async fn manejar_accion(
             // Abre el timeline del mensaje seleccionado (si hay alguno).
             if app.traza_mensaje_seleccionado().is_some() {
                 app.traza_timeline = true;
+                app.modal_scroll = 0;
             }
         }
         (Pantalla::Trazabilidad, KeyCode::Char('r')) => {
@@ -577,6 +590,7 @@ async fn manejar_accion(
             // Abre el modal DETALLE de la alerta seleccionada (detalle completo, sin recorte).
             if let Some(a) = app.datos.alertas.get(app.seleccion) {
                 app.alerta_detalle = Some(a.clone());
+                app.modal_scroll = 0;
             }
         }
         (Pantalla::Alertas, KeyCode::Char('d')) => {
@@ -627,6 +641,7 @@ async fn abrir_detalle_tarea(cliente: &ClienteAdmin, app: &mut App) {
     app.marcar_resultado(&r);
     app.tarea_reportes = r.unwrap_or_default();
     app.tarea_detalle = Some(tarea);
+    app.modal_scroll = 0;
 }
 
 /// Tipo de alerta → string del wire (lo que el broker guarda y `alerta_resolver` espera).

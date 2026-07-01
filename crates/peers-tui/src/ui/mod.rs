@@ -186,9 +186,32 @@ pub fn offset_scroll(seleccion: usize, total: usize, area_alto: u16) -> usize {
     }
 }
 
+/// Ancho disponible (en columnas) para la ÚNICA columna flexible de una tabla, dado el ancho del
+/// área y la suma de los anchos fijos de las demás columnas. Sirve para recortar el texto de esa
+/// columna al ESPACIO REAL en vez de a una constante fija (fix "textos cortados" 2026-07-01): así
+/// en una terminal ancha se ve más contenido. Descuenta 2 del borde del bloque y 1 por columna
+/// para el separador. `min` de seguridad para no devolver 0 (que ocultaría toda la celda).
+pub fn ancho_columna_flexible(area_ancho: u16, fijas: u16, num_columnas: u16) -> usize {
+    let separadores = num_columnas.saturating_sub(1); // ratatui deja 1 col entre columnas
+    (area_ancho.saturating_sub(2).saturating_sub(fijas).saturating_sub(separadores)).max(8) as usize
+}
+
 #[cfg(test)]
 mod pruebas {
-    use super::offset_scroll;
+    use super::{ancho_columna_flexible, offset_scroll};
+
+    #[test]
+    fn ancho_flexible_descuenta_fijas_borde_y_separadores() {
+        // área 100, 3 columnas fijas sumando 40, 4 columnas totales →
+        // 100 − 2 (borde) − 40 (fijas) − 3 (separadores) = 55.
+        assert_eq!(ancho_columna_flexible(100, 40, 4), 55);
+    }
+
+    #[test]
+    fn ancho_flexible_nunca_menor_que_8() {
+        // Terminal muy angosta: no devuelve 0 ni negativo, mínimo 8.
+        assert_eq!(ancho_columna_flexible(20, 40, 4), 8);
+    }
 
     #[test]
     fn lista_corta_no_scrollea() {

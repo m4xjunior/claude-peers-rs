@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -45,13 +45,15 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
 
     // Offset de scroll: mantiene la fila seleccionada dentro del viewport (fix scroll 2026-06-30).
     let offset = crate::ui::offset_scroll(app.seleccion, app.datos.historial.len(), area.height);
+    // Ancho real de la columna flexible `texto` (col 3, Min). Fijas: 8+14+14+10=46, 5 columnas.
+    let ancho_texto = crate::ui::ancho_columna_flexible(area.width, 46, 5);
     let filas: Vec<Row> = app
         .datos
         .historial
         .iter()
         .enumerate()
         .skip(offset) // viewport: solo desde la primera fila visible
-        .map(|(idx, m)| fila_render(idx, m, app.seleccion))
+        .map(|(idx, m)| fila_render(idx, m, app.seleccion, ancho_texto))
         .collect();
 
     let tabla = Table::new(
@@ -72,7 +74,7 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
     // Modal de timeline completo del mensaje seleccionado (Enter).
     if app.traza_timeline {
         if let Some(m) = app.traza_mensaje_seleccionado() {
-            dibujar_timeline(f, area, m);
+            dibujar_timeline(f, area, m, app.modal_scroll);
         }
     }
 }
@@ -80,8 +82,10 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
 /// Construye la fila de la tabla: 4 celdas neutras (id/de/texto/enviado) + la celda de estado
 /// con su color. La fila seleccionada se resalta con fondo cian (sin perder el color del estado
 /// en su celda, que se mantiene legible sobre el resalte de la fila no-seleccionada).
-fn fila_render(idx: usize, m: &Mensaje, seleccion: usize) -> Row<'static> {
+fn fila_render(idx: usize, m: &Mensaje, seleccion: usize, ancho_texto: usize) -> Row<'static> {
     let [id, de, texto, enviado] = fila_traza(m);
+    // `texto` viene sin recortar (columna flexible): lo ajustamos al ancho real de su columna.
+    let texto = crate::app::recortar(&texto, ancho_texto);
     let (etiqueta, color) = estilo_estado(m.estado);
 
     let resaltada = idx == seleccion;
@@ -105,7 +109,7 @@ fn fila_render(idx: usize, m: &Mensaje, seleccion: usize) -> Row<'static> {
 
 /// Modal centrado con el timeline completo de un mensaje: cada transición con su timestamp
 /// timbrado por el broker, más la traza de reenvío. Solo lectura.
-fn dibujar_timeline(f: &mut Frame, area: Rect, m: &Mensaje) {
+fn dibujar_timeline(f: &mut Frame, area: Rect, m: &Mensaje, scroll: u16) {
     let modal = centrar(64, 16, area);
     f.render_widget(Clear, modal);
 
@@ -149,7 +153,15 @@ fn dibujar_timeline(f: &mut Frame, area: Rect, m: &Mensaje) {
         .borders(Borders::ALL)
         .title(" timeline ")
         .border_style(Style::default().fg(Color::Cyan));
-    f.render_widget(Paragraph::new(lineas).block(bloque), modal);
+    // Wrap: el texto completo del mensaje envuelve a varias líneas (antes se cortaba). Scroll:
+    // PageDown/PageUp para mensajes que exceden el alto del modal.
+    f.render_widget(
+        Paragraph::new(lineas)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll, 0))
+            .block(bloque),
+        modal,
+    );
 }
 
 /// Una línea de hito del timeline: etiqueta + timestamp, o "—" en gris si aún no ocurrió.

@@ -14,6 +14,8 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
 
     // Offset de scroll: mantiene la fila seleccionada dentro del viewport (fix scroll 2026-06-30).
     let offset = crate::ui::offset_scroll(app.seleccion, app.datos.peers.len(), area.height);
+    // Ancho real de la columna flexible `resumen` (col 3, Min). Fijas: 16+34+10=60, 4 columnas.
+    let ancho_resumen = crate::ui::ancho_columna_flexible(area.width, 60, 4);
     let filas: Vec<Row> = app
         .datos
         .peers
@@ -21,7 +23,9 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .skip(offset) // viewport: solo desde la primera fila visible
         .map(|(idx, inst)| {
-            let celdas = fila_peer(inst);
+            let mut celdas = fila_peer(inst);
+            // resumen (celda 2) viene sin recortar: lo ajustamos al ancho real de su columna.
+            celdas[2] = crate::app::recortar(&celdas[2], ancho_resumen);
             let estilo = if idx == app.seleccion {
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {

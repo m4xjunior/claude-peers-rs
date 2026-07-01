@@ -35,13 +35,15 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
 
     // Offset de scroll: mantiene la fila seleccionada dentro del viewport (fix scroll 2026-06-30).
     let offset = crate::ui::offset_scroll(app.seleccion, app.datos.alertas.len(), area.height);
+    // Ancho real de la columna flexible `detalle` (col 3, Min). Fijas: 10+18+10=38, 4 columnas.
+    let ancho_detalle = crate::ui::ancho_columna_flexible(area.width, 38, 4);
     let filas: Vec<Row> = app
         .datos
         .alertas
         .iter()
         .enumerate()
         .skip(offset) // viewport: solo desde la primera fila visible
-        .map(|(idx, a)| fila_render(idx, a, app.seleccion))
+        .map(|(idx, a)| fila_render(idx, a, app.seleccion, ancho_detalle))
         .collect();
 
     let tabla = Table::new(
@@ -61,14 +63,14 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
     // Modal DETALLE encima de la tabla (Enter sobre una fila): muestra el detalle COMPLETO,
     // que en la tabla va recortado a 40 chars. Aquí es donde el jefe ve toda la info y decide.
     if let Some(alerta) = &app.alerta_detalle {
-        dibujar_detalle(f, area, alerta);
+        dibujar_detalle(f, area, alerta, app.modal_scroll);
     }
 }
 
 /// Modal con el detalle completo de una alerta: tipo, sujeto, texto íntegro y cuándo se creó.
 /// La tabla recorta el detalle; este modal NO, para que el jefe lea el mensaje entero del
 /// supervisor antes de descartar (d) o saltar al sujeto (g).
-fn dibujar_detalle(f: &mut Frame, area: Rect, a: &Alerta) {
+fn dibujar_detalle(f: &mut Frame, area: Rect, a: &Alerta, scroll: u16) {
     let modal = centrar(70, 14, area);
     f.render_widget(Clear, modal);
 
@@ -98,6 +100,7 @@ fn dibujar_detalle(f: &mut Frame, area: Rect, a: &Alerta) {
 
     let p = Paragraph::new(lineas)
         .wrap(Wrap { trim: true })
+        .scroll((scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -118,7 +121,7 @@ fn centrar(ancho: u16, alto: u16, area: Rect) -> Rect {
 
 /// Fila de alerta: la celda de tipo va coloreada según su severidad; el resto neutro. La fila
 /// seleccionada se resalta con fondo tenue sin perder el color del tipo.
-fn fila_render(idx: usize, a: &Alerta, seleccion: usize) -> Row<'static> {
+fn fila_render(idx: usize, a: &Alerta, seleccion: usize, ancho_detalle: usize) -> Row<'static> {
     let color = color_alerta(a.tipo);
     let estilo_fila = if idx == seleccion {
         Style::default().bg(Color::Rgb(40, 40, 60)).add_modifier(Modifier::BOLD)
@@ -129,7 +132,8 @@ fn fila_render(idx: usize, a: &Alerta, seleccion: usize) -> Row<'static> {
     Row::new(vec![
         Cell::from(etiqueta_alerta(a.tipo)).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Cell::from(recortar(&a.sujeto, 18)),
-        Cell::from(recortar(&a.detalle, 40)),
+        // detalle: columna flexible → recorte al ancho real de la columna.
+        Cell::from(recortar(&a.detalle, ancho_detalle)),
         Cell::from(crate::app::hora_iso(&a.creada_en)),
     ])
     .style(estilo_fila)

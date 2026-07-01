@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -51,6 +51,10 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
 
     // Offset de scroll: mantiene la fila seleccionada dentro del viewport (fix scroll 2026-06-30).
     let offset = crate::ui::offset_scroll(app.seleccion, visibles.len(), area.height);
+    // Ancho real de la columna flexible `tarea` (descripción). Fijas distintas por vista:
+    // global 16+11+10+10=47 (5 cols), normal 11+10+10=31 (4 cols).
+    let ancho_desc_global = crate::ui::ancho_columna_flexible(area.width, 47, 5);
+    let ancho_desc_normal = crate::ui::ancho_columna_flexible(area.width, 31, 4);
 
     // En vista global añadimos la columna PEER (dueño de la tarea) — el jefe ve de quién es cada una.
     if app.vista_global {
@@ -60,7 +64,7 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
             .iter()
             .enumerate()
             .skip(offset) // viewport: solo desde la primera fila visible
-            .map(|(idx, t)| fila_render_global(idx, t, app.seleccion, &app.ahora))
+            .map(|(idx, t)| fila_render_global(idx, t, app.seleccion, &app.ahora, ancho_desc_global))
             .collect();
         let tabla = Table::new(
             filas,
@@ -82,7 +86,7 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
             .iter()
             .enumerate()
             .skip(offset) // viewport: solo desde la primera fila visible
-            .map(|(idx, t)| fila_render(idx, t, app.seleccion))
+            .map(|(idx, t)| fila_render(idx, t, app.seleccion, ancho_desc_normal))
             .collect();
         let tabla = Table::new(
             filas,
@@ -100,14 +104,16 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
 
     // Modal DETALLE encima de la tabla (Enter sobre una fila).
     if let Some(tarea) = &app.tarea_detalle {
-        dibujar_detalle(f, area, tarea, &app.tarea_reportes);
+        dibujar_detalle(f, area, tarea, &app.tarea_reportes, app.modal_scroll);
     }
 }
 
 /// Fila de tarea con resalte de la seleccionada y estado coloreado por `color_estado_tarea`.
 /// La columna "real" muestra lo timbrado por el broker (`duracion_seg`); "estimado" lo de la IA.
-fn fila_render(idx: usize, t: &Tarea, seleccion: usize) -> Row<'static> {
+fn fila_render(idx: usize, t: &Tarea, seleccion: usize, ancho_desc: usize) -> Row<'static> {
     let [desc, estimado, real, _estado_viejo] = fila_tarea(t);
+    // `desc` viene sin recortar (columna flexible): al ancho real de su columna.
+    let desc = crate::app::recortar(&desc, ancho_desc);
     let color = color_estado_tarea(t.estado);
     let etiqueta = etiqueta_estado_tarea(t.estado);
 
@@ -129,8 +135,10 @@ fn fila_render(idx: usize, t: &Tarea, seleccion: usize) -> Row<'static> {
 /// Fila de tarea en VISTA GLOBAL: añade la columna PEER (dueño) al principio. Marca las
 /// overrun/atascadas con un `⚠` rojo en el peer para que salten a la vista del jefe (#14/R3).
 /// `ahora_iso` se usa para evaluar el overrun (mismo reloj que el orden). Función pura.
-fn fila_render_global(idx: usize, t: &Tarea, seleccion: usize, ahora_iso: &str) -> Row<'static> {
+fn fila_render_global(idx: usize, t: &Tarea, seleccion: usize, ahora_iso: &str, ancho_desc: usize) -> Row<'static> {
     let [desc, estimado, real, _estado_viejo] = fila_tarea(t);
+    // `desc` viene sin recortar (columna flexible): al ancho real de su columna.
+    let desc = crate::app::recortar(&desc, ancho_desc);
     let color = color_estado_tarea(t.estado);
     let etiqueta = etiqueta_estado_tarea(t.estado);
     let overrun = App::tarea_overrun(t, ahora_iso);
@@ -162,7 +170,7 @@ fn fila_render_global(idx: usize, t: &Tarea, seleccion: usize, ahora_iso: &str) 
 /// Modal centrado con el detalle completo de la tarea: descripción, tiempos, estado (coloreado),
 /// motivo de bloqueo y lista de reportes de progreso (AC5). Solo lectura — las acciones se hacen
 /// con teclas sobre la tabla (la barra de ayuda las lista). Se cierra con Esc/Enter/q.
-fn dibujar_detalle(f: &mut Frame, area: Rect, t: &Tarea, reportes: &[String]) {
+fn dibujar_detalle(f: &mut Frame, area: Rect, t: &Tarea, reportes: &[String], scroll: u16) {
     let modal = centrar(72, 18, area);
     f.render_widget(Clear, modal);
 
@@ -226,7 +234,15 @@ fn dibujar_detalle(f: &mut Frame, area: Rect, t: &Tarea, reportes: &[String]) {
         .borders(Borders::ALL)
         .title(" Detalle de tarea ")
         .border_style(Style::default().fg(color));
-    f.render_widget(Paragraph::new(lineas).block(bloque), modal);
+    // Wrap: descripción/motivo/reportes largos envuelven a varias líneas (antes se cortaban en
+    // seco). Scroll: PageDown/PageUp mueven `scroll` para leer lo que exceda el alto del modal.
+    f.render_widget(
+        Paragraph::new(lineas)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll, 0))
+            .block(bloque),
+        modal,
+    );
 }
 
 /// Rectángulo centrado de `ancho` × `alto` dentro de `area` (acotado al tamaño disponible).

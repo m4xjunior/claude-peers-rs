@@ -83,9 +83,16 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(tabla_ses, zonas[1]);
 
     // --- Tabla de tareas (estimado vs real) ---
+    // Ancho real de la columna flexible `descripción` (col 1, Min). Fijas: 10×3=30, 4 columnas.
+    let ancho_desc = crate::ui::ancho_columna_flexible(zonas[2].width, 30, 4);
     let filas_tar: Vec<Row> = tareas
         .iter()
-        .map(|t| Row::new(fila_tarea(t).into_iter().map(Cell::from).collect::<Vec<_>>()))
+        .map(|t| {
+            let mut celdas = fila_tarea(t);
+            // descripción (celda 0) viene sin recortar: al ancho real de su columna.
+            celdas[0] = crate::app::recortar(&celdas[0], ancho_desc);
+            Row::new(celdas.into_iter().map(Cell::from).collect::<Vec<_>>())
+        })
         .collect();
     let tabla_tar = Table::new(
         filas_tar,

@@ -243,6 +243,10 @@ pub struct App {
     /// Alerta abierta en el modal DETALLE (Enter en pantalla Alertas). Copia, no índice, para
     /// sobrevivir a un refresco que reordene/encoja la lista (igual criterio que `tarea_detalle`).
     pub alerta_detalle: Option<Alerta>,
+    /// Offset de scroll VERTICAL del modal de detalle abierto (tarea/alerta/timeline). Se mueve
+    /// con PageDown/PageUp para leer contenido que excede el alto fijo del modal (descripciones,
+    /// reportes o mensajes largos). Se resetea a 0 al abrir y al cerrar cualquier modal.
+    pub modal_scroll: u16,
     /// Reportes de progreso de la tarea del modal DETALLE (`GET /tarea/reportes`). Se cargan al
     /// abrir el modal; vacío si la tarea no tiene reportes o el broker no respondió.
     pub tarea_reportes: Vec<String>,
@@ -279,6 +283,7 @@ impl App {
             peer_foco: 0,
             tarea_detalle: None,
             alerta_detalle: None,
+            modal_scroll: 0,
             tarea_reportes: Vec::new(),
             reasignar_destino: 0,
             vista_global: false,
@@ -367,6 +372,18 @@ impl App {
     pub fn cerrar_detalle_tarea(&mut self) {
         self.tarea_detalle = None;
         self.tarea_reportes.clear();
+        self.modal_scroll = 0;
+    }
+
+    /// Baja el scroll del modal de detalle abierto (PageDown). Acotado por el llamador según las
+    /// líneas visibles; aquí solo incrementa de forma segura (paso de media página = 6 líneas).
+    pub fn modal_scroll_abajo(&mut self) {
+        self.modal_scroll = self.modal_scroll.saturating_add(6);
+    }
+
+    /// Sube el scroll del modal de detalle abierto (PageUp), sin pasar de 0.
+    pub fn modal_scroll_arriba(&mut self) {
+        self.modal_scroll = self.modal_scroll.saturating_sub(6);
     }
 
     /// Resuelve qué peer enfoca las pantallas Jornada/Trazabilidad/Tareas: el peer en `peer_foco`
@@ -522,7 +539,9 @@ pub fn fila_traza(m: &Mensaje) -> [String; 4] {
     [
         m.id.to_string(),
         recortar(&m.de_id, 14),
-        recortar(&m.texto, 40),
+        // El texto NO se recorta aquí: es columna flexible (Min) → el render lo recorta al ancho
+        // real de la columna con `ancho_columna_flexible` (fix "textos cortados" 2026-07-01).
+        m.texto.clone(),
         hora_iso(&m.enviado_en),
     ]
 }
@@ -533,7 +552,8 @@ pub fn fila_peer(i: &Instancia) -> [String; 4] {
     [
         recortar(&i.id, 16),
         recortar(&i.directorio, 32),
-        recortar(&i.resumen, 40),
+        // resumen: columna flexible (Min) → recorte al ancho real en el render, no aquí.
+        i.resumen.clone(),
         hora_iso(&i.visto_en),
     ]
 }
@@ -578,7 +598,8 @@ pub fn fila_tarea(t: &Tarea) -> [String; 4] {
         "abierta".to_string()
     };
     [
-        recortar(&t.descripcion, 40),
+        // descripción: columna flexible (Min) → recorte al ancho real en el render, no aquí.
+        t.descripcion.clone(),
         formatear_duracion(t.estimado_seg),
         formatear_duracion(t.duracion_seg),
         estado,
@@ -740,7 +761,10 @@ mod tests {
     }
 
     #[test]
-    fn fila_traza_recorta_texto_largo() {
+    fn fila_traza_no_recorta_texto_es_columna_flexible() {
+        // Desde el fix "textos cortados" (2026-07-01) la función pura NO recorta el texto:
+        // es columna flexible y el recorte lo hace el render según el ancho real. Aquí se
+        // verifica que devuelve el texto ÍNTEGRO (sin `…`).
         let m = Mensaje {
             id: 1,
             de_id: "p".to_string(),
@@ -756,8 +780,8 @@ mod tests {
             reenvios: 0,
         };
         let fila = fila_traza(&m);
-        assert_eq!(fila[2].chars().count(), 40);
-        assert!(fila[2].ends_with('…'));
+        assert_eq!(fila[2].chars().count(), 100);
+        assert!(!fila[2].ends_with('…'));
     }
 
     #[test]
@@ -800,7 +824,9 @@ mod tests {
     }
 
     #[test]
-    fn fila_peer_recorta_resumen_largo() {
+    fn fila_peer_no_recorta_resumen_es_columna_flexible() {
+        // Igual que fila_traza: el resumen es columna flexible, la función pura NO lo recorta
+        // (lo hace el render con el ancho real). Verifica que devuelve el resumen íntegro.
         let largo = "x".repeat(100);
         let i = Instancia {
             id: "p".to_string(),
@@ -815,8 +841,8 @@ mod tests {
             visto_en: String::new(),
         };
         let fila = fila_peer(&i);
-        assert_eq!(fila[2].chars().count(), 40);
-        assert!(fila[2].ends_with('…'));
+        assert_eq!(fila[2].chars().count(), 100);
+        assert!(!fila[2].ends_with('…'));
     }
 
     #[test]
