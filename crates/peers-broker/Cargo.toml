@@ -34,6 +34,13 @@ octocrab = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 # Detección de PID vivo (kill(pid,0)) para resolver colisión de id entre peers locales.
 libc = "0.2"
+# Bitácora de acciones (RFC registro-acciones / ADR-001): SQLx con FK reales en un fichero
+# SQLite PROPIO, independiente del backend (Redis/rusqlite). Las CONSULTAS son dinámicas
+# (query/bind, nunca query!): nadie necesita DATABASE_URL ni .sqlx/ para compilar. La feature
+# "macros" está SOLO por `sqlx::migrate!` (embebe migrations/ en el binario con checksums;
+# no activa validación contra una BD). Dep pedida por Max.
+# Sin conflicto de links: comparte libsqlite3-sys 0.30 con rusqlite 0.32 (verificado).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

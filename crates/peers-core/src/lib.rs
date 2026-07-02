@@ -580,6 +580,18 @@ pub struct PeticionHistorial {
     pub estado: Option<EstadoMensaje>,
 }
 
+/// `GET /acciones` (bajo token, RFC registro-acciones R6): bitácora del peer, más reciente
+/// primero. `desde` = cursor ISO EXCLUSIVO hacia atrás (acciones con `cuando` < desde), para
+/// paginar; `limite` default 100 (el broker lo acota).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionAcciones {
+    pub instancia_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desde: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limite: Option<i64>,
+}
+
 // ===========================================================================
 // GESTIÓN DE TAREAS (jefe ↔ empleados IA) — peticiones de la pantalla Tareas (R4-R9).
 // Todos bajo el middleware de token. Reusan jornada/tarea_guardar/enviar/crear-tarea.

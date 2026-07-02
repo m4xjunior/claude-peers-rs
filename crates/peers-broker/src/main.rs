@@ -10,6 +10,7 @@
 //!
 //! No entra en pánico en producción: anyhow en `main`, handlers devuelven `Result`.
 
+mod bitacora;
 mod github;
 mod jornada;
 mod store;
@@ -28,17 +29,18 @@ use axum::{
 use clap::Parser;
 use github::GitHub;
 use peers_core::{
-    corregir_estimado, supera_umbral, Alerta, Almacen, BloqueoComunicacion, ColaResumen,
-    DecisionPolitica, EstadoMensaje, EstadoTarea,
-    FactorEstimacion, Mensaje, PeticionAbrirTarea, PeticionAsignarTarea, PeticionCerrarTarea,
+    corregir_estimado, supera_umbral, AccionRegistrada, Alerta, Almacen, BloqueoComunicacion,
+    ColaResumen, DecisionPolitica, EstadoMensaje, EstadoTarea,
+    FactorEstimacion, Mensaje, PeticionAbrirTarea, PeticionAcciones, PeticionAsignarTarea,
+    PeticionCerrarTarea,
     PeticionConfirmar, PeticionDefinirResumen, PeticionEditarTarea, PeticionEnviar,
     PeticionEstadoTarea, PeticionForzarTarea, PeticionHistorial, PeticionJornada, PeticionLatido,
     PeticionListar, PeticionPurgar, PeticionReasignarTarea, PeticionRecibir, PeticionRegistrar,
     PeticionReenviar, PeticionReportarTarea, PeticionReportesTarea, PeticionResolverAlerta,
     PeticionSalir, Politica,
     RespuestaAbrirTarea, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar,
-    RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, TipoAlerta,
-    PUERTO_DEFECTO, VENCIMIENTO_MS,
+    RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, TipoAccion,
+    TipoAlerta, ID_OPERADOR, PUERTO_DEFECTO, VENCIMIENTO_MS,
 };
 use store::AlmacenRedis;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -79,6 +81,11 @@ struct Args {
     /// Umbral GHOSTEO en segundos: mensaje en Leido sin Procesado desde hace > X → alerta (R4/R8).
     #[arg(long, env = "CLAUDE_PEERS_UMBRAL_GHOSTEO", default_value_t = peers_core::UMBRAL_GHOSTEO_SEG)]
     umbral_ghosteo: i64,
+
+    /// Ruta del fichero SQLite de la BITÁCORA de acciones (ADR-001). Independiente del backend
+    /// (funciona igual con Redis y con --db). Default: ~/.config/claude-peers/bitacora.db.
+    #[arg(long, env = "CLAUDE_PEERS_BITACORA_DB")]
+    bitacora_db: Option<String>,
 }
 
 /// Umbrales del supervisor (R8): configurables vía env/flags del broker, con los defaults
@@ -99,6 +106,7 @@ impl std::fmt::Debug for Args {
             .field("db", &self.db)
             // El token NUNCA se imprime en claro: se redacta a "<presente>"/"<ninguno>".
             .field("token", &self.token.as_ref().map(|_| "<presente>").unwrap_or("<ninguno>"))
+            .field("bitacora_db", &self.bitacora_db)
             .finish()
     }
 }
@@ -124,6 +132,10 @@ struct EstadoApp {
     /// (cada envío) dominan a las escrituras (ediciones de Max). Regla de oro del proyecto: el
     /// guard JAMÁS se sostiene a través de un `.await` — se lee/escribe y se suelta.
     politica: tokio::sync::RwLock<Politica>,
+    /// Bitácora de acciones (RFC registro-acciones / ADR-001): fichero SQLite propio vía SQLx,
+    /// transversal a ambos backends. `None` = desactivada (no se pudo abrir el fichero): el
+    /// broker opera igual — la bitácora es observabilidad, nunca condición de negocio (R9).
+    bitacora: Option<bitacora::Bitacora>,
 }
 
 type Estado = Arc<EstadoApp>;
@@ -348,6 +360,17 @@ async fn definir_resumen(
     Json(p): Json<PeticionDefinirResumen>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     e.almacen.definir_resumen(&p.id, &p.resumen).await?;
+    // Bitácora (R4): el nuevo resumen (recortado) como detalle — el historial de resúmenes
+    // que hoy se pierde (solo quedaba el último en la instancia).
+    registrar_accion(
+        &e,
+        &p.id,
+        TipoAccion::DefinirResumen,
+        None,
+        Some(recortar_detalle(&p.resumen, 120)),
+        None,
+    )
+    .await;
     Ok(Json(RespuestaOk { ok: true }))
 }
 
@@ -366,6 +389,65 @@ async fn listar(
         )
         .await?;
     Ok(Json(r))
+}
+
+/// Ruta por defecto del fichero de bitácora: `~/.config/claude-peers/bitacora.db` (junto a la
+/// config de la TUI). Sin HOME (entorno raro) cae al directorio de trabajo — nunca panic.
+fn ruta_bitacora_defecto() -> String {
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}/.config/claude-peers/bitacora.db"),
+        Err(_) => "bitacora.db".to_string(),
+    }
+}
+
+/// Registra una acción en la bitácora (RFC registro-acciones R4/R5/R9). El `cuando` lo timbra
+/// el broker AQUÍ (regla sagrada). SIEMPRE best-effort: con la bitácora desactivada es un no-op
+/// y un fallo del INSERT se queda en `warn!` — la mutación de negocio ya ocurrió y JAMÁS se
+/// revierte ni se propaga error al cliente por culpa de la observabilidad.
+///
+/// `quien` (R5): el emisor real del payload cuando existe (`de_id`/`id`/instancia dueña); las
+/// acciones de los paneles del operador (asignar/reasignar/editar/estado/forzar/purgar/
+/// alerta-resolver — payloads SIN identidad de actor) se atribuyen a `ID_OPERADOR`, el id
+/// reservado unificado con la política de comunicación.
+async fn registrar_accion(
+    e: &Estado,
+    quien: &str,
+    accion: TipoAccion,
+    sujeto: Option<String>,
+    detalle: Option<String>,
+    tarea: Option<&Tarea>,
+) {
+    let Some(b) = &e.bitacora else { return };
+    let a = AccionRegistrada {
+        quien: quien.to_string(),
+        accion,
+        sujeto,
+        detalle,
+        cuando: ahora_iso(),
+    };
+    if let Err(err) = b.registrar(&a, tarea).await {
+        warn!("no se pudo registrar la acción {accion:?} de '{quien}' (la mutación ya ocurrió): {err:#}");
+    }
+}
+
+/// Forma de wire (lowercase) de un `EstadoTarea` para el `detalle` de la bitácora — la misma
+/// cadena que emite serde en el protocolo.
+fn estado_tarea_texto(e: EstadoTarea) -> String {
+    serde_json::to_string(&e)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+/// Recorta un texto libre a `max` caracteres para el campo `detalle` de la bitácora (evita
+/// eventos kilométricos; el contenido completo vive donde siempre — mensaje/reporte/resumen).
+fn recortar_detalle(texto: &str, max: usize) -> String {
+    if texto.chars().count() <= max {
+        texto.to_string()
+    } else {
+        let corto: String = texto.chars().take(max).collect();
+        format!("{corto}…")
+    }
 }
 
 /// Evalúa la política de comunicación para un envío (RFC politica-comunicacion R2/R3/R9).
@@ -421,6 +503,17 @@ async fn enviar(
     e.almacen
         .encolar_mensaje(&p.de_id, &p.para_id, &p.texto, &ahora_iso())
         .await?;
+    // Bitácora (R4/R5): el emisor declarado es el actor. Sin el texto del mensaje (vive en el
+    // historial de la cola); el sujeto es el destinatario.
+    registrar_accion(
+        &e,
+        &p.de_id,
+        TipoAccion::EnviarMensaje,
+        Some(p.para_id.clone()),
+        None,
+        None,
+    )
+    .await;
     Ok(Json(RespuestaEnviar { ok: true, error: None }))
 }
 
@@ -439,6 +532,9 @@ async fn salir(
     // Cierra la jornada (timbrada por el broker) antes de dar de baja.
     jornada::cerrar_sesion(&e.almacen, &p.id, &ahora_iso()).await?;
     e.almacen.salir(&p.id).await?;
+    // Bitácora (R4): la baja queda en el histórico DURABLE aunque la instancia desaparezca
+    // del registro efímero (ese es justo el punto del ADR-001).
+    registrar_accion(&e, &p.id, TipoAccion::Kick, None, None, None).await;
     Ok(Json(RespuestaOk { ok: true }))
 }
 
@@ -547,6 +643,17 @@ async fn tarea_abrir(
     let ahora = ahora_iso();
     let (tarea, issue_number) = abrir_tarea_con_estimado(&e, &p, &ahora).await?;
 
+    // Bitácora (R4/R5): la creación se atribuye al peer dueño (abre su propia tarea).
+    registrar_accion(
+        &e,
+        &p.instancia_id,
+        TipoAccion::CrearTarea,
+        Some(tarea.id.clone()),
+        None,
+        Some(&tarea),
+    )
+    .await;
+
     // El estimado corregido + factor/muestras se calculan en `/crear-tarea` (el endpoint de las
     // tools MCP). `/tarea/abrir` es el legacy y devuelve neutros para no cambiar su contrato.
     Ok(Json(RespuestaAbrirTarea {
@@ -566,6 +673,19 @@ async fn tarea_reportar(
     // aquí, no de GitHub. El reloj lo pone el broker.
     let ahora = ahora_iso();
     e.almacen.tarea_reportar(&p.tarea_id, &p.texto, &ahora).await?;
+    // Bitácora (R4/R5): el reporte se atribuye al dueño de la tarea (las tools MCP reportan
+    // sobre tareas propias). Refetch barato — ruta fría; degrada si la tarea ya no está.
+    if let Some(t) = e.almacen.tarea_obtener(&p.tarea_id).await? {
+        registrar_accion(
+            &e,
+            &t.instancia_id,
+            TipoAccion::ReportarTarea,
+            Some(t.id.clone()),
+            Some(recortar_detalle(&p.texto, 120)),
+            Some(&t),
+        )
+        .await;
+    }
     // Si la tarea tiene issue y hay GitHub, comenta también. Degrada si falla.
     if let Some(gh) = &e.github {
         if let Some(tarea) = e.almacen.tarea_obtener(&p.tarea_id).await? {
@@ -723,7 +843,17 @@ async fn tarea_cerrar(
     State(e): State<Estado>,
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
-    cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
+    let tarea = cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
+    // Bitácora (R4/R5): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
+    registrar_accion(
+        &e,
+        &tarea.instancia_id,
+        TipoAccion::CerrarTarea,
+        Some(tarea.id.clone()),
+        None,
+        Some(&tarea),
+    )
+    .await;
     Ok(Json(RespuestaOk { ok: true }))
 }
 
@@ -743,6 +873,17 @@ async fn crear_tarea(
 ) -> Result<Json<RespuestaAbrirTarea>, ErrorApp> {
     let ahora = ahora_iso();
     let (tarea, issue_number) = abrir_tarea_con_estimado(&e, &p, &ahora).await?;
+
+    // Bitácora (R4/R5): la creación se atribuye al peer dueño (tool MCP crear_tarea).
+    registrar_accion(
+        &e,
+        &p.instancia_id,
+        TipoAccion::CrearTarea,
+        Some(tarea.id.clone()),
+        None,
+        Some(&tarea),
+    )
+    .await;
 
     // #9: usa el factor del PEER si tiene historial propio (muestras > 0); si no, cae al GLOBAL
     // como fallback. Así un peer con sesgo conocido se corrige con SU número, y uno nuevo hereda
@@ -773,7 +914,17 @@ async fn cerrar_tarea(
     State(e): State<Estado>,
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
-    cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
+    let tarea = cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
+    // Bitácora (R4/R5): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
+    registrar_accion(
+        &e,
+        &tarea.instancia_id,
+        TipoAccion::CerrarTarea,
+        Some(tarea.id.clone()),
+        None,
+        Some(&tarea),
+    )
+    .await;
     Ok(Json(RespuestaOk { ok: true }))
 }
 
@@ -822,7 +973,19 @@ async fn tarea_editar(
         .tarea_editar(&p.tarea_id, p.descripcion.as_deref(), p.estimado_seg)
         .await?
     {
-        Some(tarea) => Ok(Json(tarea)),
+        Some(tarea) => {
+            // Bitácora (R4/R5): edición desde los paneles del operador (payload sin actor).
+            registrar_accion(
+                &e,
+                ID_OPERADOR,
+                TipoAccion::EditarTarea,
+                Some(tarea.id.clone()),
+                None,
+                Some(&tarea),
+            )
+            .await;
+            Ok(Json(tarea))
+        }
         None => Err(ErrorApp(anyhow::anyhow!(
             "la tarea '{}' no existe",
             p.tarea_id
@@ -883,6 +1046,18 @@ async fn tarea_estado(
         }
     }
 
+    // Bitácora (R4/R5): transición desde los paneles del operador; el estado destino va como
+    // detalle para que el feed lea "cambiar_estado_tarea → hecha" sin abrir la tarea.
+    registrar_accion(
+        &e,
+        ID_OPERADOR,
+        TipoAccion::CambiarEstadoTarea,
+        Some(tarea.id.clone()),
+        Some(estado_tarea_texto(p.estado)),
+        Some(&tarea),
+    )
+    .await;
+
     Ok(Json(tarea))
 }
 
@@ -923,6 +1098,18 @@ async fn tarea_asignar(
             p.instancia_id
         );
     }
+
+    // Bitácora (R4/R5/AC2): asignar es acción del OPERADOR (aparece en la jornada de Max, no
+    // en la del peer destino); el destino queda como detalle.
+    registrar_accion(
+        &e,
+        ID_OPERADOR,
+        TipoAccion::CrearTarea,
+        Some(tarea.id.clone()),
+        Some(format!("asignada a {}", p.instancia_id)),
+        Some(&tarea),
+    )
+    .await;
 
     info!("tarea {} asignada a '{}'", tarea.id, p.instancia_id);
     Ok(Json(serde_json::json!({ "ok": true, "tarea_id": tarea.id })))
@@ -975,6 +1162,17 @@ async fn tarea_reasignar(
         );
     }
 
+    // Bitácora (R4/R5): reasignar es acción del operador; la ruta vieja→nueva como detalle.
+    registrar_accion(
+        &e,
+        ID_OPERADOR,
+        TipoAccion::ReasignarTarea,
+        Some(tarea.id.clone()),
+        Some(format!("de '{dueno_anterior}' a '{}'", p.nuevo_instancia_id)),
+        Some(&tarea),
+    )
+    .await;
+
     info!(
         "tarea {} reasignada: '{}' → '{}'",
         tarea.id, dueno_anterior, p.nuevo_instancia_id
@@ -1001,6 +1199,16 @@ async fn tarea_forzar(
         e.almacen
             .encolar_mensaje("broker", &tarea.instancia_id, &texto, &ahora)
             .await?;
+        // Bitácora (R4/R5): "tócale el hombro" es acción del operador sobre la tarea.
+        registrar_accion(
+            &e,
+            ID_OPERADOR,
+            TipoAccion::ForzarTarea,
+            Some(tarea.id.clone()),
+            None,
+            Some(&tarea),
+        )
+        .await;
         info!("tarea {} forzada al peer '{}'", tarea.id, tarea.instancia_id);
         Ok(Json(RespuestaOk { ok: true }))
     } else {
@@ -1119,6 +1327,8 @@ async fn admin_purgar(
     Json(p): Json<PeticionPurgar>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     e.almacen.purgar(&p.id).await?;
+    // Bitácora (R4/R5): purga = acción del operador; el peer purgado es el sujeto.
+    registrar_accion(&e, ID_OPERADOR, TipoAccion::Purgar, Some(p.id.clone()), None, None).await;
     info!("admin: purgada la cola y outbox de '{}'", p.id);
     Ok(Json(RespuestaOk { ok: true }))
 }
@@ -1192,6 +1402,16 @@ async fn admin_alerta_resolver(
     Json(p): Json<PeticionResolverAlerta>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     e.almacen.alerta_resolver(&p.tipo, &p.sujeto).await?;
+    // Bitácora (R4/R5): descarte manual del operador; clave tipo:sujeto como sujeto del evento.
+    registrar_accion(
+        &e,
+        ID_OPERADOR,
+        TipoAccion::ResolverAlerta,
+        Some(format!("{}:{}", p.tipo, p.sujeto)),
+        None,
+        None,
+    )
+    .await;
     info!("admin: alerta '{}' / '{}' descartada manualmente", p.tipo, p.sujeto);
     Ok(Json(RespuestaOk { ok: true }))
 }
@@ -1235,6 +1455,22 @@ async fn admin_politica_bloqueos(
     State(e): State<Estado>,
 ) -> Result<Json<Vec<BloqueoComunicacion>>, ErrorApp> {
     Ok(Json(e.almacen.bloqueos_recientes().await?))
+}
+
+/// `GET /acciones?instancia_id=&desde=&limite=` (RFC registro-acciones R6, bajo token) →
+/// bitácora del peer, más reciente primero. Bitácora desactivada → lista vacía (degradación,
+/// AC5: nunca un error por observabilidad ausente). `limite` default 100 (acotado en Bitacora).
+async fn acciones(
+    State(e): State<Estado>,
+    axum::extract::Query(p): axum::extract::Query<PeticionAcciones>,
+) -> Result<Json<Vec<AccionRegistrada>>, ErrorApp> {
+    let Some(b) = &e.bitacora else {
+        return Ok(Json(vec![]));
+    };
+    Ok(Json(
+        b.listar(&p.instancia_id, p.desde.as_deref(), p.limite.unwrap_or(100))
+            .await?,
+    ))
 }
 
 /// Evalúa los 3 detectores del supervisor y emite/resuelve alertas (R1–R4, R7).
@@ -1504,6 +1740,24 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Bitácora de acciones (ADR-001): fichero propio, independiente del backend. Degradación
+    // graciosa: si no se puede abrir, warn y el broker sigue SIN bitácora (jamás bloquea el
+    // arranque — es observabilidad, no negocio).
+    let ruta_bitacora = args
+        .bitacora_db
+        .clone()
+        .unwrap_or_else(ruta_bitacora_defecto);
+    let bitacora = match bitacora::Bitacora::abrir(&ruta_bitacora).await {
+        Ok(b) => {
+            info!("bitácora de acciones activa: {ruta_bitacora}");
+            Some(b)
+        }
+        Err(err) => {
+            warn!("bitácora de acciones DESACTIVADA (no se pudo abrir {ruta_bitacora}): {err:#}");
+            None
+        }
+    };
+
     let estado: Estado = Arc::new(EstadoApp {
         almacen,
         github,
@@ -1511,6 +1765,7 @@ async fn main() -> anyhow::Result<()> {
         puerto: args.puerto,
         registro_lock: tokio::sync::Mutex::new(()),
         politica: tokio::sync::RwLock::new(politica_inicial),
+        bitacora,
     });
 
     // Umbrales del supervisor (R8): resueltos una vez, copiados al spawn (Copy).
@@ -1553,6 +1808,12 @@ async fn main() -> anyhow::Result<()> {
                 .await
             {
                 error!("fallo al podar tareas: {e:#}");
+            }
+            // R7 registro-acciones: poda de la bitácora a las últimas N por peer (ADR-001).
+            if let Some(b) = &limpieza.bitacora {
+                if let Err(e) = b.podar(peers_core::RETENCION_ACCIONES as i64).await {
+                    error!("fallo al podar la bitácora de acciones: {e:#}");
+                }
             }
             // Supervisor (R1): el `ahora` lo timbra el broker en cada tick. La función ya
             // aísla cada detector (warn + sigue), así que un fallo no rompe el ciclo (AC5).
@@ -1613,6 +1874,8 @@ async fn main() -> anyhow::Result<()> {
             get(admin_politica_leer).post(admin_politica_guardar),
         )
         .route("/admin/politica/bloqueos", get(admin_politica_bloqueos))
+        // Bitácora de acciones (RFC registro-acciones R6): el feed que la Jornada pinta.
+        .route("/acciones", get(acciones))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));
 
     let app = Router::new()
@@ -1688,6 +1951,7 @@ mod pruebas {
             umbral_ocioso: peers_core::UMBRAL_OCIOSO_SEG,
             umbral_atasco: peers_core::UMBRAL_ATASCO_SEG,
             umbral_ghosteo: peers_core::UMBRAL_GHOSTEO_SEG,
+            bitacora_db: None,
         };
         let s = format!("{args:?}");
         assert!(!s.contains("secreto-super-sensible"), "el token NO debe aparecer en claro");

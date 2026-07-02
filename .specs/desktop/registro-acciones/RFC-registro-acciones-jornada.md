@@ -162,15 +162,14 @@ una **tercera sección "Acciones"** (timeline cronológico) que lee esos eventos
 5. **Relación con reportes de tarea.** Los reportes (`cprs:reportes:{id}`) siguen viviendo atados a la
    tarea (detalle de tarea). La bitácora los duplica como evento `ReportarTarea` en el feed del peer, con
    `sujeto = tarea_id` → clic salta al detalle. No se borra lo existente.
-6. **SQLx (async) coexiste con rusqlite (síncrono) — DECISIÓN DE DISEÑO clave.** El backend SQLite actual
-   usa `rusqlite` (síncrono, feature `sqlite`). SQLx es async y trae su propio pool. Opciones para Jefim:
-   (a) añadir `sqlx` con runtime tokio + `sqlite` feature y un `SqlitePool` SEPARADO solo para la tabla
-   `acciones` (más simple, dos accesos al mismo fichero .db — cuidado con locks: usar WAL mode
-   `PRAGMA journal_mode=WAL` para lectores/escritores concurrentes); (b) apuntar SQLx a un fichero .db
-   propio de bitácora (aísla del store principal, sin locks compartidos, pero las FK a `instancias`/`tareas`
-   solo funcionan si viven en la MISMA db → si se aísla, las FK se vuelven lógicas, no reales). **Recomendado
-   (a):** mismo fichero + WAL, así las FK a instancias/tareas son REALES (que es justo lo que Max pide:
-   rastreabilidad con FK, no datos sueltos). Jefim valida el enfoque con los fundamentos SQLx y lo documenta.
+6. **SQLx (async) coexiste con rusqlite (síncrono) — RESUELTO en [[ADR-001-bitacora-sqlx-identidad-durable|ADR-001]].**
+   La opción (a) "mismo fichero + WAL" resultó INVIABLE: en producción el backend es Redis (no hay .db
+   principal al que FK-ar) y la FK a `instancias` con CASCADE borraría el histórico con cada
+   kick/`limpiar_vencidas` (instancias = presencia efímera). Decisión final: fichero PROPIO
+   `bitacora.db` (SQLx, WAL, foreign_keys=ON) con identidad DURABLE dentro — `peers_conocidos` (nunca
+   se borra) y `tareas_conocidas` (ANCLA de FK, no fuente de verdad) — y `acciones` con FK
+   `ON DELETE RESTRICT`/`SET NULL` (cero cascade destructivo). `bitacora.rs` fuera del trait `Almacen`
+   (desviación de R8b aprobada por Julio). Sin macros compile-time de sqlx (build sin DATABASE_URL).
 7. **Dependencia nueva JUSTIFICADA.** Esta RFC añade `sqlx` (con features sqlite+runtime-tokio). Es la
    ÚNICA dep nueva y Max la pidió explícitamente por la rastreabilidad FK. No viola el "cero deps externas
    de runtime" (SQLx es una lib Rust compilada al binario, no un servicio aparte como sería RabbitMQ).
