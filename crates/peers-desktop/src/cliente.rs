@@ -71,6 +71,11 @@ pub struct ClienteBroker {
     http: Client,
     base: String,
     token: Option<String>,
+    /// Runtime tokio propio. reqwest exige un reactor tokio corriendo, pero las tareas de GPUI
+    /// (`cx.spawn`/`cx.background_spawn`) NO corren sobre tokio → sin este runtime, cada `.await`
+    /// de reqwest paniquea con "there is no reactor running". Se comparte por `Arc` (el cliente se
+    /// clona en cada carga). Los métodos async se ejecutan con `bloquear_en` sobre este runtime.
+    runtime: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
 impl Default for ClienteBroker {
@@ -91,11 +96,27 @@ impl ClienteBroker {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_default();
+        // Runtime tokio dedicado (1 hilo basta: son peticiones HTTP cortas). Si su creación
+        // fallara —extremadamente raro— no hay forma segura de degradar, así que se `expect`:
+        // sin runtime el cliente no puede hacer NINGUNA petición y la app no tiene sentido.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("no se pudo crear el runtime tokio del cliente");
         Self {
             http,
             base: base.into(),
             token,
+            runtime: std::sync::Arc::new(runtime),
         }
+    }
+
+    /// Ejecuta un future del cliente sobre su runtime tokio y devuelve el resultado de forma
+    /// SÍNCRONA. Pensado para llamarse desde `cx.background_spawn` (hilo de fondo de GPUI): así
+    /// reqwest tiene su reactor tokio y la UI no se bloquea. `f` es un closure que produce el
+    /// future (para poder capturar `&self` sin problemas de lifetime).
+    pub fn bloquear_en<T>(&self, f: impl std::future::Future<Output = T>) -> T {
+        self.runtime.block_on(f)
     }
 
     /// Mapea un error de transporte de reqwest a `ErrorBroker::Offline`.

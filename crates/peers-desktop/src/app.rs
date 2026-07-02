@@ -223,6 +223,9 @@ impl AppDesktop {
             panel_config,
             ..EstadoPantalla::default()
         };
+        // Arranca la carga inicial + el refresco periódico. El `cx` aquí es `Context<Self>` (viene
+        // de `cx.new(|cx| AppDesktop::nueva(...))`), así que `cx.spawn` captura la entidad ya creada.
+        Self::arrancar_refresco(cx);
         Self {
             cliente,
             activa: Pantalla::Peers,
@@ -230,12 +233,253 @@ impl AppDesktop {
         }
     }
 
-    /// Cambia la pantalla activa y solicita re-render. Es el único punto que muta la navegación.
+    /// Cambia la pantalla activa, dispara la carga de sus datos y solicita re-render. Es el único
+    /// punto que muta la navegación. La carga inmediata (T4/R2) evita que el usuario vea la pantalla
+    /// vacía hasta el siguiente tick del refresco periódico.
     fn ir_a(&mut self, pantalla: Pantalla, cx: &mut Context<Self>) {
         if self.activa != pantalla {
             self.activa = pantalla;
+            self.cargar_pantalla_activa(cx);
             cx.notify();
         }
+    }
+
+    // --- Carga de datos del broker (feature desktop-carga-datos) ---
+    // Cada `cargar_*` sigue el patrón verificado de `descartar_alerta`: clona el cliente, hace el
+    // fetch en `cx.spawn` (no bloquea el hilo de UI) y muta `datos` al volver con `esta.update`.
+    // El `Result` del cliente se maneja con match (nunca `.unwrap()`): Ok puebla la caché y limpia
+    // el `error_*`; Err guarda el motivo para que la vista pinte el banner. `cx.notify()` repinta.
+
+    /// Dispatcher: carga los datos de la pantalla ACTIVA. Lo llaman la carga inicial, el cambio de
+    /// pantalla (`ir_a`) y el refresco periódico. Config no hace fetch (edita config local).
+    fn cargar_pantalla_activa(&mut self, cx: &mut Context<Self>) {
+        match self.activa {
+            Pantalla::Peers => self.cargar_peers(cx),
+            Pantalla::Alertas => self.cargar_alertas(cx),
+            Pantalla::Broker | Pantalla::Acceso => self.cargar_broker(cx),
+            Pantalla::Redis => self.cargar_redis(cx),
+            Pantalla::Tareas => self.cargar_tareas(cx),
+            Pantalla::Trazabilidad => self.cargar_trazabilidad(cx),
+            Pantalla::Jornada => self.cargar_jornada(cx),
+            Pantalla::Config => {}
+        }
+    }
+
+    /// Peers: `POST /listar` + `GET /admin/alertas` (la tabla cruza alertas por sujeto para la
+    /// columna de estado ocioso/atascado). Ambas cachés se rellenan; el error va a `error_peers`.
+    fn cargar_peers(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        // El fetch corre dentro del executor de fondo de GPUI (`background_executor().spawn`), que
+        // devuelve una Task awaitable. Ahí `bloquear_en` entra al runtime tokio del cliente (reqwest
+        // exige reactor tokio; el executor de GPUI no lo es). Al volver al `cx.spawn` (foreground)
+        // se muta el estado con `esta.update`. Así ni el hilo de UI se bloquea ni reqwez paniquea.
+        let fondo = cx.background_executor().spawn(async move {
+            let peers = cliente.bloquear_en(cliente.listar_instancias());
+            let alertas = cliente.bloquear_en(cliente.admin_alertas());
+            (peers, alertas)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (peers, alertas) = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                match peers {
+                    Ok(lista) => {
+                        esta.datos.instancias = lista;
+                        esta.datos.error_peers = None;
+                    }
+                    Err(e) => esta.datos.error_peers = Some(e),
+                }
+                if let Ok(a) = alertas {
+                    esta.datos.alertas = a;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Alertas: `GET /admin/alertas`. Acota la selección a la nueva longitud.
+    fn cargar_alertas(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.admin_alertas()) });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                match r {
+                    Ok(lista) => {
+                        esta.datos.alertas = lista;
+                        esta.datos.error_alertas = None;
+                        let n = esta.datos.alertas.len();
+                        if n == 0 {
+                            esta.datos.alertas_seleccion = 0;
+                        } else if esta.datos.alertas_seleccion >= n {
+                            esta.datos.alertas_seleccion = n - 1;
+                        }
+                    }
+                    Err(e) => esta.datos.error_alertas = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Broker/Acceso: `GET /admin/info` + `GET /salud` + `GET /factor-estimacion`. Comparten estado
+    /// (info/salud alimentan ambas pantallas). El error va a `error_acceso` (Broker lee los mismos
+    /// campos; si están en None la vista pinta "sin datos").
+    fn cargar_broker(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            let info = cliente.bloquear_en(cliente.admin_info());
+            let salud = cliente.bloquear_en(cliente.salud());
+            let factor = cliente.bloquear_en(cliente.factor_estimacion());
+            (info, salud, factor)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (info, salud, factor) = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                // El primer error real (offline/401) se guarda para el banner; los Ok pueblan.
+                let mut err = None;
+                match info {
+                    Ok(v) => esta.datos.info = Some(v),
+                    Err(e) => err = Some(e),
+                }
+                match salud {
+                    Ok(v) => esta.datos.salud = Some(v),
+                    Err(e) => err = err.or(Some(e)),
+                }
+                if let Ok(v) = factor {
+                    esta.datos.factor = Some(v);
+                }
+                esta.datos.error_acceso = err;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Redis: `GET /admin/redis` (colas + outbox por peer). Error a `error_redis`.
+    fn cargar_redis(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.admin_redis()) });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                match r {
+                    Ok(v) => {
+                        esta.datos.redis = Some(v);
+                        esta.datos.error_redis = None;
+                    }
+                    Err(e) => esta.datos.error_redis = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Tareas: `GET /admin/tareas` (todas las de todos los peers). Error a `error_tareas`.
+    fn cargar_tareas(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.admin_tareas()) });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                match r {
+                    Ok(lista) => {
+                        esta.datos.tareas = lista;
+                        esta.datos.error_tareas = None;
+                    }
+                    Err(e) => esta.datos.error_tareas = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Trazabilidad: `GET /admin/historial` del peer en foco. Sin foco → no hay fetch (la vista
+    /// pinta el texto guía "selecciona un peer"). El historial no tiene campo de error propio:
+    /// un fallo deja el historial como estaba (mejor que vaciarlo).
+    fn cargar_trazabilidad(&mut self, cx: &mut Context<Self>) {
+        let Some(peer) = self.datos.traza_peer.clone() else {
+            return;
+        };
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.historial(&peer)) });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                if let Ok(lista) = r {
+                    let n = lista.len();
+                    esta.datos.historial = lista;
+                    if n == 0 {
+                        esta.datos.traza_seleccion = 0;
+                    } else if esta.datos.traza_seleccion >= n {
+                        esta.datos.traza_seleccion = n - 1;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Jornada: por ahora sólo asegura el roster (`POST /listar`) para poder elegir el peer en foco.
+    /// La jornada detallada (`POST /jornada`) requiere un método de cliente que aún no existe; se
+    /// deja la caché como está. Documentado como pendiente en el spec (R3.6).
+    fn cargar_jornada(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.listar_instancias()) });
+        cx.spawn(async move |esta, cx| {
+            let peers = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                if let Ok(lista) = peers {
+                    esta.datos.instancias = lista;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Lanza la carga inicial (R1) + el refresco periódico de la pantalla activa (cada 2s, R5). Un
+    /// solo timer para toda la app: sólo refresca lo que el usuario mira (sin martillar el broker).
+    /// Se llama desde `nueva` (donde el `cx` es `Context<Self>` y permite `cx.spawn`). El primer
+    /// tick es inmediato (sin esperar los 2s) para que la primera pantalla no arranque vacía. El
+    /// loop se corta solo cuando la entidad muere (cierre de ventana) → `update` devuelve Err.
+    fn arrancar_refresco(cx: &mut Context<Self>) {
+        cx.spawn(async move |esta, cx| {
+            // Carga inicial inmediata (R1): antes del primer sleep.
+            if esta
+                .update(cx, |esta, cx| esta.cargar_pantalla_activa(cx))
+                .is_err()
+            {
+                return;
+            }
+            loop {
+                // Timer del executor de GPUI (no depende de un runtime tokio en este hilo).
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                if esta
+                    .update(cx, |esta, cx| esta.cargar_pantalla_activa(cx))
+                    .is_err()
+                {
+                    break; // la entidad ya no existe: la ventana se cerró.
+                }
+            }
+        })
+        .detach();
     }
 
     // --- Manejadores de la pantalla Alertas ---
