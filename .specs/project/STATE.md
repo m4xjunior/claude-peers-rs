@@ -8,3 +8,13 @@
   Fix pendiente: hacer atómico el registro (lock/SETNX o Lua) + reservar `"broker"` como de_id
   no-suplantable + singleton de broker (SETNX broker_lock). Es un fix del backend claude-peers-rs,
   independiente de la app desktop. Vale arreglarlo para que no se repita el caos de identidad de hoy.
+
+### Actualización 2026-07-02 (verificación de identidad de app-planificacion)
+Evidencia nueva del bug de ids: un peer con from_id="app-planificacion" me escribió, pero
+listar_instancias NO lo mostraba con ese id — colapsaba a id="instancia", cwd="/". Hipótesis del
+propio peer (sólida): el id se deriva del NOMBRE DEL DIRECTORIO del proyecto → dos instancias en
+carpetas llamadas igual (una en el Mac local, otra en el servidor con el mismo proyecto) COLISIONAN
+con el mismo id, y el registro las colapsa a un id genérico. Confirma el diagnóstico de la revisión
+(tar-79): la derivación del id por cwd + el TOCTOU del registro producen colisión cross-máquina.
+Refuerza la prioridad del fix: id estable NO derivado solo del cwd (o cwd+hostname), registro
+atómico, y detección de colisión que sufije en vez de colapsar.
