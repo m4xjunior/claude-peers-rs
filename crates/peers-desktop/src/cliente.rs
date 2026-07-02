@@ -355,6 +355,24 @@ impl ClienteBroker {
         self.post("/tarea/reasignar", &p).await
     }
 
+    /// `POST /tarea/editar {tarea_id, descripcion?, estimado_seg?}` → parche PARCIAL de metadatos
+    /// (R4): `None` no toca ese campo. Lo usan EDITAR descripción (tareas-05) y AMPLIAR estimado
+    /// (tareas-06); el broker valida el rango plausible del estimado y responde 404 si la tarea no
+    /// existe. Devuelve la `Tarea` ya parcheada. Espejo de `peers_tui::cliente::tarea_editar`.
+    pub async fn tarea_editar(
+        &self,
+        tarea_id: &str,
+        descripcion: Option<String>,
+        estimado_seg: Option<i64>,
+    ) -> ResultadoBroker<Tarea> {
+        let p = PeticionEditarTarea {
+            tarea_id: tarea_id.to_string(),
+            descripcion,
+            estimado_seg,
+        };
+        self.post("/tarea/editar", &p).await
+    }
+
     /// `POST /tarea/forzar {tarea_id}` → "tócale el hombro": empuja un recordatorio a la sesión
     /// del peer dueño (R8). No cambia el estado, sólo notifica; `RespuestaOk` basta.
     pub async fn tarea_forzar(&self, tarea_id: &str) -> ResultadoBroker<RespuestaOk> {

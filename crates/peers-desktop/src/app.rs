@@ -211,6 +211,24 @@ pub struct EstadoPantalla {
     /// Último error al hablar con el broker desde la pantalla Tareas (cargar lista o ejecutar una
     /// acción). Se pinta como banner (offline vs 401 vs otro) en vez de dejar la tabla muda.
     pub error_tareas: Option<crate::cliente::ErrorBroker>,
+    /// Si `Some(i)`, se muestra el POP-UP de detalle (tareas-01) de la tarea `tareas[i]`: descripción
+    /// íntegra, dueño, estimado vs real, motivo de bloqueo, evidencia e issue. `i` es el índice REAL
+    /// en `tareas` (la vista global no filtra, así que fila pintada == índice real). `None` = sin
+    /// pop-up. Espejo exacto de `alerta_detalle`; se acota/cierra al recargar la lista.
+    pub tarea_detalle: Option<usize>,
+    /// Formulario del CRUD de tareas abierto (tareas-03..08), o `None`. Cada variante lleva su
+    /// contexto capturado al abrir (tarea_id, dueño, estimado vigente) — ver `FormTareas`.
+    pub tareas_form: Option<crate::vista::tareas::FormTareas>,
+    /// Peer elegido en el selector del formulario activo (asignar/reasignar). Se limpia al abrir.
+    pub tareas_form_peer: Option<String>,
+    /// Error de VALIDACIÓN DE FRONTERA del formulario activo (campo obligatorio vacío, número
+    /// ilegible…). Se pinta DENTRO del modal (el banner de la pantalla queda detrás del overlay).
+    pub tareas_form_error: Option<String>,
+    /// Las tres entradas de texto compartidas por los formularios del CRUD (descripcion/estimado/
+    /// motivo). Son `Entity<InputState>` del kit — estado que no cabe en la vista pura — creadas
+    /// por la app al arrancar. `None` sólo si la construcción no llegó a hacerse (nunca `.unwrap()`;
+    /// el modal pinta un aviso).
+    pub inputs_tareas: Option<crate::vista::tareas::InputsTareas>,
 
     // --- Pantalla Jornada (Fase 2) ---
     /// Jornada del peer enfocado (sesiones + tareas timbradas por el broker). `None` hasta que
@@ -263,12 +281,16 @@ impl AppDesktop {
         // La URL base y el token enmascarado son config fija del cliente: se copian una vez al
         // estado para que la pantalla Acceso (que sólo recibe `&EstadoPantalla`) pueda pintarlos
         // sin acceso al cliente. Nunca se guarda el token en claro, sólo su versión enmascarada.
+        // Las entradas del CRUD de tareas (tareas-03..08) también son stateful (InputState del
+        // kit): se crean aquí una vez y los formularios las siembran/leen al abrir/confirmar.
+        let inputs_tareas = Some(crate::vista::tareas::nuevos_inputs(window, cx));
         let datos = EstadoPantalla {
             acceso_url: cliente.base().to_string(),
             acceso_token: cliente.token_enmascarado(),
             acceso_sin_token: cliente.sin_token(),
             panel_config,
             panel_acceso,
+            inputs_tareas,
             ..EstadoPantalla::default()
         };
         // Arranca la carga inicial + el refresco periódico. El `cx` aquí es `Context<Self>` (viene
@@ -469,6 +491,13 @@ impl AppDesktop {
                     Ok(lista) => {
                         esta.datos.tareas = lista;
                         esta.datos.error_tareas = None;
+                        // Si el pop-up de detalle apunta fuera de la nueva lista, se cierra (mejor
+                        // que dejarlo abierto sobre una tarea que ya no existe en esa posición).
+                        if let Some(i) = esta.datos.tarea_detalle {
+                            if i >= esta.datos.tareas.len() {
+                                esta.datos.tarea_detalle = None;
+                            }
+                        }
                     }
                     Err(e) => esta.datos.error_tareas = Some(e),
                 }
@@ -741,13 +770,19 @@ impl AppDesktop {
         let sujeto_toast = sujeto.clone();
 
         let cliente = self.cliente.clone();
-        cx.spawn(async move |esta, cx| {
-            let resultado = cliente.alerta_resolver(&tipo, &sujeto).await;
+        // Red en el hilo de FONDO con `bloquear_en` (runtime tokio del cliente): el `.await`
+        // directo en `cx.spawn` abortaba con "no reactor running" (fix transversal del crash).
+        let fondo = cx.background_executor().spawn(async move {
+            let resultado = cliente.bloquear_en(cliente.alerta_resolver(&tipo, &sujeto));
             // Tras descartar, re-lee la lista para reflejar el estado real del broker.
             let recarga = match &resultado {
-                Ok(_) => Some(cliente.admin_alertas().await),
+                Ok(_) => Some(cliente.bloquear_en(cliente.admin_alertas())),
                 Err(_) => None,
             };
+            (resultado, recarga)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (resultado, recarga) = fondo.await;
             // Éxito/motivo para el toast (se leen antes de mover `resultado` al match).
             let ok = resultado.is_ok();
             let motivo_fallo = resultado.as_ref().err().map(|e| e.to_string());
@@ -986,13 +1021,18 @@ impl AppDesktop {
             return; // sin peer en foco no hay historial que refrescar
         };
         let cliente = self.cliente.clone();
-        cx.spawn(async move |esta, cx| {
-            let resultado = cliente.reenviar(msg_id).await;
+        // Mismo fix anti-SIGABRT que `descartar_alerta`: la red va al fondo con `bloquear_en`.
+        let fondo = cx.background_executor().spawn(async move {
+            let resultado = cliente.bloquear_en(cliente.reenviar(msg_id));
             // Si el reenvío fue aceptado, re-lee el historial para reflejar el nuevo mensaje.
             let recarga = match &resultado {
-                Ok(_) => Some(cliente.historial(&peer).await),
+                Ok(_) => Some(cliente.bloquear_en(cliente.historial(&peer))),
                 Err(_) => None,
             };
+            (resultado, recarga)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (_resultado, recarga) = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
                 if let Some(Ok(lista)) = recarga {
                     let n = lista.len();
@@ -1017,26 +1057,429 @@ impl AppDesktop {
         cx.notify();
     }
 
+    /// Abre el POP-UP de detalle (tareas-01) de la tarea `indice` y la marca como seleccionada.
+    /// Índice fuera de rango (la lista cambió entre el pintado y el click) → no abre nada.
+    fn abrir_detalle_tarea(&mut self, indice: usize, cx: &mut Context<Self>) {
+        if indice >= self.datos.tareas.len() {
+            return;
+        }
+        self.datos.tareas_seleccion = indice;
+        self.datos.tarea_detalle = Some(indice);
+        cx.notify();
+    }
+
+    /// Cierra el pop-up de detalle de tarea (deja la selección donde estaba). Destino de
+    /// `CerrarDetalleTarea` (✕, botón Cerrar, clic en el backdrop) y de `Esc` en la pantalla Tareas.
+    fn cerrar_detalle_tarea(&mut self, cx: &mut Context<Self>) {
+        if self.datos.tarea_detalle.is_some() {
+            self.datos.tarea_detalle = None;
+            cx.notify();
+        }
+    }
+
+    // --- Formularios del CRUD de tareas (tareas-03..08) ---
+    // Un único formulario abierto a la vez (`tareas_form`). Abrir SIEMBRA los Inputs compartidos
+    // (nunca heredan texto del formulario anterior), limpia el peer elegido y el error, y cierra
+    // el detalle (un solo overlay en pantalla). Confirmar valida la frontera y hace el POST.
+
+    /// Abre el formulario `form`, sembrando las tres entradas con los valores indicados. Punto
+    /// único de apertura: garantiza el estado limpio (peer/error) y el cierre del detalle.
+    fn abrir_form_tareas(
+        &mut self,
+        form: crate::vista::tareas::FormTareas,
+        descripcion: &str,
+        estimado: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::vista::tareas::FormTareas;
+        if let Some(inputs) = &self.datos.inputs_tareas {
+            inputs.sembrar(descripcion, estimado, "", window, cx);
+        }
+        // ASIGNAR/REASIGNAR necesitan el roster fresco para el selector de peer: la pantalla
+        // Tareas no lo recarga por sí sola (sólo Peers/Jornada lo hacen).
+        if matches!(form, FormTareas::Asignar | FormTareas::Reasignar { .. }) {
+            self.recargar_roster(cx);
+        }
+        self.datos.tarea_detalle = None;
+        self.datos.tareas_form_peer = None;
+        self.datos.tareas_form_error = None;
+        self.datos.tareas_form = Some(form);
+        cx.notify();
+    }
+
+    /// Cierra el formulario activo sin confirmar (Cancelar, ✕, clic fuera, Esc).
+    fn cerrar_form_tareas(&mut self, cx: &mut Context<Self>) {
+        if self.datos.tareas_form.is_some() {
+            self.datos.tareas_form = None;
+            self.datos.tareas_form_peer = None;
+            self.datos.tareas_form_error = None;
+            cx.notify();
+        }
+    }
+
+    /// Fija el peer elegido en el selector del formulario activo (asignar/reasignar).
+    fn elegir_peer_form(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.tareas_form_peer = Some(id);
+        // Elegir un peer resuelve el error "elige un peer destino" si estaba en pantalla.
+        self.datos.tareas_form_error = None;
+        cx.notify();
+    }
+
+    /// Abre REASIGNAR (tareas-04) buscando el dueño actual de la tarea (para excluirlo del
+    /// selector). Si la tarea ya no está (la lista cambió), no abre nada.
+    fn abrir_form_reasignar(&mut self, tarea_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dueno) = self
+            .datos
+            .tareas
+            .iter()
+            .find(|t| t.id == tarea_id)
+            .map(|t| t.instancia_id.clone())
+        else {
+            return;
+        };
+        self.abrir_form_tareas(
+            crate::vista::tareas::FormTareas::Reasignar { tarea_id, dueno },
+            "",
+            "",
+            window,
+            cx,
+        );
+    }
+
+    /// Abre EDITAR descripción (tareas-05) PRECARGANDO el Input con la descripción actual.
+    fn abrir_form_editar(&mut self, tarea_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(descripcion) = self
+            .datos
+            .tareas
+            .iter()
+            .find(|t| t.id == tarea_id)
+            .map(|t| t.descripcion.clone())
+        else {
+            return;
+        };
+        self.abrir_form_tareas(
+            crate::vista::tareas::FormTareas::Editar { tarea_id },
+            &descripcion,
+            "",
+            window,
+            cx,
+        );
+    }
+
+    /// Abre AMPLIAR estimado (tareas-06) capturando el estimado VIGENTE (para el hint y la suma).
+    fn abrir_form_ampliar(&mut self, tarea_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(estimado_actual) = self
+            .datos
+            .tareas
+            .iter()
+            .find(|t| t.id == tarea_id)
+            .map(|t| t.estimado_seg)
+        else {
+            return;
+        };
+        self.abrir_form_tareas(
+            crate::vista::tareas::FormTareas::Ampliar {
+                tarea_id,
+                estimado_actual,
+            },
+            "",
+            "",
+            window,
+            cx,
+        );
+    }
+
+    /// Abre el mini-modal de CONFIRMACIÓN destructiva (tareas-08) capturando la descripción para
+    /// el texto "¿Seguro? «…»". Cancelar y Reabrir pasan por aquí; el resto transiciona directo.
+    fn pedir_confirm_estado(
+        &mut self,
+        tarea_id: String,
+        estado: peers_core::EstadoTarea,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(descripcion) = self
+            .datos
+            .tareas
+            .iter()
+            .find(|t| t.id == tarea_id)
+            .map(|t| t.descripcion.clone())
+        else {
+            return;
+        };
+        self.abrir_form_tareas(
+            crate::vista::tareas::FormTareas::Confirmar {
+                tarea_id,
+                estado,
+                descripcion,
+            },
+            "",
+            "",
+            window,
+            cx,
+        );
+    }
+
+    /// Confirma el formulario activo: valida la FRONTERA (campos obligatorios, números legibles) y
+    /// dispara el POST correspondiente vía `mutar_tarea` (que recarga + toast). Un error de
+    /// validación se queda en `tareas_form_error` (el modal sigue abierto para corregir); una
+    /// validación OK cierra el formulario de inmediato (la mutación ya está en marcha).
+    fn confirmar_form_tareas(&mut self, cx: &mut Context<Self>) {
+        use crate::vista::tareas::FormTareas;
+        let Some(form) = self.datos.tareas_form.clone() else {
+            return;
+        };
+
+        // Lecturas de los Inputs compartidos (trim en frontera; parse, don't validate).
+        let (descripcion, estimado_txt, motivo) = match &self.datos.inputs_tareas {
+            Some(inputs) => (
+                inputs.descripcion.read(cx).value().trim().to_string(),
+                inputs.estimado.read(cx).value().trim().to_string(),
+                inputs.motivo.read(cx).value().trim().to_string(),
+            ),
+            None => (String::new(), String::new(), String::new()),
+        };
+
+        // Cada rama valida y produce (mensaje de éxito, POST como closure sync sobre el cliente).
+        // El closure corre en el hilo de fondo con `bloquear_en` (reqwest exige su runtime tokio).
+        match form {
+            FormTareas::Asignar => {
+                let Some(peer) = self.datos.tareas_form_peer.clone() else {
+                    self.datos.tareas_form_error = Some("elige un peer destino".to_string());
+                    cx.notify();
+                    return;
+                };
+                if descripcion.is_empty() {
+                    self.datos.tareas_form_error = Some("la descripción es obligatoria".to_string());
+                    cx.notify();
+                    return;
+                }
+                // Estimado opcional: vacío = sin estimado; con texto, debe ser minutos legibles.
+                let estimado_seg = if estimado_txt.is_empty() {
+                    None
+                } else {
+                    match estimado_txt.parse::<i64>() {
+                        Ok(min) if min > 0 => Some(min * 60),
+                        _ => {
+                            self.datos.tareas_form_error =
+                                Some("el estimado debe ser un número de minutos > 0".to_string());
+                            cx.notify();
+                            return;
+                        }
+                    }
+                };
+                self.cerrar_form_tareas(cx);
+                let exito = format!("Tarea asignada a {peer}");
+                self.mutar_tarea(
+                    exito,
+                    move |c| {
+                        c.bloquear_en(c.tarea_asignar(&peer, &descripcion, estimado_seg))
+                            .map(|_| ())
+                    },
+                    cx,
+                );
+            }
+            FormTareas::Reasignar { tarea_id, .. } => {
+                let Some(destino) = self.datos.tareas_form_peer.clone() else {
+                    self.datos.tareas_form_error = Some("elige el peer destino".to_string());
+                    cx.notify();
+                    return;
+                };
+                self.cerrar_form_tareas(cx);
+                let exito = format!("Tarea reasignada a {destino}");
+                self.mutar_tarea(
+                    exito,
+                    move |c| {
+                        c.bloquear_en(c.tarea_reasignar(&tarea_id, &destino))
+                            .map(|_| ())
+                    },
+                    cx,
+                );
+            }
+            FormTareas::Editar { tarea_id } => {
+                if descripcion.is_empty() {
+                    self.datos.tareas_form_error = Some("la descripción es obligatoria".to_string());
+                    cx.notify();
+                    return;
+                }
+                self.cerrar_form_tareas(cx);
+                self.mutar_tarea(
+                    "Descripción actualizada".to_string(),
+                    move |c| {
+                        c.bloquear_en(c.tarea_editar(&tarea_id, Some(descripcion), None))
+                            .map(|_| ())
+                    },
+                    cx,
+                );
+            }
+            FormTareas::Ampliar {
+                tarea_id,
+                estimado_actual,
+            } => {
+                let minutos = match estimado_txt.parse::<i64>() {
+                    Ok(min) if min > 0 => min,
+                    _ => {
+                        self.datos.tareas_form_error =
+                            Some("indica los minutos a sumar (número > 0)".to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+                // Suma sobre el vigente capturado al abrir; el broker valida el rango plausible.
+                let nuevo = estimado_actual.unwrap_or(0) + minutos * 60;
+                self.cerrar_form_tareas(cx);
+                let exito = format!("Estimado ampliado +{minutos}min");
+                self.mutar_tarea(
+                    exito,
+                    move |c| {
+                        c.bloquear_en(c.tarea_editar(&tarea_id, None, Some(nuevo)))
+                            .map(|_| ())
+                    },
+                    cx,
+                );
+            }
+            FormTareas::Bloquear { tarea_id } => {
+                // tareas-07: el motivo es OBLIGATORIO — bloquear sin razón era el defecto a matar.
+                if motivo.is_empty() {
+                    self.datos.tareas_form_error =
+                        Some("el motivo de bloqueo es obligatorio".to_string());
+                    cx.notify();
+                    return;
+                }
+                self.cerrar_form_tareas(cx);
+                self.mutar_tarea(
+                    "Tarea bloqueada (motivo registrado)".to_string(),
+                    move |c| {
+                        c.bloquear_en(c.tarea_estado(
+                            &tarea_id,
+                            peers_core::EstadoTarea::Bloqueada,
+                            Some(motivo),
+                            None,
+                        ))
+                        .map(|_| ())
+                    },
+                    cx,
+                );
+            }
+            FormTareas::Confirmar {
+                tarea_id, estado, ..
+            } => {
+                self.cerrar_form_tareas(cx);
+                let exito = match estado {
+                    peers_core::EstadoTarea::Cancelada => "Tarea cancelada".to_string(),
+                    peers_core::EstadoTarea::Abierta => "Tarea reabierta".to_string(),
+                    _ => "Estado actualizado".to_string(),
+                };
+                self.mutar_tarea(
+                    exito,
+                    move |c| {
+                        c.bloquear_en(c.tarea_estado(&tarea_id, estado, None, None))
+                            .map(|_| ())
+                    },
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ejecuta una MUTACIÓN de tarea en segundo plano y aplica el post-proceso común: recarga
+    /// `admin_tareas` si fue OK, guarda el error en el banner si falló, y emite un toast de
+    /// éxito/fallo (tareas-17 aplicado a las mutaciones del CRUD; patrón de `descartar_alerta`).
+    /// `hacer` es un closure SÍNCRONO que corre en el executor de fondo y usa `bloquear_en` para
+    /// entrar al runtime tokio del cliente (reqwest lo exige; el executor de GPUI no lo es).
+    fn mutar_tarea(
+        &mut self,
+        exito: String,
+        hacer: impl FnOnce(&ClienteBroker) -> Result<(), crate::cliente::ErrorBroker> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let ventana = cx.active_window();
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            let resultado = hacer(&cliente);
+            // Tras mutar OK, re-lee la lista para reflejar el estado real del broker.
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.bloquear_en(cliente.admin_tareas())),
+                Err(_) => None,
+            };
+            (resultado, recarga)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (resultado, recarga) = fondo.await;
+            let ok = resultado.is_ok();
+            let motivo_fallo = resultado.as_ref().err().map(|e| e.to_string());
+            let _ = esta.update(cx, |esta, cx| {
+                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
+            });
+            // Toast de feedback vía el handle de la ventana (no hay `&mut Window` en el spawn).
+            if let Some(ventana) = ventana {
+                let _ = ventana.update(cx, |_raiz, win, app| {
+                    use gpui_component::notification::Notification;
+                    use gpui_component::WindowExt as _;
+                    let note = if ok {
+                        Notification::success(exito.clone())
+                    } else {
+                        let motivo =
+                            motivo_fallo.unwrap_or_else(|| "error desconocido".to_string());
+                        Notification::error(format!("No se pudo aplicar: {motivo}"))
+                    };
+                    win.push_notification(note, app);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Recarga SÓLO el roster de peers vivos (`POST /listar`) para poblar el selector de peer de
+    /// los formularios de asignar/reasignar. No toca `error_peers` (no es la pantalla Peers): un
+    /// fallo deja el roster como estaba y el selector avisa si quedó vacío.
+    fn recargar_roster(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.listar_instancias()) });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                if let Ok(lista) = r {
+                    esta.datos.instancias = lista;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Transiciona el estado de una tarea (`POST /tarea/estado`) y recarga la lista. El broker
     /// valida la transición; si la rechaza, el error se pinta en el banner (`error_tareas`).
+    ///
+    /// CORRECCIÓN (crash SIGABRT): la versión anterior hacía `cliente.tarea_estado(...).await`
+    /// DIRECTO en `cx.spawn` — el executor de GPUI no es tokio y reqwest abortaba con "there is no
+    /// reactor running". Ahora delega en `mutar_tarea`, que ejecuta la red en el hilo de fondo con
+    /// `bloquear_en` (el runtime tokio del cliente), igual que `cargar_peers`.
     fn cambiar_estado_tarea(
         &mut self,
         tarea_id: String,
         estado: peers_core::EstadoTarea,
         cx: &mut Context<Self>,
     ) {
-        let cliente = self.cliente.clone();
-        cx.spawn(async move |esta, cx| {
-            let resultado = cliente.tarea_estado(&tarea_id, estado, None, None).await;
-            let recarga = match &resultado {
-                Ok(_) => Some(cliente.admin_tareas().await),
-                Err(_) => None,
-            };
-            let _ = esta.update(cx, |esta, cx| {
-                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
-            });
-        })
-        .detach();
+        use peers_core::EstadoTarea;
+        let exito = match estado {
+            EstadoTarea::EnCurso => "Tarea en curso",
+            EstadoTarea::Hecha => "Tarea marcada como hecha",
+            EstadoTarea::Cancelada => "Tarea cancelada",
+            EstadoTarea::Abierta => "Tarea reabierta",
+            EstadoTarea::Bloqueada => "Tarea bloqueada",
+        };
+        self.mutar_tarea(
+            exito.to_string(),
+            move |c| {
+                c.bloquear_en(c.tarea_estado(&tarea_id, estado, None, None))
+                    .map(|_| ())
+            },
+            cx,
+        );
     }
 
     /// Reasigna una tarea a otro peer (`POST /tarea/reasignar`) y recarga. Si `nuevo_instancia_id`
@@ -1057,34 +1500,26 @@ impl AppDesktop {
             cx.notify();
             return;
         };
-        let cliente = self.cliente.clone();
-        cx.spawn(async move |esta, cx| {
-            let resultado = cliente.tarea_reasignar(&tarea_id, &destino).await;
-            let recarga = match &resultado {
-                Ok(_) => Some(cliente.admin_tareas().await),
-                Err(_) => None,
-            };
-            let _ = esta.update(cx, |esta, cx| {
-                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
-            });
-        })
-        .detach();
+        // Red SIEMPRE vía `mutar_tarea` (fondo + `bloquear_en`): el `.await` directo en `cx.spawn`
+        // abortaba con "no reactor running" (mismo fix que `cambiar_estado_tarea`).
+        let exito = format!("Tarea reasignada a {destino}");
+        self.mutar_tarea(
+            exito,
+            move |c| {
+                c.bloquear_en(c.tarea_reasignar(&tarea_id, &destino))
+                    .map(|_| ())
+            },
+            cx,
+        );
     }
 
     /// "Tócale el hombro": `POST /tarea/forzar`. No cambia el estado; recarga por consistencia.
     fn forzar_tarea(&mut self, tarea_id: String, cx: &mut Context<Self>) {
-        let cliente = self.cliente.clone();
-        cx.spawn(async move |esta, cx| {
-            let resultado = cliente.tarea_forzar(&tarea_id).await;
-            let recarga = match &resultado {
-                Ok(_) => Some(cliente.admin_tareas().await),
-                Err(_) => None,
-            };
-            let _ = esta.update(cx, |esta, cx| {
-                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
-            });
-        })
-        .detach();
+        self.mutar_tarea(
+            "Recordatorio enviado al dueño".to_string(),
+            move |c| c.bloquear_en(c.tarea_forzar(&tarea_id)).map(|_| ()),
+            cx,
+        );
     }
 
     /// Crea una tarea nueva (`POST /tarea/asignar`) y recarga. Si `instancia_id`/`descripcion` van
@@ -1118,20 +1553,16 @@ impl AppDesktop {
         } else {
             descripcion
         };
-        let cliente = self.cliente.clone();
-        cx.spawn(async move |esta, cx| {
-            let resultado = cliente
-                .tarea_asignar(&destino, &descripcion, estimado_seg)
-                .await;
-            let recarga = match &resultado {
-                Ok(_) => Some(cliente.admin_tareas().await),
-                Err(_) => None,
-            };
-            let _ = esta.update(cx, |esta, cx| {
-                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
-            });
-        })
-        .detach();
+        // Red SIEMPRE vía `mutar_tarea` (fondo + `bloquear_en`), mismo fix anti-SIGABRT.
+        let exito = format!("Tarea asignada a {destino}");
+        self.mutar_tarea(
+            exito,
+            move |c| {
+                c.bloquear_en(c.tarea_asignar(&destino, &descripcion, estimado_seg))
+                    .map(|_| ())
+            },
+            cx,
+        );
     }
 
     /// Aplica el resultado de una acción sobre tareas: guarda el error (si lo hubo) en el banner, o
@@ -1155,6 +1586,12 @@ impl AppDesktop {
                             esta.datos.tareas_seleccion = 0;
                         } else if esta.datos.tareas_seleccion >= n {
                             esta.datos.tareas_seleccion = n - 1;
+                        }
+                        // Mismo criterio que `cargar_tareas`: detalle fuera de rango → cerrar.
+                        if let Some(i) = esta.datos.tarea_detalle {
+                            if i >= n {
+                                esta.datos.tarea_detalle = None;
+                            }
                         }
                     }
                     // La acción fue OK pero la recarga falló: informa sin romper la lista.
@@ -1209,12 +1646,17 @@ impl AppDesktop {
     /// peer desaparece de la lista, tras la recarga se limpia la selección (evita índice colgado).
     fn purgar_peer(&mut self, id: String, cx: &mut Context<Self>) {
         let cliente = self.cliente.clone();
-        cx.spawn(async move |esta, cx| {
-            let resultado = cliente.purgar(&id).await;
+        // Mismo fix anti-SIGABRT que el resto de escrituras: la red va al fondo con `bloquear_en`.
+        let fondo = cx.background_executor().spawn(async move {
+            let resultado = cliente.bloquear_en(cliente.purgar(&id));
             let recarga = match &resultado {
-                Ok(_) => Some(cliente.admin_redis().await),
+                Ok(_) => Some(cliente.bloquear_en(cliente.admin_redis())),
                 Err(_) => None,
             };
+            (resultado, recarga)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (resultado, recarga) = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
                 match resultado {
                     Ok(_) => {
@@ -1320,6 +1762,11 @@ impl AppDesktop {
                 let idx = self.datos.alertas_seleccion;
                 self.abrir_detalle_alerta(idx, cx);
             }
+            Pantalla::Tareas => {
+                // Paridad con el Enter de la TUI: abre el pop-up de detalle (tareas-01).
+                let idx = self.datos.tareas_seleccion;
+                self.abrir_detalle_tarea(idx, cx);
+            }
             Pantalla::Trazabilidad => {
                 let idx = self.datos.traza_seleccion;
                 self.seleccionar_mensaje(idx, cx);
@@ -1329,12 +1776,19 @@ impl AppDesktop {
     }
 
     /// Ejecuta la letra de acción del TUI sobre la fila seleccionada de la pantalla activa. Mapa:
-    ///   - Tareas:  c=en curso, b=bloquear, h=hecha, x=cancelar, a=reasignar, f=forzar
+    ///   - Tareas:  c=en curso, b=bloquear (form de motivo), h=hecha, x=cancelar (confirmación),
+    ///              a=reasignar (selector de peer), f=forzar
     ///   - Alertas: d=descartar (la seleccionada)
     ///   - Redis:   p=purgar (la cola seleccionada)
     ///   - Trazab.: r=reenviar (el mensaje seleccionado)
     /// Devuelve `true` si la tecla correspondía a una acción de la pantalla activa (para consumirla).
-    fn ejecutar_letra_accion(&mut self, tecla: &str, cx: &mut Context<Self>) -> bool {
+    /// `window` es necesario para SEMBRAR los Inputs al abrir un formulario (tareas-04/07/08).
+    fn ejecutar_letra_accion(
+        &mut self,
+        tecla: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         use peers_core::EstadoTarea;
         match self.activa {
             Pantalla::Tareas => {
@@ -1344,10 +1798,18 @@ impl AppDesktop {
                 let tarea_id = t.id.clone();
                 match tecla {
                     "c" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::EnCurso, cx),
-                    "b" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::Bloqueada, cx),
+                    // Paridad con los botones del CRUD: bloquear pide MOTIVO (tareas-07), cancelar
+                    // pide CONFIRMACIÓN (tareas-08) y reasignar abre el selector (tareas-04).
+                    "b" => self.abrir_form_tareas(
+                        crate::vista::tareas::FormTareas::Bloquear { tarea_id },
+                        "",
+                        "",
+                        window,
+                        cx,
+                    ),
                     "h" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::Hecha, cx),
-                    "x" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::Cancelada, cx),
-                    "a" => self.reasignar_tarea(tarea_id, String::new(), cx),
+                    "x" => self.pedir_confirm_estado(tarea_id, EstadoTarea::Cancelada, window, cx),
+                    "a" => self.abrir_form_reasignar(tarea_id, window, cx),
                     "f" => self.forzar_tarea(tarea_id, cx),
                     _ => return false,
                 }
@@ -1411,12 +1873,21 @@ impl AppDesktop {
     ///   - letras de acción    → c/b/h/x/a/f (Tareas), d (Alertas), p (Redis), r (Trazabilidad).
     /// Se ignoran las pulsaciones con Cmd/Ctrl/Alt (reservadas al SO / atajos globales del kit) para
     /// no pisar copiar/pegar ni cerrar ventana.
-    fn manejar_tecla(&mut self, ev: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+    fn manejar_tecla(&mut self, ev: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let m = &ks.modifiers;
         // No interceptamos combinaciones con modificadores de sistema (salvo shift, que usamos para
         // shift-tab): dejar pasar Cmd+C, Ctrl+…, etc.
         if m.platform || m.control || m.alt || m.function {
+            return;
+        }
+        // Con un FORMULARIO del CRUD abierto, las letras pertenecen a los Inputs (el jefe está
+        // escribiendo texto): sólo se intercepta Escape (cerrar). Sin este guard, teclear una
+        // descripción con 'b'/'x'/'a' dispararía acciones de tarea debajo del modal.
+        if self.datos.tareas_form.is_some() {
+            if ks.key.as_str() == "escape" {
+                self.cerrar_form_tareas(cx);
+            }
             return;
         }
         let tecla = ks.key.as_str();
@@ -1444,7 +1915,7 @@ impl AppDesktop {
             "escape" => self.manejar_escape(cx),
             // Letras de acción del TUI (dependen de la pantalla activa).
             otra => {
-                self.ejecutar_letra_accion(otra, cx);
+                self.ejecutar_letra_accion(otra, window, cx);
             }
         }
     }
@@ -1454,6 +1925,14 @@ impl AppDesktop {
     fn manejar_escape(&mut self, cx: &mut Context<Self>) {
         match self.activa {
             Pantalla::Alertas => self.cerrar_detalle_alerta(cx),
+            Pantalla::Tareas => {
+                // El formulario del CRUD tiene prioridad (está por encima del detalle).
+                if self.datos.tareas_form.is_some() {
+                    self.cerrar_form_tareas(cx);
+                } else {
+                    self.cerrar_detalle_tarea(cx);
+                }
+            }
             Pantalla::Trazabilidad => {
                 if self.datos.traza_timeline {
                     self.datos.traza_timeline = false;
@@ -1585,6 +2064,63 @@ impl AppDesktop {
                 .into_any_element(),
         )
     }
+
+    /// Overlay del POP-UP de detalle de tarea (tareas-01), si `tarea_detalle` apunta a una tarea
+    /// válida. Calco de `overlay_alerta` (misma decisión de diseño: overlay `absolute` propio en vez
+    /// del `Dialog` stateful del kit, para conservar el patrón "vista pura + estado en
+    /// `EstadoPantalla`"). Backdrop tinta translúcido que centra `render_modal_detalle_tarea`;
+    /// clic en el backdrop → `CerrarDetalleTarea`; el contenido `occlude` para que el clic dentro
+    /// no cierre. El `Esc` lo cubre `manejar_escape` → `cerrar_detalle_tarea`.
+    fn overlay_tarea(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let idx = self.datos.tarea_detalle?;
+        let tarea = self.datos.tareas.get(idx)?;
+        let contenido = crate::vista::tareas::render_modal_detalle_tarea(tarea);
+
+        Some(
+            div()
+                .id("overlay-tarea")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::vista::tareas::CerrarDetalleTarea),
+                        cx,
+                    );
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
+    /// Overlay del FORMULARIO del CRUD de tareas (tareas-03..08), si hay uno abierto. Mismo patrón
+    /// que `overlay_tarea`/`overlay_alerta`: backdrop translúcido, clic fuera cierra (sin
+    /// confirmar), contenido `occlude`. Se monta el ÚLTIMO (por encima del detalle).
+    fn overlay_form_tareas(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let form = self.datos.tareas_form.as_ref()?;
+        let contenido = crate::vista::tareas::render_modal_form(form, &self.datos);
+
+        Some(
+            div()
+                .id("overlay-form-tareas")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::tareas::CerrarFormTareas), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for AppDesktop {
@@ -1682,7 +2218,10 @@ impl Render for AppDesktop {
         use crate::vista::peers::{DeseleccionarPeer, EnviarMensajePeer, SeleccionarPeer, VerJornadaPeer};
         use crate::vista::redis::{PurgarPeer, SeleccionarColaRedis};
         use crate::vista::tareas::{
-            AsignarTarea, CambiarEstadoTarea, ForzarTarea, ReasignarTarea, SeleccionarTarea,
+            AbrirDetalleTarea, AbrirFormAmpliar, AbrirFormAsignar, AbrirFormBloquear,
+            AbrirFormEditar, AbrirFormReasignar, AsignarTarea, CambiarEstadoTarea,
+            CerrarDetalleTarea, CerrarFormTareas, ConfirmarFormTareas, ElegirPeerForm, ForzarTarea,
+            PedirConfirmEstado, ReasignarTarea, SeleccionarTarea,
         };
         use crate::vista::trazabilidad::{EnfocarPeer, ReenviarMensaje, SeleccionarMensaje};
 
@@ -1691,8 +2230,8 @@ impl Render for AppDesktop {
         tema::fondo_app()
             .h_flex()
             .track_focus(&self.foco)
-            .on_key_down(cx.listener(|esta, ev: &gpui::KeyDownEvent, _window, cx| {
-                esta.manejar_tecla(ev, cx);
+            .on_key_down(cx.listener(|esta, ev: &gpui::KeyDownEvent, window, cx| {
+                esta.manejar_tecla(ev, window, cx);
             }))
             // --- Alertas (ya existían) ---
             .on_action(cx.listener(|esta, accion: &AbrirDetalle, _window, cx| {
@@ -1750,6 +2289,13 @@ impl Render for AppDesktop {
             .on_action(cx.listener(|esta, a: &SeleccionarTarea, _window, cx| {
                 esta.seleccionar_tarea(a.indice, cx);
             }))
+            // tareas-01: pop-up de detalle (doble-click en la fila, botón "Abrir" o Enter).
+            .on_action(cx.listener(|esta, a: &AbrirDetalleTarea, _window, cx| {
+                esta.abrir_detalle_tarea(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarDetalleTarea, _window, cx| {
+                esta.cerrar_detalle_tarea(cx);
+            }))
             .on_action(cx.listener(|esta, a: &CambiarEstadoTarea, _window, cx| {
                 esta.cambiar_estado_tarea(a.tarea_id.clone(), a.estado, cx);
             }))
@@ -1761,6 +2307,48 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, a: &AsignarTarea, _window, cx| {
                 esta.asignar_tarea(a.instancia_id.clone(), a.descripcion.clone(), a.estimado_seg, cx);
+            }))
+            // --- Tareas: formularios del CRUD (tareas-03..08) ---
+            .on_action(cx.listener(|esta, _a: &AbrirFormAsignar, window, cx| {
+                esta.abrir_form_tareas(
+                    crate::vista::tareas::FormTareas::Asignar,
+                    "",
+                    "",
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|esta, a: &AbrirFormReasignar, window, cx| {
+                esta.abrir_form_reasignar(a.tarea_id.clone(), window, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AbrirFormEditar, window, cx| {
+                esta.abrir_form_editar(a.tarea_id.clone(), window, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AbrirFormAmpliar, window, cx| {
+                esta.abrir_form_ampliar(a.tarea_id.clone(), window, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AbrirFormBloquear, window, cx| {
+                esta.abrir_form_tareas(
+                    crate::vista::tareas::FormTareas::Bloquear {
+                        tarea_id: a.tarea_id.clone(),
+                    },
+                    "",
+                    "",
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|esta, a: &PedirConfirmEstado, window, cx| {
+                esta.pedir_confirm_estado(a.tarea_id.clone(), a.estado, window, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ElegirPeerForm, _window, cx| {
+                esta.elegir_peer_form(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &ConfirmarFormTareas, _window, cx| {
+                esta.confirmar_form_tareas(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarFormTareas, _window, cx| {
+                esta.cerrar_form_tareas(cx);
             }))
             // --- Redis ---
             .on_action(cx.listener(|esta, a: &SeleccionarColaRedis, _window, cx| {
@@ -1802,5 +2390,9 @@ impl Render for AppDesktop {
             // Overlay del modal de detalle de alerta (alertas-01), por encima del layout. `children`
             // acepta el `Option` (0 o 1 elemento): sin modal abierto no pinta nada.
             .children(self.overlay_alerta())
+            // Overlay del pop-up de detalle de tarea (tareas-01), mismo patrón.
+            .children(self.overlay_tarea())
+            // Overlay del formulario del CRUD de tareas (tareas-03..08), por encima de todo.
+            .children(self.overlay_form_tareas())
     }
 }
