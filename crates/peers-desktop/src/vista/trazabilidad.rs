@@ -52,8 +52,9 @@ pub struct EnfocarPeer {
     pub id: String,
 }
 
-/// Seleccionar la fila `indice` de la tabla y ABRIR su timeline inline (click/Enter sobre la fila).
-/// `AppDesktop` fija `traza_seleccion = indice` y `traza_timeline = true`. Índice sobre `historial`.
+/// Seleccionar la fila `indice` de la tabla (click simple). Desde trazabilidad-01 SOLO selecciona
+/// (resalte); el detalle se abre con doble-click/Enter → `AbrirMensaje` (modal). Índice sobre
+/// `historial`.
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = trazabilidad, no_json)]
 pub struct SeleccionarMensaje {
@@ -61,14 +62,46 @@ pub struct SeleccionarMensaje {
     pub indice: usize,
 }
 
+/// Abrir el POP-UP "Abrir mensaje" (trazabilidad-01): modal con el timeline completo del mensaje
+/// `indice` (doble-click en la fila o Enter). `AppDesktop` fija `traza_seleccion = indice` y
+/// `traza_timeline = true` (el flag que antes abría el panel inline ahora abre el modal).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = trazabilidad, no_json)]
+pub struct AbrirMensaje {
+    pub indice: usize,
+}
+
+// Acciones sin datos: cerrar el modal de timeline (✕/Cerrar/clic fuera/Esc), y confirmar/cancelar
+// el reenvío pendiente (trazabilidad-05: reenviar SIEMPRE pide confirmación).
+gpui::actions!(trazabilidad, [CerrarTimeline, ConfirmarReenvio, CancelarReenvio]);
+
+/// Pedir el REENVÍO del mensaje `msg_id` (trazabilidad-05): abre el mini-modal de confirmación.
+/// El POST real (`/admin/reenviar`) sólo sale al confirmar con `ConfirmarReenvio`. Se despacha
+/// desde el botón ↻ de la fila y desde el botón "Reenviar" del modal de timeline.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = trazabilidad, no_json)]
+pub struct PedirReenvio {
+    /// Id durable del mensaje a reenviar (`Mensaje::id`).
+    pub msg_id: i64,
+}
+
 /// Reenviar el mensaje `msg_id` → `ClienteBroker::reenviar(msg_id)` y luego recargar el historial.
-/// `msg_id` es el `Mensaje::id` (i64), lo que el endpoint `POST /admin/reenviar` espera. Se despacha
-/// desde el botón "Reenviar" del panel de timeline.
+/// `msg_id` es el `Mensaje::id` (i64), lo que el endpoint `POST /admin/reenviar` espera. Desde
+/// trazabilidad-05 SIEMPRE llega vía la confirmación (`PedirReenvio` → `ConfirmarReenvio`).
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = trazabilidad, no_json)]
 pub struct ReenviarMensaje {
     /// Id durable del mensaje a reenviar (`Mensaje::id`).
     pub msg_id: i64,
+}
+
+/// Filtrar el historial por estado (trazabilidad-02): recarga vía
+/// `historial(id, estado)` — el filtrado lo hace el BROKER (capacidad ya existente). `None` =
+/// chip "Todos" (sin filtro). Se despacha desde los chips segmentados sobre la tabla.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = trazabilidad, no_json)]
+pub struct FiltrarEstadoTraza {
+    pub estado: Option<EstadoMensaje>,
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -152,10 +185,13 @@ pub fn render_trazabilidad(datos: &EstadoPantalla) -> impl IntoElement {
     // volver a la pantalla Peers (mejora operativa sobre la TUI, que fija el foco desde Peers).
     let selector = selector_peer(datos);
 
-    // Sin foco o sin mensajes: cabecera + selector + texto guía (nunca render vacío confuso).
+    // Sin foco o sin mensajes: cabecera + selector (+ chips si hay foco) + texto guía. Con filtro
+    // activo y 0 resultados, la guía lo dice y los chips siguen visibles para poder quitarlo.
     if foco.is_none() || datos.historial.is_empty() {
         let guia = if foco.is_none() {
             "No hay peer en foco. Elige un peer arriba (o selecciónalo en la pantalla Peers)."
+        } else if datos.traza_filtro_estado.is_some() {
+            "Ningún mensaje en ese estado. Pulsa «Todos» para quitar el filtro."
         } else {
             "Este peer aún no tiene mensajes en el historial."
         };
@@ -167,6 +203,9 @@ pub fn render_trazabilidad(datos: &EstadoPantalla) -> impl IntoElement {
             .child(cabecera);
         if let Some(sel) = selector {
             col = col.child(sel);
+        }
+        if foco.is_some() {
+            col = col.child(barra_filtro_estado(datos.traza_filtro_estado));
         }
         return col.child(
             tema::superficie_card()
@@ -198,13 +237,8 @@ pub fn render_trazabilidad(datos: &EstadoPantalla) -> impl IntoElement {
         .child(encabezado_tabla())
         .child(div().v_flex().w_full().gap_1().children(filas));
 
-    // Panel de timeline del mensaje seleccionado (equivalente inline al modal `Enter` de la TUI).
-    let timeline = if datos.traza_timeline {
-        datos.historial.get(sel).map(panel_timeline)
-    } else {
-        None
-    };
-
+    // El timeline ya NO se pinta inline (trazabilidad-01): vive en un MODAL que `AppDesktop`
+    // monta en su render raíz leyendo `traza_timeline` (ver `render_modal_timeline`).
     let mut columna = div()
         .v_flex()
         .size_full()
@@ -214,11 +248,89 @@ pub fn render_trazabilidad(datos: &EstadoPantalla) -> impl IntoElement {
     if let Some(sel_ui) = selector {
         columna = columna.child(sel_ui);
     }
+    // Chips de filtro por estado (trazabilidad-02), entre el selector de peer y la tabla.
+    columna = columna.child(barra_filtro_estado(datos.traza_filtro_estado));
     columna = columna.child(tabla);
-    if let Some(panel) = timeline {
-        columna = columna.child(panel);
-    }
     columna
+}
+
+/// Barra de chips segmentados de filtro por estado (trazabilidad-02): "Todos" + un chip por cada
+/// `EstadoMensaje`, cada uno con su punto de color semántico. El activo va con fondo brasa tenue +
+/// borde brasa; el resto borde línea/humo. Single-select: clicar un chip recarga el historial con
+/// ese filtro EN EL BROKER (`FiltrarEstadoTraza`); "Todos" lo quita.
+fn barra_filtro_estado(activo: Option<EstadoMensaje>) -> impl IntoElement {
+    // Los 6 estados en orden del ciclo de vida (los dos terminales de error al final).
+    const ESTADOS: [EstadoMensaje; 6] = [
+        EstadoMensaje::Enviado,
+        EstadoMensaje::Entregado,
+        EstadoMensaje::Leido,
+        EstadoMensaje::Procesado,
+        EstadoMensaje::Fallido,
+        EstadoMensaje::DeadLetter,
+    ];
+
+    let mut barra = div().h_flex().flex_wrap().gap_2().items_center();
+    barra = barra.child(chip_filtro_estado("Todos", None, activo.is_none()));
+    for e in ESTADOS {
+        let (etiqueta, _) = estilo_estado(e);
+        barra = barra.child(chip_filtro_estado(etiqueta, Some(e), activo == Some(e)));
+    }
+
+    div()
+        .v_flex()
+        .gap_1()
+        .child(tema::eyebrow("Estado"))
+        .child(barra)
+}
+
+/// Un chip del filtro por estado. `estado = None` es el chip "Todos". El punto de color semántico
+/// del estado va a la izquierda (en "Todos" no hay punto). Despacha `FiltrarEstadoTraza`.
+fn chip_filtro_estado(etiqueta: &str, estado: Option<EstadoMensaje>, activo: bool) -> impl IntoElement {
+    let id = format!("traza-filtro-{}", etiqueta.replace([' ', '○', '◑', '●', '✕'], ""));
+
+    let mut chip = div()
+        .id(gpui::ElementId::Name(id.into()))
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py(gpui::px(4.0))
+        .rounded(tema::radio(tema::RADIO_PILL))
+        .border_1()
+        .cursor_pointer()
+        .text_xs()
+        .font_family(tema::FUENTE_MONO);
+
+    // Punto de color semántico del estado (no en "Todos").
+    if let Some(e) = estado {
+        let (_, color) = estilo_estado(e);
+        chip = chip.child(
+            div()
+                .w(gpui::px(7.0))
+                .h(gpui::px(7.0))
+                .rounded(gpui::px(999.0))
+                .bg(color),
+        );
+    }
+    // La etiqueta sin el símbolo del estado (el punto ya lo representa).
+    let texto = etiqueta
+        .trim_start_matches(['○', '◑', '●', '✕', ' '])
+        .to_uppercase();
+    let chip = chip.child(SharedString::from(texto));
+
+    let chip = if activo {
+        chip.bg(tema::BRASA_TENUE)
+            .border_color(tema::BRASA)
+            .text_color(tema::PAPEL)
+    } else {
+        chip.border_color(tema::LINEA)
+            .text_color(tema::HUMO)
+            .hover(|s| s.bg(tema::TINTA2))
+    };
+
+    chip.on_click(move |_e, window, cx| {
+        window.dispatch_action(Box::new(FiltrarEstadoTraza { estado }), cx);
+    })
 }
 
 /// Selector de peer en foco: una fila de pills, uno por peer vivo (`instancias`). El pill del peer
@@ -283,6 +395,8 @@ fn encabezado_tabla() -> impl IntoElement {
         .child(div().flex_1().child(tema::eyebrow("texto")))
         .child(div().w(gpui::px(COL_ESTADO)).child(tema::eyebrow("estado")))
         .child(div().w(gpui::px(COL_ENVIADO)).child(tema::eyebrow("enviado")))
+        // Columna reservada para la acción rápida de reenvío (trazabilidad-05); label vacío.
+        .child(div().w(gpui::px(40.0)))
 }
 
 /// Fila de la tabla para un mensaje: usa `tema::fila_seleccionable` (resalte brasa tenue + borde
@@ -293,6 +407,8 @@ fn encabezado_tabla() -> impl IntoElement {
 /// "de" atenuado en humo. La columna "estado" mantiene su color semántico por encima del resalte.
 fn fila_mensaje(idx: usize, m: &Mensaje, activa: bool) -> impl IntoElement {
     let (etiqueta, color) = estilo_estado(m.estado);
+    // `Mensaje::id` es i64 (Copy): el closure del botón ↻ lo captura sin clonar.
+    let msg_id = m.id;
 
     tema::fila_seleccionable(SharedString::from(format!("traza-fila-{idx}")), activa)
         .child(
@@ -333,47 +449,101 @@ fn fila_mensaje(idx: usize, m: &Mensaje, activa: bool) -> impl IntoElement {
                 .text_sm()
                 .child(SharedString::from(hora_iso(&m.enviado_en))),
         )
-        .on_click(move |_e, window, cx| {
-            // Selecciona la fila y abre su timeline; `AppDesktop` muta el estado. La vista no toca `cx`.
-            window.dispatch_action(Box::new(SeleccionarMensaje { indice: idx }), cx);
+        // Acción rápida de REENVÍO (trazabilidad-05): botón ↻ al final de la fila que pide la
+        // confirmación SIN abrir el modal (espejo de la tecla `r`). `.occlude()` evita que el clic
+        // atraviese hacia el `on_click` de la fila (que la seleccionaría).
+        .child(
+            div()
+                .id(gpui::ElementId::Name(format!("traza-reenviar-{idx}").into()))
+                .occlude()
+                .w(gpui::px(40.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(tema::radio(tema::RADIO_CONTROL))
+                .text_color(tema::HUMO)
+                .cursor_pointer()
+                .hover(|s| s.bg(tema::TINTA2).text_color(tema::BRASA))
+                .child(SharedString::from("↻"))
+                .on_click(move |_e, window, cx| {
+                    window.dispatch_action(Box::new(PedirReenvio { msg_id }), cx);
+                }),
+        )
+        .on_click(move |e, window, cx| {
+            // Doble-click abre el MODAL de timeline (trazabilidad-01); click simple sólo
+            // selecciona. `AppDesktop` muta el estado; la vista no toca `cx`.
+            if e.click_count() >= 2 {
+                window.dispatch_action(Box::new(AbrirMensaje { indice: idx }), cx);
+            } else {
+                window.dispatch_action(Box::new(SeleccionarMensaje { indice: idx }), cx);
+            }
         })
-        // Accesibilidad-teclado: el foco de la fila permite abrir el timeline con Enter/Espacio,
-        // que GPUI traduce a `on_click` en elementos con `.id()` (paridad con la tecla Enter de la TUI).
-        // (El resalte del foco lo aporta el hover del tema; no añadimos ring para no romper el look.)
 }
 
-/// Panel de timeline del mensaje seleccionado: cada hito de la máquina de estados con su timestamp
-/// (o "—" en humo si aún no se alcanzó), estado actual, contadores de intentos/reenvíos y las
-/// acciones (Reenviar / Cerrar). Réplica del contenido del modal `dibujar_timeline` de la TUI,
-/// vestido con el tema Ethos (superficie card, borde brasa sutil, tipografía).
-fn panel_timeline(m: &Mensaje) -> impl IntoElement {
+/// Contenido del POP-UP "Abrir mensaje" (trazabilidad-01/04): el timeline completo del mensaje en
+/// un modal — cabecera `#id` + ruta, CUERPO ÍNTEGRO con wrap+scroll (sin el recorte destructivo de
+/// la fila), hitos con los timestamps que timbra el broker, estado actual, contadores, traza de
+/// reenvío y acciones (Cerrar / Reenviar→confirmación). Sustituye al antiguo panel inline (que
+/// empujaba la tabla); el overlay/backdrop/Esc los aporta `AppDesktop` (`overlay_mensaje`).
+///
+/// `pub` para que `AppDesktop` lo monte desde su render raíz leyendo `traza_timeline`.
+pub fn render_modal_timeline(m: &Mensaje) -> gpui::AnyElement {
     let (etiqueta_estado, color_estado) = estilo_estado(m.estado);
     let msg_id = m.id;
 
-    // Cabecera del panel: eyebrow + identificador y ruta del mensaje.
+    // Cabecera del modal: eyebrow + #id + ruta, y el ✕ de cierre a la derecha.
     let cabecera = div()
-        .v_flex()
-        .gap_1()
-        .child(tema::eyebrow("Timeline del mensaje"))
+        .h_flex()
+        .items_start()
+        .justify_between()
         .child(
-            tema::titulo(format!("#{}", m.id))
-                .text_size(gpui::px(20.0)),
+            div()
+                .v_flex()
+                .gap_1()
+                .child(tema::eyebrow("Timeline del mensaje"))
+                .child(tema::titulo(format!("#{}", m.id)).text_size(gpui::px(20.0)))
+                .child(
+                    div()
+                        .font_family(tema::FUENTE_MONO)
+                        .text_color(tema::HUMO)
+                        .text_sm()
+                        .child(SharedString::from(format!("{} → {}", m.de_id, m.para_id))),
+                ),
         )
         .child(
             div()
-                .font_family(tema::FUENTE_MONO)
+                .id("modal-traza-cerrar-x")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(gpui::px(28.0))
+                .h(gpui::px(28.0))
+                .rounded(tema::radio(tema::RADIO_CONTROL))
                 .text_color(tema::HUMO)
-                .text_sm()
-                .child(SharedString::from(format!("{} → {}", m.de_id, m.para_id))),
+                .cursor_pointer()
+                .hover(|s| s.bg(tema::TINTA).text_color(tema::PAPEL))
+                .child(SharedString::from("✕"))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(CerrarTimeline), cx);
+                }),
         );
 
-    // Cuerpo completo del mensaje (sin recortar: aquí sí cabe el texto entero).
+    // Cuerpo ÍNTEGRO del mensaje (trazabilidad-04): wrap natural + scroll acotado para que un
+    // mensaje kilométrico no desborde el modal. Nada de recortes destructivos aquí.
     let cuerpo = div()
-        .w_full()
-        .text_color(tema::PAPEL)
-        .child(SharedString::from(m.texto.clone()));
+        .v_flex()
+        .gap_1()
+        .child(tema::eyebrow("mensaje"))
+        .child(
+            div()
+                .id("modal-traza-texto-scroll")
+                .max_h(gpui::px(200.0))
+                .overflow_y_scroll()
+                .child(tema::texto_primario(m.texto.clone())),
+        );
 
-    // Hitos de la máquina de estados con su timestamp. `None`/vacío ⇒ aún no alcanzado.
+    // Hitos de la máquina de estados con su timestamp (timbrados por el BROKER, nunca por la IA).
+    // `None`/vacío ⇒ aún no alcanzado (se pinta "—" en humo).
     let hitos = div()
         .v_flex()
         .gap_1()
@@ -406,28 +576,33 @@ fn panel_timeline(m: &Mensaje) -> impl IntoElement {
             m.intentos, m.reenvios
         )));
 
-    // Acción: Reenviar (primario, brasa) — despacha `ReenviarMensaje` con el id del mensaje activo.
-    // No hay botón "Cerrar" porque el timeline se cierra/alterna re-clicando la fila (paridad con la
-    // tecla Enter de la TUI, que abre/cierra el mismo modal). Si Fase 3 quiere un cierre explícito,
-    // basta declarar una acción sin datos `CerrarTimeline` como en Alertas (`CerrarDetalleAlerta`).
+    // Acciones: Cerrar (secundario) + Reenviar (primario → pide CONFIRMACIÓN, trazabilidad-05).
     let acciones = div()
         .h_flex()
-        .gap_2()
+        .gap_3()
         .pt_2()
         .child(
-            // `msg_id` es i64 (Copy): el closure `Fn` puede invocarse varias veces sin clonar.
-            tema::boton_primario("traza-reenviar", "Reenviar").on_click(move |_e, window, cx| {
-                window.dispatch_action(Box::new(ReenviarMensaje { msg_id }), cx);
+            tema::boton_secundario("modal-traza-cerrar", "Cerrar").on_click(|_e, window, cx| {
+                window.dispatch_action(Box::new(CerrarTimeline), cx);
             }),
+        )
+        .child(
+            tema::boton_primario("modal-traza-reenviar", "Reenviar").on_click(
+                move |_e, window, cx| {
+                    window.dispatch_action(Box::new(PedirReenvio { msg_id }), cx);
+                },
+            ),
         );
 
-    let mut panel = tema::superficie_card()
+    let mut modal = div()
         .v_flex()
-        .w_full()
+        .w(gpui::px(560.0))
         .gap_2()
-        .p_4()
-        // Borde brasa sutil para marcar que este panel pertenece a la fila activa (acento moderado).
-        .border_color(tema::BRASA)
+        .p_5()
+        .rounded(tema::radio(tema::RADIO_CARD))
+        .bg(tema::TINTA2)
+        .border_1()
+        .border_color(tema::LINEA)
         .child(cabecera)
         .child(cuerpo)
         .child(hitos)
@@ -436,7 +611,7 @@ fn panel_timeline(m: &Mensaje) -> impl IntoElement {
 
     // Traza de reenvío: sólo si este mensaje es a su vez un reenvío de otro (se marca en humo, dato).
     if let Some(orig) = m.reenviado_de {
-        panel = panel.child(
+        modal = modal.child(
             div()
                 .font_family(tema::FUENTE_MONO)
                 .text_color(tema::HUMO)
@@ -445,7 +620,56 @@ fn panel_timeline(m: &Mensaje) -> impl IntoElement {
         );
     }
 
-    panel.child(acciones)
+    modal.child(acciones).into_any_element()
+}
+
+/// Mini-modal de CONFIRMACIÓN de reenvío (trazabilidad-05). `mensaje` es el `Mensaje` original si
+/// sigue en la caché (para mostrar contexto: destino y texto recortado); si ya no está, se
+/// confirma sólo por id. Confirmar despacha `ConfirmarReenvio` (el `msg_id` pendiente lo guarda
+/// `AppDesktop` en `traza_confirmar_reenvio`).
+pub fn render_modal_confirmar_reenvio(msg_id: i64, mensaje: Option<&Mensaje>) -> gpui::AnyElement {
+    let contexto = match mensaje {
+        Some(m) => format!(
+            "Se re-encola para «{}» como un mensaje NUEVO: «{}»",
+            m.para_id,
+            recortar(&m.texto, 70)
+        ),
+        None => "Se re-encola como un mensaje nuevo en la bandeja del destino original.".to_string(),
+    };
+
+    div()
+        .v_flex()
+        .w(gpui::px(520.0))
+        .gap_3()
+        .p_5()
+        .rounded(tema::radio(tema::RADIO_CARD))
+        .bg(tema::TINTA2)
+        .border_1()
+        .border_color(tema::LINEA)
+        .child(tema::titulo("Reenviar mensaje").text_size(gpui::px(18.0)))
+        .child(tema::texto_primario(format!("¿Reenviar el mensaje #{msg_id}?")))
+        .child(tema::texto_terciario(contexto))
+        .child(
+            div()
+                .h_flex()
+                .gap_3()
+                .pt_2()
+                .child(
+                    tema::boton_secundario("traza-reenvio-cancelar", "Cancelar").on_click(
+                        |_e, window, cx| {
+                            window.dispatch_action(Box::new(CancelarReenvio), cx);
+                        },
+                    ),
+                )
+                .child(
+                    tema::boton_primario("traza-reenvio-confirmar", "Sí, reenviar").on_click(
+                        |_e, window, cx| {
+                            window.dispatch_action(Box::new(ConfirmarReenvio), cx);
+                        },
+                    ),
+                ),
+        )
+        .into_any_element()
 }
 
 /// Una línea de hito del timeline: etiqueta a la izquierda (ancho fijo para alinear en columna) y

@@ -290,14 +290,20 @@ impl ClienteBroker {
         self.get("/factor-estimacion").await
     }
 
-    /// `GET /admin/historial?id=…` → historial durable de la cola de un peer, en orden
-    /// cronológico ascendente. Pantalla Trazabilidad. Se pide la vista completa (sin `desde`
-    /// ni `estado`): el filtrado por estado, si hace falta, se hace en cliente sobre la caché.
-    pub async fn historial(&self, id: &str) -> ResultadoBroker<Vec<Mensaje>> {
+    /// `GET /admin/historial?id=…[&estado=…]` → historial durable de la cola de un peer, en orden
+    /// cronológico ascendente. Pantalla Trazabilidad. `estado` acota en el BROKER a los mensajes
+    /// en ese estado (trazabilidad-02): la capacidad ya existía en el backend y el cliente la
+    /// desperdiciaba pidiendo siempre todo. `None` = sin filtro (vista completa). El cursor
+    /// `desde` sigue sin usarse (paginación es trazabilidad-15, fase posterior).
+    pub async fn historial(
+        &self,
+        id: &str,
+        estado: Option<EstadoMensaje>,
+    ) -> ResultadoBroker<Vec<Mensaje>> {
         let q = PeticionHistorial {
             id: id.to_string(),
             desde: None,
-            estado: None,
+            estado,
         };
         self.get_con_query("/admin/historial", &q).await
     }

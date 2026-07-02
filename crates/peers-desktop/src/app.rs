@@ -132,11 +132,19 @@ pub struct EstadoPantalla {
     /// cronológico ascendente tal como lo devuelve el broker. Vacío si no hay foco o datos.
     pub historial: Vec<peers_core::Mensaje>,
     /// Índice de la fila seleccionada en la tabla de trazabilidad. Sirve para resaltar la fila
-    /// y decidir qué mensaje expande su timeline. Se mantiene dentro de `historial`.
+    /// y decidir qué mensaje abre su timeline. Se mantiene dentro de `historial`.
     pub traza_seleccion: usize,
-    /// Si `true`, se muestra el timeline completo (transiciones + timestamps) del mensaje
-    /// seleccionado. Espejo del modal `Enter` de la TUI; aquí se despliega inline.
+    /// Si `true`, se muestra el MODAL de timeline (trazabilidad-01) del mensaje seleccionado —
+    /// transiciones + timestamps timbrados por el broker. Espejo del modal `Enter` de la TUI.
+    /// (Antes abría un panel inline; ahora abre el overlay `overlay_mensaje`.)
     pub traza_timeline: bool,
+    /// Filtro por estado del historial (trazabilidad-02). `Some(estado)` recarga el historial
+    /// acotado EN EL BROKER (`GET /admin/historial?estado=`); `None` = chip "Todos". Se conserva
+    /// entre recargas y al cambiar de peer en foco.
+    pub traza_filtro_estado: Option<peers_core::EstadoMensaje>,
+    /// Si `Some(msg_id)`, está abierto el mini-modal de CONFIRMACIÓN de reenvío (trazabilidad-05)
+    /// para ese mensaje. El POST `/admin/reenviar` sólo sale al confirmar.
+    pub traza_confirmar_reenvio: Option<i64>,
 
     // --- Pantalla Broker (Fase 2) ---
     /// Datos de arranque del broker (`GET /admin/info`): host, puerto, versión, nº instancias.
@@ -537,10 +545,12 @@ impl AppDesktop {
         let Some(peer) = self.datos.traza_peer.clone() else {
             return;
         };
+        // El filtro por estado (trazabilidad-02) viaja al broker: la criba la hace el backend.
+        let filtro = self.datos.traza_filtro_estado;
         let cliente = self.cliente.clone();
         let fondo = cx
             .background_executor()
-            .spawn(async move { cliente.bloquear_en(cliente.historial(&peer)) });
+            .spawn(async move { cliente.bloquear_en(cliente.historial(&peer, filtro)) });
         cx.spawn(async move |esta, cx| {
             let r = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
@@ -1181,41 +1191,96 @@ impl AppDesktop {
         self.navegar_y_cargar(Pantalla::Trazabilidad, cx);
     }
 
-    /// Selecciona la fila `indice` del historial y ALTERNA su timeline (paridad con la tecla Enter
-    /// de la TUI: re-pulsar sobre la misma fila cierra el timeline). Sólo muta estado local.
+    /// Selecciona la fila `indice` del historial (click simple). Desde trazabilidad-01 SOLO mueve
+    /// el cursor: el modal de timeline se abre con doble-click/Enter (`abrir_mensaje`).
     fn seleccionar_mensaje(&mut self, indice: usize, cx: &mut Context<Self>) {
         if indice >= self.datos.historial.len() {
             return;
         }
-        if self.datos.traza_seleccion == indice && self.datos.traza_timeline {
-            // Misma fila ya abierta → cierra el timeline (alternancia).
-            self.datos.traza_timeline = false;
-        } else {
-            self.datos.traza_seleccion = indice;
-            self.datos.traza_timeline = true;
-        }
+        self.datos.traza_seleccion = indice;
         cx.notify();
     }
 
-    /// Reenvía el mensaje `msg_id` (`POST /admin/reenviar`) y recarga el historial del peer en foco.
-    /// Patrón idéntico a `descartar_alerta`: escritura + recarga en `cx.spawn`, sin `.unwrap()`.
+    /// Abre el MODAL de timeline (trazabilidad-01) del mensaje `indice` y lo marca seleccionado.
+    fn abrir_mensaje(&mut self, indice: usize, cx: &mut Context<Self>) {
+        if indice >= self.datos.historial.len() {
+            return;
+        }
+        self.datos.traza_seleccion = indice;
+        self.datos.traza_timeline = true;
+        cx.notify();
+    }
+
+    /// Cierra el modal de timeline (✕, Cerrar, clic fuera, Esc).
+    fn cerrar_timeline(&mut self, cx: &mut Context<Self>) {
+        if self.datos.traza_timeline {
+            self.datos.traza_timeline = false;
+            cx.notify();
+        }
+    }
+
+    /// Abre el mini-modal de CONFIRMACIÓN de reenvío (trazabilidad-05) para `msg_id`.
+    fn pedir_reenvio(&mut self, msg_id: i64, cx: &mut Context<Self>) {
+        self.datos.traza_confirmar_reenvio = Some(msg_id);
+        cx.notify();
+    }
+
+    /// Cancela la confirmación de reenvío pendiente (Cancelar / clic fuera / Esc).
+    fn cancelar_reenvio(&mut self, cx: &mut Context<Self>) {
+        if self.datos.traza_confirmar_reenvio.is_some() {
+            self.datos.traza_confirmar_reenvio = None;
+            cx.notify();
+        }
+    }
+
+    /// Confirma el reenvío pendiente: cierra la confirmación y dispara el POST real.
+    fn confirmar_reenvio(&mut self, cx: &mut Context<Self>) {
+        let Some(msg_id) = self.datos.traza_confirmar_reenvio.take() else {
+            return;
+        };
+        cx.notify();
+        self.reenviar_mensaje(msg_id, cx);
+    }
+
+    /// Cambia el filtro por estado del historial (trazabilidad-02) y recarga contra el broker.
+    /// `None` = "Todos". Resetea el cursor de fila (la lista cambia de composición).
+    fn filtrar_estado_traza(
+        &mut self,
+        estado: Option<peers_core::EstadoMensaje>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.datos.traza_filtro_estado == estado {
+            return; // chip ya activo: nada que recargar
+        }
+        self.datos.traza_filtro_estado = estado;
+        self.datos.traza_seleccion = 0;
+        self.datos.traza_timeline = false;
+        self.cargar_trazabilidad(cx);
+        cx.notify();
+    }
+
+    /// Reenvía el mensaje `msg_id` (`POST /admin/reenviar`), recarga el historial del peer en foco
+    /// (conservando el filtro por estado activo) y emite un TOAST con el resultado — "Reenviado
+    /// como #N" si el broker devolvió el id nuevo (trazabilidad-05). Red SIEMPRE en fondo con
+    /// `bloquear_en` (fix anti-SIGABRT), sin `.unwrap()`.
     fn reenviar_mensaje(&mut self, msg_id: i64, cx: &mut Context<Self>) {
         let Some(peer) = self.datos.traza_peer.clone() else {
             return; // sin peer en foco no hay historial que refrescar
         };
+        let filtro = self.datos.traza_filtro_estado;
+        let ventana = cx.active_window();
         let cliente = self.cliente.clone();
-        // Mismo fix anti-SIGABRT que `descartar_alerta`: la red va al fondo con `bloquear_en`.
         let fondo = cx.background_executor().spawn(async move {
             let resultado = cliente.bloquear_en(cliente.reenviar(msg_id));
             // Si el reenvío fue aceptado, re-lee el historial para reflejar el nuevo mensaje.
             let recarga = match &resultado {
-                Ok(_) => Some(cliente.bloquear_en(cliente.historial(&peer))),
-                Err(_) => None,
+                Ok(r) if r.ok => Some(cliente.bloquear_en(cliente.historial(&peer, filtro))),
+                _ => None,
             };
             (resultado, recarga)
         });
         cx.spawn(async move |esta, cx| {
-            let (_resultado, recarga) = fondo.await;
+            let (resultado, recarga) = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
                 if let Some(Ok(lista)) = recarga {
                     let n = lista.len();
@@ -1226,6 +1291,31 @@ impl AppDesktop {
                 }
                 cx.notify();
             });
+            // Toast con el veredicto tipado del broker: reenviado (con el id nuevo), rechazado
+            // (`ok=false`, mensaje inexistente) o error de transporte.
+            if let Some(ventana) = ventana {
+                let _ = ventana.update(cx, |_raiz, win, app| {
+                    use gpui_component::notification::Notification;
+                    use gpui_component::WindowExt as _;
+                    let note = match &resultado {
+                        Ok(r) if r.ok => match r.msg_id {
+                            Some(nuevo) => Notification::success(format!(
+                                "Mensaje #{msg_id} reenviado como #{nuevo}"
+                            )),
+                            None => Notification::success(format!("Mensaje #{msg_id} reenviado")),
+                        },
+                        Ok(r) => {
+                            let motivo = r
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "el broker lo rechazó".to_string());
+                            Notification::error(format!("No se pudo reenviar: {motivo}"))
+                        }
+                        Err(e) => Notification::error(format!("No se pudo reenviar: {e}")),
+                    };
+                    win.push_notification(note, app);
+                });
+            }
         })
         .detach();
     }
@@ -1956,8 +2046,9 @@ impl AppDesktop {
                 self.abrir_detalle_peer(idx, cx);
             }
             Pantalla::Trazabilidad => {
+                // trazabilidad-01: Enter abre el MODAL de timeline del mensaje seleccionado.
                 let idx = self.datos.traza_seleccion;
-                self.seleccionar_mensaje(idx, cx);
+                self.abrir_mensaje(idx, cx);
             }
             _ => {}
         }
@@ -2063,7 +2154,8 @@ impl AppDesktop {
                     .get(self.datos.traza_seleccion)
                     .map(|m| m.id);
                 if let Some(msg_id) = msg_id {
-                    self.reenviar_mensaje(msg_id, cx);
+                    // trazabilidad-05: la tecla `r` también pasa por la confirmación.
+                    self.pedir_reenvio(msg_id, cx);
                     true
                 } else {
                     false
@@ -2151,9 +2243,11 @@ impl AppDesktop {
                 }
             }
             Pantalla::Trazabilidad => {
-                if self.datos.traza_timeline {
-                    self.datos.traza_timeline = false;
-                    cx.notify();
+                // Prioridad: confirmación de reenvío > modal de timeline (volver atrás contextual).
+                if self.datos.traza_confirmar_reenvio.is_some() {
+                    self.cancelar_reenvio(cx);
+                } else {
+                    self.cerrar_timeline(cx);
                 }
             }
             Pantalla::Peers => {
@@ -2348,6 +2442,64 @@ impl AppDesktop {
         )
     }
 
+    /// Overlay del MODAL de timeline de mensaje (trazabilidad-01/04), si `traza_timeline` está
+    /// activo y la selección apunta a un mensaje válido. Mismo patrón que el resto de overlays.
+    fn overlay_mensaje(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        if !self.datos.traza_timeline {
+            return None;
+        }
+        let sel = self
+            .datos
+            .traza_seleccion
+            .min(self.datos.historial.len().checked_sub(1)?);
+        let mensaje = self.datos.historial.get(sel)?;
+        let contenido = crate::vista::trazabilidad::render_modal_timeline(mensaje);
+
+        Some(
+            div()
+                .id("overlay-mensaje")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::trazabilidad::CerrarTimeline), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
+    /// Overlay del mini-modal de CONFIRMACIÓN de reenvío (trazabilidad-05), por encima del modal
+    /// de timeline si ambos están abiertos. Clic fuera = cancelar (no reenvía).
+    fn overlay_confirmar_reenvio(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let msg_id = self.datos.traza_confirmar_reenvio?;
+        // El mensaje original, si sigue en la caché, da contexto al texto de confirmación.
+        let mensaje = self.datos.historial.iter().find(|m| m.id == msg_id);
+        let contenido =
+            crate::vista::trazabilidad::render_modal_confirmar_reenvio(msg_id, mensaje);
+
+        Some(
+            div()
+                .id("overlay-confirmar-reenvio")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::trazabilidad::CancelarReenvio), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
     /// Overlay del FORMULARIO de Peers (composer de mensaje / confirmación de kick), si hay uno
     /// abierto. Mismo patrón; se monta por encima del detalle.
     fn overlay_form_peers(&self) -> Option<gpui::AnyElement> {
@@ -2501,7 +2653,10 @@ impl Render for AppDesktop {
             CerrarDetalleTarea, CerrarFormTareas, ConfirmarFormTareas, ElegirPeerForm, ForzarTarea,
             PedirConfirmEstado, ReasignarTarea, SeleccionarTarea,
         };
-        use crate::vista::trazabilidad::{EnfocarPeer, ReenviarMensaje, SeleccionarMensaje};
+        use crate::vista::trazabilidad::{
+            AbrirMensaje, CancelarReenvio, CerrarTimeline, ConfirmarReenvio, EnfocarPeer,
+            FiltrarEstadoTraza, PedirReenvio, ReenviarMensaje, SeleccionarMensaje,
+        };
 
         // Layout raíz de dos columnas sobre el fondo Ethos. `track_focus` + el enfoque inicial de
         // `nueva` habilitan la captura de teclado (`on_key_down`); sin él, GPUI no entrega teclas.
@@ -2582,6 +2737,25 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, a: &ReenviarMensaje, _window, cx| {
                 esta.reenviar_mensaje(a.msg_id, cx);
+            }))
+            // --- Trazabilidad: modal de timeline + reenvío con confirmación + filtro (fase 4) ---
+            .on_action(cx.listener(|esta, a: &AbrirMensaje, _window, cx| {
+                esta.abrir_mensaje(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarTimeline, _window, cx| {
+                esta.cerrar_timeline(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &PedirReenvio, _window, cx| {
+                esta.pedir_reenvio(a.msg_id, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &ConfirmarReenvio, _window, cx| {
+                esta.confirmar_reenvio(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CancelarReenvio, _window, cx| {
+                esta.cancelar_reenvio(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &FiltrarEstadoTraza, _window, cx| {
+                esta.filtrar_estado_traza(a.estado, cx);
             }))
             // --- Tareas ---
             .on_action(cx.listener(|esta, a: &SeleccionarTarea, _window, cx| {
@@ -2692,8 +2866,12 @@ impl Render for AppDesktop {
             .children(self.overlay_tarea())
             // Overlay del pop-up de detalle de peer (peers-01).
             .children(self.overlay_peer())
-            // Overlays de formularios (CRUD de tareas y composer/kick de peers), por encima de todo.
+            // Overlay del modal de timeline de mensaje (trazabilidad-01).
+            .children(self.overlay_mensaje())
+            // Overlays de formularios (CRUD de tareas y composer/kick de peers), por encima.
             .children(self.overlay_form_tareas())
             .children(self.overlay_form_peers())
+            // Confirmación de reenvío (trazabilidad-05): el último, por encima del timeline.
+            .children(self.overlay_confirmar_reenvio())
     }
 }
