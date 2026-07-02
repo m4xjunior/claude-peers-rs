@@ -35,10 +35,11 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
         None => (&[], &[]),
     };
 
-    // Layout vertical: resumen (3) · sesiones (mitad) · tareas (resto).
+    // Layout vertical: resumen (3) · sesiones · tareas · acciones (registro-acciones R12).
     let zonas = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Percentage(50),
+        Constraint::Percentage(35),
+        Constraint::Percentage(30),
         Constraint::Min(4),
     ])
     .split(area);
@@ -109,4 +110,66 @@ pub fn dibujar(f: &mut Frame, area: Rect, app: &App) {
     )
     .block(Block::default().borders(Borders::ALL).title(format!(" Tareas ({}) ", tareas.len())));
     f.render_widget(tabla_tar, zonas[2]);
+
+    // --- Bitácora de acciones (registro-acciones R12): hora · acción · sujeto · detalle ---
+    // Paridad mínima con la desktop: las últimas N del peer, más reciente primero. Vacía si
+    // el broker no tiene bitácora (compat con brokers viejos) o el peer aún no actuó.
+    let acciones = &app.datos.jornada_acciones;
+    let ancho_detalle = crate::ui::ancho_columna_flexible(zonas[3].width, 34, 4);
+    let filas_acc: Vec<Row> = acciones
+        .iter()
+        .map(|a| {
+            let hora = a.cuando.get(11..19).unwrap_or("—").to_string();
+            let etiqueta = etiqueta_accion(a.accion).to_string();
+            let sujeto = a.sujeto.clone().unwrap_or_default();
+            let detalle =
+                crate::app::recortar(&a.detalle.clone().unwrap_or_default(), ancho_detalle);
+            Row::new(vec![
+                Cell::from(hora),
+                Cell::from(etiqueta),
+                Cell::from(sujeto),
+                Cell::from(detalle),
+            ])
+        })
+        .collect();
+    let tabla_acc = Table::new(
+        filas_acc,
+        [
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Min(10),
+        ],
+    )
+    .header(
+        Row::new(["hora", "acción", "sujeto", "detalle"])
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Acciones ({}) ", acciones.len())),
+    );
+    f.render_widget(tabla_acc, zonas[3]);
+}
+
+/// Etiqueta corta en español de un `TipoAccion` (espejo de la desktop). El comodín cubre las
+/// variantes futuras del enum `#[non_exhaustive]` — un broker más nuevo no rompe la TUI.
+fn etiqueta_accion(a: peers_core::TipoAccion) -> &'static str {
+    use peers_core::TipoAccion;
+    match a {
+        TipoAccion::CrearTarea => "crear tarea",
+        TipoAccion::ReportarTarea => "reporte",
+        TipoAccion::CerrarTarea => "cerrar tarea",
+        TipoAccion::EditarTarea => "editar tarea",
+        TipoAccion::CambiarEstadoTarea => "cambio estado",
+        TipoAccion::ReasignarTarea => "reasignar",
+        TipoAccion::ForzarTarea => "recordatorio",
+        TipoAccion::DefinirResumen => "resumen",
+        TipoAccion::EnviarMensaje => "mensaje",
+        TipoAccion::Kick => "salida",
+        TipoAccion::Purgar => "purga",
+        TipoAccion::ResolverAlerta => "alerta resuelta",
+        _ => "acción",
+    }
 }

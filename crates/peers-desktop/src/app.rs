@@ -270,6 +270,10 @@ pub struct EstadoPantalla {
     /// Peers fije un foco y se cargue vía `ClienteBroker::jornada`. La pantalla Jornada lo pinta;
     /// si es `None` muestra el texto guía "selecciona un peer".
     pub jornada: Option<peers_core::RespuestaJornada>,
+    /// Bitácora de acciones del peer enfocado en Jornada (`GET /acciones`, registro-acciones
+    /// R10): timeline "quién hizo qué, cuándo". Se recarga junto a la jornada; vacía si el
+    /// broker no tiene bitácora activa o aún no expone el endpoint (degradación sin banner).
+    pub jornada_acciones: Vec<peers_core::AccionRegistrada>,
     /// Id del peer cuya jornada está cacheada (para el título "Jornada · <id>"). `None` = sin foco.
     pub jornada_peer: Option<String>,
     /// Índice de la sesión seleccionada en la tabla de sesiones de Jornada (feedback de cursor,
@@ -610,13 +614,24 @@ impl AppDesktop {
             let jornada = foco
                 .as_deref()
                 .map(|id| cliente.bloquear_en(cliente.jornada(id)));
-            (peers, jornada)
+            // Bitácora del peer (registro-acciones R10), en el MISMO viaje de fondo.
+            let acciones = foco
+                .as_deref()
+                .map(|id| cliente.bloquear_en(cliente.acciones(id)));
+            (peers, jornada, acciones)
         });
         cx.spawn(async move |esta, cx| {
-            let (peers, jornada) = fondo.await;
+            let (peers, jornada, acciones) = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
                 if let Ok(lista) = peers {
                     esta.datos.instancias = lista;
+                }
+                // Bitácora: en éxito se refresca; en fallo (broker viejo sin /acciones, error
+                // puntual) o sin foco se VACÍA — mejor sección vacía que el timeline de OTRO
+                // peer colgado en pantalla. Sin banner: es observabilidad, no negocio.
+                match acciones {
+                    Some(Ok(a)) => esta.datos.jornada_acciones = a,
+                    _ => esta.datos.jornada_acciones.clear(),
                 }
                 // Un fallo al cargar la jornada deja la caché como estaba (mejor que vaciarla).
                 if let Some(Ok(j)) = jornada {

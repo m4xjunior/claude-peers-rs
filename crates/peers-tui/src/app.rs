@@ -4,8 +4,8 @@
 
 use crate::cliente::ErrorBroker;
 use peers_core::{
-    Alerta, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, Mensaje, RespuestaAdminInfo,
-    RespuestaAdminRedis, RespuestaJornada, RespuestaSalud, Tarea, TipoAlerta,
+    AccionRegistrada, Alerta, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, Mensaje,
+    RespuestaAdminInfo, RespuestaAdminRedis, RespuestaJornada, RespuestaSalud, Tarea, TipoAlerta,
 };
 
 /// Las 9 pantallas del panel, conmutables con Tab o las teclas 1-9.
@@ -204,6 +204,9 @@ pub struct Datos {
     /// Jornada (sesiones + tareas) del peer enfocado en la pantalla Jornada (POST /jornada).
     /// `None` hasta la primera respuesta exitosa. Es el "fichaje" visible del peer.
     pub jornada: Option<RespuestaJornada>,
+    /// Bitácora de acciones del peer enfocado (GET /acciones, registro-acciones R12): las
+    /// últimas N, más reciente primero. Vacía si el broker no expone la bitácora (compat).
+    pub jornada_acciones: Vec<AccionRegistrada>,
     /// Tareas del peer enfocado en la pantalla Tareas (POST /listar-tareas). Estimado vs real.
     /// Vacío si no hay foco o si el peer no abrió tareas.
     pub tareas: Vec<Tarea>,

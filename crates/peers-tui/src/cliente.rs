@@ -245,6 +245,19 @@ impl ClienteAdmin {
         self.post("/jornada", &p).await
     }
 
+    /// `GET /acciones?instancia_id=…` → bitácora del peer (registro-acciones R6/R12), más
+    /// reciente primero (últimas 50). Sección "Acciones" de la Jornada. Un broker viejo sin el
+    /// endpoint devuelve error → el caller deja la sección vacía SIN tocar el banner (la
+    /// bitácora es observabilidad; su ausencia no es un fallo de la TUI).
+    pub async fn acciones(&self, instancia_id: &str) -> ResultadoBroker<Vec<AccionRegistrada>> {
+        let q = PeticionAcciones {
+            instancia_id: instancia_id.to_string(),
+            desde: None,
+            limite: Some(50),
+        };
+        self.get_con_query("/acciones", &q).await
+    }
+
     /// `POST /listar-tareas {instancia_id}` → solo las tareas de la jornada de esa instancia
     /// (R10). Comparte cuerpo con `/jornada` (`PeticionJornada`); el broker devuelve únicamente
     /// el vector de tareas, sin sesiones, para vistas que no necesitan los tiempos de sesión.

@@ -241,10 +241,17 @@ async fn refrescar(cliente: &ClienteAdmin, app: &mut App) {
                     if let Ok(j) = r {
                         app.datos.jornada = Some(j);
                     }
+                    // Bitácora (registro-acciones R12): best-effort SIN tocar el banner — un
+                    // broker viejo sin /acciones no es un fallo de la TUI; sección vacía.
+                    match cliente.acciones(&id).await {
+                        Ok(a) => app.datos.jornada_acciones = a,
+                        Err(_) => app.datos.jornada_acciones.clear(),
+                    }
                 }
                 None => {
                     app.marcar_resultado(&lp);
                     app.datos.jornada = None;
+                    app.datos.jornada_acciones.clear();
                 }
             }
         }

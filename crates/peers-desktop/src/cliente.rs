@@ -250,6 +250,19 @@ impl ClienteBroker {
         self.get("/admin/tareas").await
     }
 
+    /// `GET /acciones?instancia_id=…` → bitácora del peer (RFC registro-acciones R6/R10), más
+    /// reciente primero. Alimenta la sección "Acciones" de la Jornada. Se piden las últimas 50
+    /// (el timeline visible); un broker viejo sin el endpoint devuelve error y la sección
+    /// degrada a vacía (nunca banner por observabilidad ausente).
+    pub async fn acciones(&self, instancia_id: &str) -> ResultadoBroker<Vec<AccionRegistrada>> {
+        let q = PeticionAcciones {
+            instancia_id: instancia_id.to_string(),
+            desde: None,
+            limite: Some(50),
+        };
+        self.get_con_query("/acciones", &q).await
+    }
+
     /// `GET /admin/alertas` → alertas vigentes (SOLO LECTURA). Pantalla Alertas.
     pub async fn admin_alertas(&self) -> ResultadoBroker<Vec<Alerta>> {
         self.get("/admin/alertas").await

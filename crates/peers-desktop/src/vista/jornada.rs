@@ -24,7 +24,7 @@ use gpui::{
 };
 // `v_flex`/`h_flex` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
 use gpui_component::StyledExt;
-use peers_core::{EstadoTarea, RespuestaJornada, Sesion, Tarea};
+use peers_core::{AccionRegistrada, EstadoTarea, RespuestaJornada, Sesion, Tarea, TipoAccion};
 
 use crate::app::EstadoPantalla;
 use crate::tema;
@@ -346,7 +346,144 @@ pub fn render_jornada(datos: &EstadoPantalla) -> impl IntoElement {
         tabla_tar = tabla_tar.child(fila_tarea(idx, t, tar_sel));
     }
 
-    base.child(resumen).child(tabla_ses).child(tabla_tar)
+    // --- Bitácora de acciones (registro-acciones R10): timeline "qué hizo, cuándo" ---
+    let acciones = &datos.jornada_acciones;
+    let mut tabla_acc = tema::superficie_card().v_flex().gap_1().p_4().child(
+        div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .pb_1()
+            .child(tema::eyebrow("Acciones"))
+            .child(tema::texto_terciario(format!("({})", acciones.len()))),
+    );
+    if acciones.is_empty() {
+        // Estado vacío legible (AC3): sin bitácora en el broker o peer sin acciones aún.
+        tabla_acc = tabla_acc.child(tema::texto_terciario("Sin acciones registradas todavía."));
+    } else {
+        for (idx, a) in acciones.iter().enumerate() {
+            tabla_acc = tabla_acc.child(fila_accion(idx, a, tareas));
+        }
+    }
+
+    base.child(resumen)
+        .child(tabla_ses)
+        .child(tabla_tar)
+        .child(tabla_acc)
+}
+
+/// Etiqueta corta en español de un `TipoAccion` para el chip del timeline. El comodín cubre
+/// las variantes futuras del enum `#[non_exhaustive]` (un broker más nuevo no rompe la vista).
+fn etiqueta_accion(a: TipoAccion) -> &'static str {
+    match a {
+        TipoAccion::CrearTarea => "crear tarea",
+        TipoAccion::ReportarTarea => "reporte",
+        TipoAccion::CerrarTarea => "cerrar tarea",
+        TipoAccion::EditarTarea => "editar tarea",
+        TipoAccion::CambiarEstadoTarea => "cambio estado",
+        TipoAccion::ReasignarTarea => "reasignar",
+        TipoAccion::ForzarTarea => "recordatorio",
+        TipoAccion::DefinirResumen => "resumen",
+        TipoAccion::EnviarMensaje => "mensaje",
+        TipoAccion::Kick => "salida",
+        TipoAccion::Purgar => "purga",
+        TipoAccion::ResolverAlerta => "alerta resuelta",
+        _ => "acción",
+    }
+}
+
+/// Rellena una fila del timeline con sus 4 celdas: hora (mono humo) · chip del tipo (brasa
+/// tenue) · sujeto (papel) · detalle (humo, recortado por overflow). Genérica para servir
+/// tanto a la fila clicable (`Stateful<Div>`) como a la estática (`Div`).
+fn celdas_accion<T: ParentElement + Styled>(
+    fila: T,
+    hora: &str,
+    etiqueta: &str,
+    sujeto: &str,
+    detalle: &str,
+) -> T {
+    fila.child(
+        div()
+            .w(px(64.0))
+            .flex_none()
+            .font_family(tema::FUENTE_MONO)
+            .text_xs()
+            .text_color(tema::HUMO)
+            .child(SharedString::from(hora.to_string())),
+    )
+    .child(
+        div()
+            .flex_none()
+            .px_2()
+            .py(px(1.0))
+            .rounded(px(tema::RADIO_PILL))
+            .bg(tema::BRASA_TENUE)
+            .text_xs()
+            .text_color(tema::BRASA)
+            .child(SharedString::from(etiqueta.to_string())),
+    )
+    .child(
+        div()
+            .flex_none()
+            .text_sm()
+            .text_color(tema::PAPEL)
+            .child(SharedString::from(sujeto.to_string())),
+    )
+    .child(
+        div()
+            .flex_1()
+            .overflow_hidden()
+            .text_sm()
+            .text_color(tema::HUMO)
+            .child(SharedString::from(detalle.to_string())),
+    )
+}
+
+/// Una fila del timeline de acciones. Si el `sujeto` es una tarea de ESTA jornada, la fila es
+/// CLICABLE y abre su detalle (AC3: "clicar un sujeto salta a su detalle") reutilizando la
+/// Action `AbrirTareaJornada` y el modal ya existentes. Si no (mensajes, purgas, sujetos de
+/// otras pantallas), fila estática con el mismo layout.
+fn fila_accion(idx: usize, a: &AccionRegistrada, tareas: &[Tarea]) -> AnyElement {
+    // `cuando` es ISO 8601 UTC (posiciones 11..19 = HH:MM:SS); si viniera corto, guion.
+    let hora = a.cuando.get(11..19).unwrap_or("—").to_string();
+    let etiqueta = etiqueta_accion(a.accion);
+    let sujeto = a.sujeto.clone().unwrap_or_default();
+    let detalle = a.detalle.clone().unwrap_or_default();
+
+    let indice_tarea = a
+        .sujeto
+        .as_deref()
+        .and_then(|s| tareas.iter().position(|t| t.id == s));
+
+    match indice_tarea {
+        Some(indice) => celdas_accion(
+            tema::fila_seleccionable(format!("jornada-accion-{idx}"), false).on_click(
+                move |_e, window, cx| {
+                    window.dispatch_action(Box::new(AbrirTareaJornada { indice }), cx);
+                },
+            ),
+            &hora,
+            etiqueta,
+            &sujeto,
+            &detalle,
+        )
+        .into_any_element(),
+        None => celdas_accion(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .px_3()
+                .py_2()
+                .gap_2(),
+            &hora,
+            etiqueta,
+            &sujeto,
+            &detalle,
+        )
+        .into_any_element(),
+    }
 }
 
 /// Métrica del resumen: label humo pequeño encima, valor mono papel debajo.
