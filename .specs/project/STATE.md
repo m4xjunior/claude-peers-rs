@@ -25,3 +25,11 @@ El bug de colisión de ids está ARREGLADO: (1) lock atómico en el registro del
 del cliente pasó de "instancia" (colapsaba en masa) a "peer" (el broker lo sufija). Test
 dos_instancias_mismo_dir_coexisten_con_sufijo. Broker recargado en vivo. Comportamiento pedido
 por Max logrado: varias instancias por directorio, filtrables por nombre (ejemplo, ejemplo-2…).
+
+### Pendiente de refinamiento (anotado 2026-07-02, para la fase Trazabilidad)
+- alertas-02 "ir al sujeto": para GHOSTEO el sujeto es un msg-id, no un peer → hoy navega a
+  Trazabilidad buscando el "historial del peer msg:NNNN" (inexistente → "0 mensajes"). Al
+  implementar la pestaña Trazabilidad (trazabilidad-01: pop-up timeline del mensaje), hacer que
+  "ir al sujeto" de un ghosteo abra el MENSAJE concreto (su timeline), no el historial de un peer.
+- La trazabilidad rica de mensajes (timeline enviado→entregado→leído→procesado, abrir mensaje,
+  reenviar) es la pestaña Trazabilidad — pendiente, fase futura de Fable.
