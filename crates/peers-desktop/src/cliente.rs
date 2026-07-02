@@ -320,6 +320,26 @@ impl ClienteBroker {
         self.post("/admin/reenviar", &PeticionReenviar { msg_id }).await
     }
 
+    /// `POST /enviar {de_id, para_id, texto}` → encola un mensaje directo al peer (peers-02).
+    /// El remitente es la propia desktop (`de_id` fijo "peers-desktop"), espejo del `de_id`
+    /// "peers-tui" del cliente de la TUI: el peer sabe así que le escribe el panel del jefe, no
+    /// otra instancia. Devuelve `RespuestaEnviar` tipada (`ok`/`error`) para el toast.
+    pub async fn enviar(&self, para_id: &str, texto: &str) -> ResultadoBroker<RespuestaEnviar> {
+        let p = PeticionEnviar {
+            de_id: "peers-desktop".to_string(),
+            para_id: para_id.to_string(),
+            texto: texto.to_string(),
+        };
+        self.post("/enviar", &p).await
+    }
+
+    /// `POST /salir {id}` → da de baja al peer (kick, peers-03). Espejo de la tecla `k` de la
+    /// TUI (`ClienteAdmin::salir`). La desktop SIEMPRE pide confirmación antes (acción
+    /// destructiva: cierra la presencia del peer en la red).
+    pub async fn salir(&self, id: &str) -> ResultadoBroker<RespuestaOk> {
+        self.post("/salir", &PeticionSalir { id: id.to_string() }).await
+    }
+
     // --- Acciones de gestión de tareas (Pantalla Tareas, R5/R6/R7/R8) ---
     // El jefe opera sobre las tareas de sus peers. Cada acción es un POST idempotente en el
     // broker; la desktop dispara y luego refresca la lista con `admin_tareas`.

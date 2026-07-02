@@ -12,8 +12,8 @@
 //! contrato de `EstadoPantalla` quedan idénticos.
 
 use gpui::{
-    div, prelude::FluentBuilder, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, AppContext, Context, Entity, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 // `v_flex`/`h_flex` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
 use gpui_component::StyledExt;
@@ -111,6 +111,18 @@ pub struct EstadoPantalla {
     /// hay ninguno marcado. Habilita la barra de acciones del peer (enviar/jornada). Espejo del
     /// cursor de la TUI; se acota/limpia al recargar `instancias` (ver `cargar_peers`).
     pub peers_seleccion: Option<usize>,
+    /// Si `Some(i)`, se muestra el POP-UP de detalle (peers-01) del peer `instancias[i]`:
+    /// identidad, rutas, resumen íntegro, señales de vida y métricas. Espejo de `tarea_detalle`;
+    /// se cierra si el índice queda fuera de rango al recargar el roster.
+    pub peer_detalle: Option<usize>,
+    /// Formulario de la pestaña Peers abierto (peers-02 composer / peers-03 kick), o `None`.
+    pub peers_form: Option<crate::vista::peers::FormPeers>,
+    /// Error de validación de frontera del formulario de Peers (mensaje vacío). Se pinta DENTRO
+    /// del modal. Espejo de `tareas_form_error`.
+    pub peers_form_error: Option<String>,
+    /// Input del composer de mensaje (peers-02). `Entity<InputState>` del kit creada al arrancar;
+    /// `None` sólo si no llegó a construirse (el modal pinta un aviso; nunca `.unwrap()`).
+    pub input_mensaje_peer: Option<Entity<gpui_component::input::InputState>>,
 
     // --- Pantalla Trazabilidad (Fase 2) ---
     /// Peer en foco cuyo historial se muestra (espejo de `traza_peer_actual` de la TUI).
@@ -284,6 +296,10 @@ impl AppDesktop {
         // Las entradas del CRUD de tareas (tareas-03..08) también son stateful (InputState del
         // kit): se crean aquí una vez y los formularios las siembran/leen al abrir/confirmar.
         let inputs_tareas = Some(crate::vista::tareas::nuevos_inputs(window, cx));
+        // Input del composer de mensaje a peer (peers-02), mismo criterio.
+        let input_mensaje_peer = Some(cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx).placeholder("Escribe el mensaje…")
+        }));
         let datos = EstadoPantalla {
             acceso_url: cliente.base().to_string(),
             acceso_token: cliente.token_enmascarado(),
@@ -291,6 +307,7 @@ impl AppDesktop {
             panel_config,
             panel_acceso,
             inputs_tareas,
+            input_mensaje_peer,
             ..EstadoPantalla::default()
         };
         // Arranca la carga inicial + el refresco periódico. El `cx` aquí es `Context<Self>` (viene
@@ -375,6 +392,12 @@ impl AppDesktop {
                         if let Some(i) = esta.datos.peers_seleccion {
                             if i >= esta.datos.instancias.len() {
                                 esta.datos.peers_seleccion = None;
+                            }
+                        }
+                        // Mismo criterio para el pop-up de detalle (peers-01): fuera de rango → cerrar.
+                        if let Some(i) = esta.datos.peer_detalle {
+                            if i >= esta.datos.instancias.len() {
+                                esta.datos.peer_detalle = None;
                             }
                         }
                     }
@@ -973,14 +996,174 @@ impl AppDesktop {
         self.navegar_y_cargar(Pantalla::Jornada, cx);
     }
 
-    /// "Enviar mensaje" al peer `id`. La lista de métodos del cliente no expone un envío directo
-    /// peer→peer desde el supervisor (sólo `reenviar` de un mensaje EXISTENTE del historial), y la
-    /// vista pura no puede abrir un compositor de texto. En vez de dejar el botón muerto, se enfoca
-    /// la TRAZABILIDAD de ese peer (donde SÍ se puede reenviar), que es el flujo de mensajería real
-    /// disponible hoy. Documentado como el comportamiento actual hasta que exista un endpoint de
-    /// envío directo del supervisor + un compositor.
-    fn enviar_mensaje_peer(&mut self, id: String, cx: &mut Context<Self>) {
-        self.enfocar_traza(id, cx);
+    /// "Enviar mensaje" al peer `id` (peers-02): abre el COMPOSER real (Input + Para: <id>). El
+    /// comportamiento anterior (saltar a Trazabilidad) era un apaño hasta tener composición; ahora
+    /// el cliente expone `enviar` (`POST /enviar`) y el flujo es el de la TUI (tecla `m`).
+    fn enviar_mensaje_peer(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.abrir_form_peers(crate::vista::peers::FormPeers::Mensaje { id }, window, cx);
+    }
+
+    // --- Detalle y formularios de la pestaña Peers (peers-01/02/03) ---
+    // Mismo esquema que Tareas: un pop-up de detalle (`peer_detalle`) + un único formulario a la
+    // vez (`peers_form`), montados como overlays por el render raíz.
+
+    /// Abre el pop-up de detalle (peers-01) del peer `indice` y lo marca como seleccionado.
+    /// Refresca la caché de tareas en segundo plano para que la métrica "N tarea(s) abierta(s)"
+    /// del detalle no esté rancia (en esta pantalla `tareas` no se recarga sola).
+    fn abrir_detalle_peer(&mut self, indice: usize, cx: &mut Context<Self>) {
+        if indice >= self.datos.instancias.len() {
+            return;
+        }
+        self.datos.peers_seleccion = Some(indice);
+        self.datos.peer_detalle = Some(indice);
+        self.cargar_tareas(cx);
+        cx.notify();
+    }
+
+    /// Cierra el pop-up de detalle del peer (✕, Cerrar, clic fuera, Esc).
+    fn cerrar_detalle_peer(&mut self, cx: &mut Context<Self>) {
+        if self.datos.peer_detalle.is_some() {
+            self.datos.peer_detalle = None;
+            cx.notify();
+        }
+    }
+
+    /// Abre un formulario de Peers (composer de mensaje o confirmación de kick). Siembra el Input
+    /// del mensaje VACÍO (no hereda texto de un envío anterior), limpia el error y cierra el
+    /// detalle (un solo overlay a la vez, coherente con Tareas).
+    fn abrir_form_peers(
+        &mut self,
+        form: crate::vista::peers::FormPeers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(input) = &self.datos.input_mensaje_peer {
+            input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        }
+        self.datos.peer_detalle = None;
+        self.datos.peers_form_error = None;
+        self.datos.peers_form = Some(form);
+        cx.notify();
+    }
+
+    /// Cierra el formulario de Peers sin confirmar (Cancelar, ✕, clic fuera, Esc).
+    fn cerrar_form_peers(&mut self, cx: &mut Context<Self>) {
+        if self.datos.peers_form.is_some() {
+            self.datos.peers_form = None;
+            self.datos.peers_form_error = None;
+            cx.notify();
+        }
+    }
+
+    /// Confirma el formulario de Peers activo: valida la frontera y dispara el POST vía
+    /// `mutar_peer` (red en fondo + recarga del roster + toast). Mensaje vacío → error en el
+    /// modal (sigue abierto para corregir).
+    fn confirmar_form_peers(&mut self, cx: &mut Context<Self>) {
+        use crate::vista::peers::FormPeers;
+        let Some(form) = self.datos.peers_form.clone() else {
+            return;
+        };
+        match form {
+            FormPeers::Mensaje { id } => {
+                let texto = self
+                    .datos
+                    .input_mensaje_peer
+                    .as_ref()
+                    .map(|i| i.read(cx).value().trim().to_string())
+                    .unwrap_or_default();
+                if texto.is_empty() {
+                    self.datos.peers_form_error = Some("el mensaje no puede ir vacío".to_string());
+                    cx.notify();
+                    return;
+                }
+                self.cerrar_form_peers(cx);
+                let exito = format!("Mensaje enviado a {id}");
+                self.mutar_peer(
+                    exito,
+                    move |c| c.bloquear_en(c.enviar(&id, &texto)).map(|_| ()),
+                    cx,
+                );
+            }
+            FormPeers::Kick { id } => {
+                self.cerrar_form_peers(cx);
+                // Si el peer expulsado estaba seleccionado, suelta la selección (va a desaparecer).
+                self.datos.peers_seleccion = None;
+                let exito = format!("Peer «{id}» expulsado");
+                self.mutar_peer(
+                    exito,
+                    move |c| c.bloquear_en(c.salir(&id)).map(|_| ()),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ejecuta una MUTACIÓN de peer en segundo plano y aplica el post-proceso común: recarga el
+    /// roster (`POST /listar`) si fue OK, guarda el error en `error_peers` si falló, y emite un
+    /// toast de éxito/fallo. Análogo exacto de `mutar_tarea` (red SIEMPRE vía `bloquear_en` en el
+    /// executor de fondo — el `.await` directo en `cx.spawn` era el crash SIGABRT).
+    fn mutar_peer(
+        &mut self,
+        exito: String,
+        hacer: impl FnOnce(&ClienteBroker) -> Result<(), crate::cliente::ErrorBroker> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let ventana = cx.active_window();
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            let resultado = hacer(&cliente);
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.bloquear_en(cliente.listar_instancias())),
+                Err(_) => None,
+            };
+            (resultado, recarga)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (resultado, recarga) = fondo.await;
+            let ok = resultado.is_ok();
+            let motivo_fallo = resultado.as_ref().err().map(|e| e.to_string());
+            let _ = esta.update(cx, |esta, cx| {
+                match resultado {
+                    Ok(_) => {
+                        esta.datos.error_peers = None;
+                        if let Some(Ok(lista)) = recarga {
+                            esta.datos.instancias = lista;
+                            // Acota selección y detalle a la nueva longitud del roster.
+                            let n = esta.datos.instancias.len();
+                            if let Some(i) = esta.datos.peers_seleccion {
+                                if i >= n {
+                                    esta.datos.peers_seleccion = None;
+                                }
+                            }
+                            if let Some(i) = esta.datos.peer_detalle {
+                                if i >= n {
+                                    esta.datos.peer_detalle = None;
+                                }
+                            }
+                        } else if let Some(Err(e)) = recarga {
+                            esta.datos.error_peers = Some(e);
+                        }
+                    }
+                    Err(e) => esta.datos.error_peers = Some(e),
+                }
+                cx.notify();
+            });
+            if let Some(ventana) = ventana {
+                let _ = ventana.update(cx, |_raiz, win, app| {
+                    use gpui_component::notification::Notification;
+                    use gpui_component::WindowExt as _;
+                    let note = if ok {
+                        Notification::success(exito.clone())
+                    } else {
+                        let motivo =
+                            motivo_fallo.unwrap_or_else(|| "error desconocido".to_string());
+                        Notification::error(format!("No se pudo aplicar: {motivo}"))
+                    };
+                    win.push_notification(note, app);
+                });
+            }
+        })
+        .detach();
     }
 
     // --- Manejadores de la pantalla Trazabilidad ---
@@ -1767,6 +1950,11 @@ impl AppDesktop {
                 let idx = self.datos.tareas_seleccion;
                 self.abrir_detalle_tarea(idx, cx);
             }
+            Pantalla::Peers => {
+                // peers-01: Enter abre el detalle del peer seleccionado (o del primero si no hay).
+                let idx = self.datos.peers_seleccion.unwrap_or(0);
+                self.abrir_detalle_peer(idx, cx);
+            }
             Pantalla::Trazabilidad => {
                 let idx = self.datos.traza_seleccion;
                 self.seleccionar_mensaje(idx, cx);
@@ -1811,6 +1999,28 @@ impl AppDesktop {
                     "x" => self.pedir_confirm_estado(tarea_id, EstadoTarea::Cancelada, window, cx),
                     "a" => self.abrir_form_reasignar(tarea_id, window, cx),
                     "f" => self.forzar_tarea(tarea_id, cx),
+                    _ => return false,
+                }
+                true
+            }
+            Pantalla::Peers => {
+                // Paridad con la TUI: `m` = componer mensaje (peers-02), `k` = kick con
+                // confirmación (peers-03). Operan sobre el peer seleccionado.
+                let Some(inst) = self
+                    .datos
+                    .peers_seleccion
+                    .and_then(|i| self.datos.instancias.get(i))
+                else {
+                    return false;
+                };
+                let id = inst.id.clone();
+                match tecla {
+                    "m" => self.enviar_mensaje_peer(id, window, cx),
+                    "k" => self.abrir_form_peers(
+                        crate::vista::peers::FormPeers::Kick { id },
+                        window,
+                        cx,
+                    ),
                     _ => return false,
                 }
                 true
@@ -1881,12 +2091,19 @@ impl AppDesktop {
         if m.platform || m.control || m.alt || m.function {
             return;
         }
-        // Con un FORMULARIO del CRUD abierto, las letras pertenecen a los Inputs (el jefe está
-        // escribiendo texto): sólo se intercepta Escape (cerrar). Sin este guard, teclear una
-        // descripción con 'b'/'x'/'a' dispararía acciones de tarea debajo del modal.
+        // Con un FORMULARIO abierto (CRUD de tareas o composer/kick de peers), las letras
+        // pertenecen a los Inputs (el jefe está escribiendo texto): sólo se intercepta Escape
+        // (cerrar). Sin este guard, teclear una descripción con 'b'/'x'/'a'/'m'/'k' dispararía
+        // acciones de pantalla debajo del modal.
         if self.datos.tareas_form.is_some() {
             if ks.key.as_str() == "escape" {
                 self.cerrar_form_tareas(cx);
+            }
+            return;
+        }
+        if self.datos.peers_form.is_some() {
+            if ks.key.as_str() == "escape" {
+                self.cerrar_form_peers(cx);
             }
             return;
         }
@@ -1939,7 +2156,16 @@ impl AppDesktop {
                     cx.notify();
                 }
             }
-            Pantalla::Peers => self.deseleccionar_peer(cx),
+            Pantalla::Peers => {
+                // Prioridad: formulario > detalle > selección (el "volver atrás" contextual).
+                if self.datos.peers_form.is_some() {
+                    self.cerrar_form_peers(cx);
+                } else if self.datos.peer_detalle.is_some() {
+                    self.cerrar_detalle_peer(cx);
+                } else {
+                    self.deseleccionar_peer(cx);
+                }
+            }
             _ => {}
         }
     }
@@ -2097,6 +2323,55 @@ impl AppDesktop {
         )
     }
 
+    /// Overlay del POP-UP de detalle de peer (peers-01), si `peer_detalle` apunta a un peer
+    /// válido. Calco del patrón `overlay_tarea` (backdrop, clic-fuera cierra, contenido occlude).
+    fn overlay_peer(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let idx = self.datos.peer_detalle?;
+        let inst = self.datos.instancias.get(idx)?;
+        let contenido = crate::vista::peers::render_modal_detalle_peer(inst, &self.datos);
+
+        Some(
+            div()
+                .id("overlay-peer")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::peers::CerrarDetallePeer), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
+    /// Overlay del FORMULARIO de Peers (composer de mensaje / confirmación de kick), si hay uno
+    /// abierto. Mismo patrón; se monta por encima del detalle.
+    fn overlay_form_peers(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let form = self.datos.peers_form.as_ref()?;
+        let contenido = crate::vista::peers::render_modal_form_peers(form, &self.datos);
+
+        Some(
+            div()
+                .id("overlay-form-peers")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::peers::CerrarFormPeers), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
     /// Overlay del FORMULARIO del CRUD de tareas (tareas-03..08), si hay uno abierto. Mismo patrón
     /// que `overlay_tarea`/`overlay_alerta`: backdrop translúcido, clic fuera cierra (sin
     /// confirmar), contenido `occlude`. Se monta el ÚLTIMO (por encima del detalle).
@@ -2215,7 +2490,10 @@ impl Render for AppDesktop {
         use crate::vista::broker::RecargarBroker;
         use crate::vista::config::RecargarConfig;
         use crate::vista::jornada::{SeleccionarSesion, SeleccionarTareaJornada};
-        use crate::vista::peers::{DeseleccionarPeer, EnviarMensajePeer, SeleccionarPeer, VerJornadaPeer};
+        use crate::vista::peers::{
+            AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
+            DeseleccionarPeer, EnviarMensajePeer, PedirKickPeer, SeleccionarPeer, VerJornadaPeer,
+        };
         use crate::vista::redis::{PurgarPeer, SeleccionarColaRedis};
         use crate::vista::tareas::{
             AbrirDetalleTarea, AbrirFormAmpliar, AbrirFormAsignar, AbrirFormBloquear,
@@ -2272,8 +2550,28 @@ impl Render for AppDesktop {
             .on_action(cx.listener(|esta, a: &VerJornadaPeer, _window, cx| {
                 esta.ver_jornada_peer(a.id.clone(), cx);
             }))
-            .on_action(cx.listener(|esta, a: &EnviarMensajePeer, _window, cx| {
-                esta.enviar_mensaje_peer(a.id.clone(), cx);
+            .on_action(cx.listener(|esta, a: &EnviarMensajePeer, window, cx| {
+                esta.enviar_mensaje_peer(a.id.clone(), window, cx);
+            }))
+            // --- Peers: detalle + composer + kick (peers-01/02/03) ---
+            .on_action(cx.listener(|esta, a: &AbrirDetallePeer, _window, cx| {
+                esta.abrir_detalle_peer(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarDetallePeer, _window, cx| {
+                esta.cerrar_detalle_peer(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &PedirKickPeer, window, cx| {
+                esta.abrir_form_peers(
+                    crate::vista::peers::FormPeers::Kick { id: a.id.clone() },
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|esta, _a: &ConfirmarFormPeers, _window, cx| {
+                esta.confirmar_form_peers(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarFormPeers, _window, cx| {
+                esta.cerrar_form_peers(cx);
             }))
             // --- Trazabilidad ---
             .on_action(cx.listener(|esta, a: &EnfocarPeer, _window, cx| {
@@ -2392,7 +2690,10 @@ impl Render for AppDesktop {
             .children(self.overlay_alerta())
             // Overlay del pop-up de detalle de tarea (tareas-01), mismo patrón.
             .children(self.overlay_tarea())
-            // Overlay del formulario del CRUD de tareas (tareas-03..08), por encima de todo.
+            // Overlay del pop-up de detalle de peer (peers-01).
+            .children(self.overlay_peer())
+            // Overlays de formularios (CRUD de tareas y composer/kick de peers), por encima de todo.
             .children(self.overlay_form_tareas())
+            .children(self.overlay_form_peers())
     }
 }

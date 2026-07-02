@@ -25,11 +25,11 @@
 //! mutación (marcar peer, disparar fetch, navegar a trazabilidad) vive en `AppDesktop` (Fase 3).
 
 use gpui::{
-    div, actions, px, rgba, Action, IntoElement, ParentElement, Rgba,
-    SharedString, StatefulInteractiveElement, Styled,
+    div, actions, px, rgb, rgba, Action, AnyElement, InteractiveElement, IntoElement,
+    ParentElement, Rgba, SharedString, StatefulInteractiveElement, Styled,
 };
 // `v_flex`/`h_flex` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
-use gpui_component::StyledExt;
+use gpui_component::{input::Input, StyledExt};
 
 use peers_core::{Alerta, Instancia, TipoAlerta};
 
@@ -77,6 +77,39 @@ pub struct VerJornadaPeer {
 
 // Acción sin datos: limpiar la selección de peer (botón "Cerrar" de la barra de acciones).
 actions!(peers, [DeseleccionarPeer]);
+
+// Acciones sin datos del detalle y los formularios de peers (peers-01/02/03): cerrar el pop-up de
+// detalle, cerrar el formulario activo (composer/kick) sin confirmar, y confirmarlo (enviar/kick).
+actions!(peers, [CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers]);
+
+/// Abrir el pop-up de DETALLE del peer `indice` (peers-01): doble-click en la fila, botón "Abrir"
+/// o Enter. `AppDesktop` guarda `Some(indice)` en `peer_detalle` y monta el overlay en su render
+/// raíz (patrón idéntico a `tareas::AbrirDetalleTarea` → `overlay_tarea`).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = peers, no_json)]
+pub struct AbrirDetallePeer {
+    pub indice: usize,
+}
+
+/// Pedir la EXPULSIÓN del peer `id` (peers-03): abre el mini-modal de confirmación (acción
+/// destructiva — cierra la presencia del peer en la red). El POST real (`/salir`) sólo se dispara
+/// al confirmar con `ConfirmarFormPeers`.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = peers, no_json)]
+pub struct PedirKickPeer {
+    pub id: String,
+}
+
+/// Qué formulario de la pestaña Peers está abierto (peers-02/03). Vive en
+/// `EstadoPantalla.peers_form` (`None` = ninguno). Cada variante captura el `id` del peer al
+/// abrir para no depender del índice (la lista puede reordenarse entre recargas).
+#[derive(Clone, PartialEq)]
+pub enum FormPeers {
+    /// peers-02: componer y enviar un mensaje al peer (el texto vive en `input_mensaje_peer`).
+    Mensaje { id: String },
+    /// peers-03: confirmación de expulsión (destructiva, 2 pasos).
+    Kick { id: String },
+}
 
 // -------------------------------------------------------------------------------------------------
 // ESTADO OPERATIVO DEL PEER — enum cerrado (no "stringly typed") para que etiqueta y color salgan
@@ -231,9 +264,14 @@ fn fila(indice: usize, inst: &Instancia, estado: EstadoPeer, activa: bool) -> im
                 .px_1()
                 .child(tema::chip_estado(estado.etiqueta(), estado.color())),
         )
-        .on_click(move |_evento, window, cx| {
-            // Despacha la selección; `AppDesktop` la maneja y muta el estado. La vista no toca `cx`.
-            window.dispatch_action(Box::new(SeleccionarPeer { indice }), cx);
+        .on_click(move |evento, window, cx| {
+            // Doble-click abre el pop-up de detalle (peers-01); click simple sólo selecciona.
+            // La vista no toca `cx`: despacha y `AppDesktop` muta el estado.
+            if evento.click_count() >= 2 {
+                window.dispatch_action(Box::new(AbrirDetallePeer { indice }), cx);
+            } else {
+                window.dispatch_action(Box::new(SeleccionarPeer { indice }), cx);
+            }
         })
 }
 
@@ -254,11 +292,14 @@ fn banner_error(err: &crate::cliente::ErrorBroker) -> impl IntoElement {
 }
 
 /// Barra de acciones del peer seleccionado: aparece bajo la tabla cuando hay un peer marcado.
-/// Muestra el id del peer en foco y dos botones (Enviar mensaje / Ver jornada) + un "Cerrar" para
-/// soltar la selección. Espejo de las teclas de la TUI (`m` = mensaje) elevadas a botones visibles.
-fn barra_acciones(inst: &Instancia) -> impl IntoElement {
+/// Muestra el id del peer en foco y los botones Abrir (detalle, peers-01), Enviar mensaje
+/// (composer, peers-02), Ver jornada, Expulsar (kick con confirmación, peers-03) y "Cerrar" para
+/// soltar la selección. Espejo de las teclas de la TUI (`m`/`k`) elevadas a botones visibles.
+/// `indice` viaja en `AbrirDetallePeer` (posición en `datos.instancias`).
+fn barra_acciones(inst: &Instancia, indice: usize) -> impl IntoElement {
     let id_msg = inst.id.clone();
     let id_jornada = inst.id.clone();
+    let id_kick = inst.id.clone();
 
     tema::superficie_card()
         .h_flex()
@@ -277,7 +318,12 @@ fn barra_acciones(inst: &Instancia) -> impl IntoElement {
         // Empuja los botones a la derecha.
         .child(div().flex_1())
         .child(
-            tema::boton_primario("peer-accion-mensaje", "Enviar mensaje").on_click(
+            tema::boton_primario("peer-accion-abrir", "Abrir").on_click(move |_e, window, cx| {
+                window.dispatch_action(Box::new(AbrirDetallePeer { indice }), cx);
+            }),
+        )
+        .child(
+            tema::boton_secundario("peer-accion-mensaje", "Enviar mensaje").on_click(
                 move |_e, window, cx| {
                     window.dispatch_action(Box::new(EnviarMensajePeer { id: id_msg.clone() }), cx);
                 },
@@ -290,6 +336,11 @@ fn barra_acciones(inst: &Instancia) -> impl IntoElement {
                 },
             ),
         )
+        // Kick (peers-03): botón PELIGRO (rojo terroso, no brasa) — la confirmación la abre
+        // `PedirKickPeer`; el POST sólo sale al confirmar.
+        .child(boton_peligro("peer-accion-kick", "Expulsar").on_click(move |_e, window, cx| {
+            window.dispatch_action(Box::new(PedirKickPeer { id: id_kick.clone() }), cx);
+        }))
         .child(
             tema::boton_secundario("peer-accion-cerrar", "Cerrar").on_click(|_e, window, cx| {
                 window.dispatch_action(Box::new(DeseleccionarPeer), cx);
@@ -364,11 +415,355 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
     // Barra de acciones del peer marcado (si la selección apunta a una fila válida).
     if let Some(idx) = seleccion {
         if let Some(inst) = datos.instancias.get(idx) {
-            raiz = raiz.child(barra_acciones(inst));
+            raiz = raiz.child(barra_acciones(inst, idx));
         }
     }
 
     raiz
+}
+
+// -------------------------------------------------------------------------------------------------
+// MODALES (peers-01/02/03) — contenido PURO de los overlays que `AppDesktop` monta en su render
+// raíz leyendo `peer_detalle` / `peers_form` (patrón idéntico a los modales de Tareas). El overlay
+// (backdrop, clic-fuera, Esc) lo aporta la app; aquí sólo se compone el interior Ethos.
+// -------------------------------------------------------------------------------------------------
+
+/// Rojo terroso para las acciones DESTRUCTIVAS (kick). Mismo tono que el confirmar destructivo de
+/// Tareas/Alertas: semántica de peligro calibrada a la paleta cálida, nunca el dorado de marca.
+const ROJO_PELIGRO: u32 = 0xC0_4A_3E;
+const ROJO_PELIGRO_HOVER: u32 = 0xD0_5A_4E;
+
+/// Botón de acción PELIGROSA (variante roja apagada de la RFC): mismo formato que los botones del
+/// tema pero en rojo terroso. Vive aquí (no en `tema`) hasta que otra pestaña lo necesite.
+fn boton_peligro(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(gpui::ElementId::Name(id.into()))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_4()
+        .py_2()
+        .rounded(px(tema::RADIO_CONTROL))
+        .bg(rgb(ROJO_PELIGRO))
+        .text_color(tema::PAPEL)
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(ROJO_PELIGRO_HOVER)))
+        .child(label.into())
+}
+
+/// Fila "eyebrow humo + valor papel" del detalle, con el valor en MONO (ids, rutas, pids, horas).
+fn campo_mono(etiqueta: &'static str, valor: String) -> impl IntoElement {
+    div()
+        .h_flex()
+        .items_baseline()
+        .gap_3()
+        .child(div().w(px(110.0)).flex_shrink_0().child(tema::eyebrow(etiqueta)))
+        .child(
+            div()
+                .font_family(tema::FUENTE_MONO)
+                .text_color(tema::PAPEL)
+                .child(SharedString::from(valor)),
+        )
+}
+
+/// Contenido del pop-up "Detalle del peer" (peers-01). Consolida TODO lo que la fila recorta:
+/// identidad (id + directorio + repos + tty/pid/hostname), resumen íntegro, estado operativo
+/// (chip derivado de alertas), señales (`registrada_en`/`visto_en` mono) y métricas ligeras
+/// (nº alertas vivas del peer y nº tareas abiertas, cruzadas de las cachés). Al pie, la barra de
+/// acciones (mensaje / jornada / expulsar) — el hub que la RFC pide como shell de las siguientes.
+pub fn render_modal_detalle_peer(inst: &Instancia, datos: &EstadoPantalla) -> AnyElement {
+    let estado = estado_peer(&inst.id, &datos.alertas);
+
+    // Métricas cruzadas de las cachés ya cargadas (sin red aquí: la vista es pura). `AppDesktop`
+    // refresca `tareas` al abrir el detalle para que estos números no estén rancios.
+    let alertas_vivas = datos.alertas.iter().filter(|a| a.sujeto == inst.id).count();
+    let tareas_abiertas = datos
+        .tareas
+        .iter()
+        .filter(|t| t.instancia_id == inst.id && !t.estado.es_terminal())
+        .count();
+
+    let id_msg = inst.id.clone();
+    let id_jornada = inst.id.clone();
+    let id_kick = inst.id.clone();
+
+    div()
+        .v_flex()
+        .w(px(560.0))
+        .gap_3()
+        .p_5()
+        .rounded(px(tema::RADIO_CARD))
+        .bg(tema::TINTA2)
+        .border_1()
+        .border_color(tema::LINEA)
+        // Cabecera: chip de estado + título display + ✕ de cierre.
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_3()
+                        .child(tema::chip_estado(estado.etiqueta(), estado.color()))
+                        .child(tema::titulo("Detalle del peer").text_size(px(18.0))),
+                )
+                .child(
+                    div()
+                        .id("modal-peer-cerrar-x")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(tema::RADIO_CONTROL))
+                        .text_color(tema::HUMO)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(tema::TINTA).text_color(tema::PAPEL))
+                        .child(SharedString::from("✕"))
+                        .on_click(|_e, window, cx| {
+                            window.dispatch_action(Box::new(CerrarDetallePeer), cx);
+                        }),
+                ),
+        )
+        // Identidad: el id en BRASA grande (el ancla), luego las rutas en mono.
+        .child(
+            div()
+                .text_color(tema::BRASA)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(SharedString::from(inst.id.clone())),
+        )
+        .child(campo_mono("directorio", inst.directorio.clone()))
+        .child(campo_mono(
+            "repo git",
+            inst.repo_git.clone().unwrap_or_else(|| "—".to_string()),
+        ))
+        .child(campo_mono(
+            "github",
+            inst.repo_github.clone().unwrap_or_else(|| "—".to_string()),
+        ))
+        .child(campo_mono(
+            "proceso",
+            format!(
+                "pid {} · {} · {}",
+                inst.pid,
+                if inst.hostname.is_empty() { "host —" } else { &inst.hostname },
+                inst.tty.as_deref().unwrap_or("tty —")
+            ),
+        ))
+        // Resumen ÍNTEGRO (la celda de la tabla lo recorta): texto humano, con scroll acotado.
+        .child(
+            div()
+                .v_flex()
+                .gap_1()
+                .child(tema::eyebrow("resumen"))
+                .child(
+                    div()
+                        .id("modal-peer-resumen-scroll")
+                        .max_h(px(140.0))
+                        .overflow_y_scroll()
+                        .child(tema::texto_primario(if inst.resumen.is_empty() {
+                            "(sin resumen)".to_string()
+                        } else {
+                            inst.resumen.clone()
+                        })),
+                ),
+        )
+        // Señales de vida: registro y último latido, en mono (timestamps).
+        .child(campo_mono("registrada", inst.registrada_en.clone()))
+        .child(campo_mono("visto", inst.visto_en.clone()))
+        // Métricas ligeras de las cachés (alertas del peer + tareas abiertas).
+        .child(campo_mono(
+            "métricas",
+            format!("{alertas_vivas} alerta(s) viva(s) · {tareas_abiertas} tarea(s) abierta(s)"),
+        ))
+        // Pie: acciones del peer (el detalle es el hub). Cerrar + mensaje + jornada + expulsar.
+        .child(
+            div()
+                .h_flex()
+                .flex_wrap()
+                .gap_3()
+                .pt_2()
+                .child(
+                    tema::boton_secundario("modal-peer-cerrar", "Cerrar").on_click(
+                        |_e, window, cx| {
+                            window.dispatch_action(Box::new(CerrarDetallePeer), cx);
+                        },
+                    ),
+                )
+                .child(
+                    tema::boton_primario("modal-peer-mensaje", "Enviar mensaje").on_click(
+                        move |_e, window, cx| {
+                            window.dispatch_action(
+                                Box::new(EnviarMensajePeer { id: id_msg.clone() }),
+                                cx,
+                            );
+                        },
+                    ),
+                )
+                .child(
+                    tema::boton_secundario("modal-peer-jornada", "Ver jornada").on_click(
+                        move |_e, window, cx| {
+                            window.dispatch_action(
+                                Box::new(VerJornadaPeer { id: id_jornada.clone() }),
+                                cx,
+                            );
+                        },
+                    ),
+                )
+                .child(boton_peligro("modal-peer-kick", "Expulsar").on_click(
+                    move |_e, window, cx| {
+                        window.dispatch_action(Box::new(PedirKickPeer { id: id_kick.clone() }), cx);
+                    },
+                )),
+        )
+        .into_any_element()
+}
+
+/// Contenido del modal del formulario activo de Peers (peers-02/03): el COMPOSER de mensaje
+/// (Input real + Para: <id> en brasa) o la CONFIRMACIÓN de expulsión (destructiva, botón rojo).
+/// Confirmar despacha `ConfirmarFormPeers` sin payload: el texto lo lee `AppDesktop` del Input.
+pub fn render_modal_form_peers(form: &FormPeers, datos: &EstadoPantalla) -> AnyElement {
+    let titulo = match form {
+        FormPeers::Mensaje { .. } => "Enviar mensaje",
+        FormPeers::Kick { .. } => "Expulsar peer",
+    };
+
+    let mut modal = div()
+        .v_flex()
+        .w(px(520.0))
+        .gap_3()
+        .p_5()
+        .rounded(px(tema::RADIO_CARD))
+        .bg(tema::TINTA2)
+        .border_1()
+        .border_color(tema::LINEA)
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .child(tema::titulo(titulo).text_size(px(18.0)))
+                .child(
+                    div()
+                        .id("modal-form-peers-cerrar-x")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(tema::RADIO_CONTROL))
+                        .text_color(tema::HUMO)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(tema::TINTA).text_color(tema::PAPEL))
+                        .child(SharedString::from("✕"))
+                        .on_click(|_e, window, cx| {
+                            window.dispatch_action(Box::new(CerrarFormPeers), cx);
+                        }),
+                ),
+        );
+
+    match form {
+        FormPeers::Mensaje { id } => {
+            // Cabecera "Para: <id>" en brasa (la RFC lo pide explícito: ver a quién se manda).
+            modal = modal.child(
+                div()
+                    .h_flex()
+                    .items_baseline()
+                    .gap_3()
+                    .child(div().w(px(60.0)).flex_shrink_0().child(tema::eyebrow("para")))
+                    .child(
+                        div()
+                            .font_family(tema::FUENTE_MONO)
+                            .text_color(tema::BRASA)
+                            .child(SharedString::from(id.clone())),
+                    ),
+            );
+            // Input real del mensaje (Entity creada por la app; la vista sólo lo pinta).
+            if let Some(input) = &datos.input_mensaje_peer {
+                modal = modal.child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(tema::eyebrow("mensaje"))
+                        .child(
+                            div()
+                                .w_full()
+                                .px_3()
+                                .py_1()
+                                .rounded(tema::radio(tema::RADIO_CONTROL))
+                                .bg(tema::TINTA)
+                                .border_1()
+                                .border_color(tema::LINEA)
+                                .child(Input::new(input).cleanable(true)),
+                        ),
+                );
+            } else {
+                modal = modal.child(tema::texto_terciario(
+                    "El campo de mensaje no está inicializado; reinicia la app.",
+                ));
+            }
+        }
+        FormPeers::Kick { id } => {
+            modal = modal
+                .child(tema::texto_primario(format!(
+                    "¿Expulsar a «{id}»? Se cerrará su presencia en la red."
+                )))
+                .child(tema::texto_terciario(
+                    "El peer desaparece del roster; si su sesión sigue viva, volverá a registrarse \
+                     con el siguiente latido.",
+                ));
+        }
+    }
+
+    // Error de validación de frontera (mensaje vacío) que dejó `AppDesktop`.
+    if let Some(err) = &datos.peers_form_error {
+        modal = modal.child(
+            div()
+                .text_sm()
+                .text_color(rgb(0xF1_A8_A8))
+                .child(SharedString::from(format!("⚠ {err}"))),
+        );
+    }
+
+    // Botonera: Cancelar + confirmar (dorado para enviar, rojo para expulsar).
+    let confirmar: AnyElement = match form {
+        FormPeers::Mensaje { .. } => {
+            tema::boton_primario("modal-form-peers-enviar", "Enviar")
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(ConfirmarFormPeers), cx);
+                })
+                .into_any_element()
+        }
+        FormPeers::Kick { .. } => boton_peligro("modal-form-peers-kick", "Sí, expulsar")
+            .on_click(|_e, window, cx| {
+                window.dispatch_action(Box::new(ConfirmarFormPeers), cx);
+            })
+            .into_any_element(),
+    };
+
+    modal
+        .child(
+            div()
+                .h_flex()
+                .gap_3()
+                .pt_2()
+                .child(
+                    tema::boton_secundario("modal-form-peers-cancelar", "Cancelar").on_click(
+                        |_e, window, cx| {
+                            window.dispatch_action(Box::new(CerrarFormPeers), cx);
+                        },
+                    ),
+                )
+                .child(confirmar),
+        )
+        .into_any_element()
 }
 
 /// Extrae `HH:MM:SS` de un ISO 8601 para la columna "visto". Espejo de `hora_iso` de la TUI
