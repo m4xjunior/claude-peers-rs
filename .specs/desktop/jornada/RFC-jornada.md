@@ -11,7 +11,7 @@
 | **Espejo** | `crates/peers-tui/src/ui/jornada.rs` + acciones en `crates/peers-tui/src/main.rs` |
 | **Design System** | Ethos (tinta #100D0A · tinta2 #1A1611 · papel #ECE5D7 · brasa #C9A96E · humo #938B7B · línea #2B271F · Fraunces/Inter/IBM Plex Mono) |
 | **Fecha** | 2026-07-02 |
-| **Estado** | PROPUESTO (pendiente de decisión — RFC previa a implementar) |
+| **Estado** | EN DECISIÓN — jornada-03 decidida (A+B); resto pendiente |
 
 ---
 
@@ -104,11 +104,16 @@ La vista está **explícitamente declarada como SOLO LECTURA** en su propio doc-
 
 - **Problema:** si no hay peer enfocado, la pantalla solo dice "ve a Peers". Cambiar de peer obliga a abandonar la jornada.
 - **Propuesta:** **selector de peer** en la cabecera de la card resumen. Al elegir, dispara `POST /jornada { instancia_id }` y repinta.
-- **Variantes:**
-  - **A — `Select` (dropdown) dorado:** en la cabecera, pill radio 999, borde línea, texto papel, chevron brasa; lista poblada con `POST /listar`.
-  - **B — Flechas `[ ‹ id › ]`:** espejo literal de `[`/`]` de la TUI: dos botones-chevron a los lados del id en mono; cicla el índice.
-  - **C — Buscador con `Input` + Popover:** input filtrable que muestra peers coincidentes (útil con muchos peers).
-- **Endpoint:** `POST /listar` (poblar) + `POST /jornada` (recargar).
+- **DECISIÓN (Max, 2026-07-02): A + B combinadas.** Un solo control que junta el dropdown y las flechas:
+  ```
+  ‹   [ otus-backend ▾ ]   ›
+  ```
+  - El **`Select` dropdown dorado** (variante A) en el centro: click abre la lista de peers vivos (poblada con `POST /listar`) para SALTAR a cualquiera. Pill radio 999, borde línea, texto papel, chevron brasa.
+  - Los **chevrones `‹` `›`** a los lados (variante B): cada click cicla al peer anterior/siguiente. Espejo literal de `[`/`]` de la TUI (y esas mismas teclas los accionan cuando se implemente jornada-17). Botones ghost, icono brasa.
+  - Razón: el dropdown escala a muchos peers y da acceso directo; las flechas dan el recorrido rápido "el siguiente" con muscle-memory de la TUI. Coste marginal sobre una sola variante.
+- **Variantes evaluadas (descartadas):**
+  - ~~C — Buscador con `Input` + Popover~~: overkill con pocos peers; si el equipo crece mucho, el dropdown de A puede volverse filtrable (evolución de C dentro de A, no un control aparte).
+- **Endpoint:** `POST /listar` (poblar el dropdown y calcular anterior/siguiente) + `POST /jornada { instancia_id }` (recargar al cambiar).
 - **Prioridad:** **ALTA**
 
 ---
