@@ -18,6 +18,9 @@ fn broker_url_defecto() -> String {
 /// Refresco por defecto: 1s. Suficiente para una red de pocos peers sin martillar el broker.
 const REFRESH_MS_DEFECTO: u64 = 1000;
 
+/// Cuántos directorios recientes se recuerdan como máximo (R1.2 de la RFC Lanzador).
+pub const MAX_RECIENTES: usize = 8;
+
 /// Config persistida. `token` es opcional: si el broker corre sin token, se omite del archivo.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -30,10 +33,78 @@ pub struct Config {
     /// Periodo de refresco de las pantallas vivas, en milisegundos.
     #[serde(default = "refresh_ms_defecto")]
     pub refresh_ms: u64,
+    /// Estado persistido de la pantalla Lanzador (RFC Lanzador Fase 1). `#[serde(default)]`
+    /// garantiza que un `config.toml` viejo SIN esta sección deserialice sin error (AC10).
+    #[serde(default)]
+    pub lanzador: ConfigLanzador,
 }
 
 fn refresh_ms_defecto() -> u64 {
     REFRESH_MS_DEFECTO
+}
+
+/// Estado persistido del Lanzador: directorios recientes (R1.2) y plantillas de system prompt
+/// (R2.1). Se guarda en la sub-tabla `[lanzador]` del mismo `config.toml`. Ambas listas se
+/// serializan sólo si NO están vacías, para no ensuciar el archivo de quien no use el Lanzador.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ConfigLanzador {
+    /// Últimos directorios elegidos en el file picker (R1.2), del más reciente al más antiguo.
+    /// Acotado a `MAX_RECIENTES` al registrar. Rutas absolutas tal cual las devuelve el picker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recientes: Vec<String>,
+    /// Plantillas de system prompt nombradas (R2.1): pares (nombre, texto) reutilizables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plantillas: Vec<PlantillaPrompt>,
+}
+
+/// Una plantilla de system prompt nombrada (R2.1): el usuario la elige de un desplegable y la
+/// edita antes de lanzar. `nombre` es la clave visible; `texto` el cuerpo del `--append-system-prompt`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlantillaPrompt {
+    /// Nombre visible de la plantilla (p.ej. "peer backend Rust").
+    pub nombre: String,
+    /// Cuerpo del system prompt que se inyectará como `--append-system-prompt "<texto>"`.
+    pub texto: String,
+}
+
+impl ConfigLanzador {
+    /// Registra `dir` como el directorio más reciente: lo mueve al frente (o lo inserta),
+    /// deduplica y acota la lista a `MAX_RECIENTES`. No persiste por sí sola — el caller guarda
+    /// la `Config` completa. Devuelve `true` si la lista cambió (para evitar escrituras inútiles).
+    pub fn registrar_reciente(&mut self, dir: impl Into<String>) -> bool {
+        let dir = dir.into();
+        if dir.trim().is_empty() {
+            return false;
+        }
+        // Si ya estaba justo al frente, no hay cambio que persistir.
+        if self.recientes.first().is_some_and(|r| r == &dir) {
+            return false;
+        }
+        self.recientes.retain(|r| r != &dir);
+        self.recientes.insert(0, dir);
+        self.recientes.truncate(MAX_RECIENTES);
+        true
+    }
+
+    /// Guarda o actualiza una plantilla por nombre (R2.1): si ya existe una con ese `nombre`,
+    /// reemplaza su texto; si no, la añade. Nombre vacío se ignora (devuelve `false`).
+    pub fn guardar_plantilla(
+        &mut self,
+        nombre: impl Into<String>,
+        texto: impl Into<String>,
+    ) -> bool {
+        let nombre = nombre.into();
+        if nombre.trim().is_empty() {
+            return false;
+        }
+        let texto = texto.into();
+        if let Some(p) = self.plantillas.iter_mut().find(|p| p.nombre == nombre) {
+            p.texto = texto;
+        } else {
+            self.plantillas.push(PlantillaPrompt { nombre, texto });
+        }
+        true
+    }
 }
 
 impl Default for Config {
@@ -42,6 +113,7 @@ impl Default for Config {
             broker_url: broker_url_defecto(),
             token: None,
             refresh_ms: REFRESH_MS_DEFECTO,
+            lanzador: ConfigLanzador::default(),
         }
     }
 }
@@ -171,6 +243,7 @@ mod tests {
             broker_url: "http://127.0.0.1:7899".to_string(),
             token: Some("lexus-secreto-2026".to_string()),
             refresh_ms: 750,
+            ..Default::default()
         };
         let ruta = std::env::temp_dir().join("peers-desktop-test-roundtrip.toml");
         cfg.guardar_en(&ruta).unwrap();
@@ -188,5 +261,70 @@ mod tests {
     fn enmascarar_token_none_y_vacio() {
         assert_eq!(enmascarar_token(None), "(sin token)");
         assert_eq!(enmascarar_token(Some("")), "(sin token)");
+    }
+
+    // --- RFC Lanzador Fase 1: config `[lanzador]` (R1.2 recientes, R2.1 plantillas, AC10 compat) ---
+
+    #[test]
+    fn config_vieja_sin_lanzador_deserializa(/* AC10 */) {
+        // Un config.toml previo a la RFC Lanzador NO tiene la tabla [lanzador]: debe cargar con
+        // la sección al default (recientes y plantillas vacías), sin error de deserialización.
+        let cfg =
+            Config::desde_toml("broker_url = \"http://127.0.0.1:7899\"\nrefresh_ms = 500").unwrap();
+        assert_eq!(cfg.refresh_ms, 500);
+        assert!(cfg.lanzador.recientes.is_empty());
+        assert!(cfg.lanzador.plantillas.is_empty());
+    }
+
+    #[test]
+    fn recientes_mueve_al_frente_dedup_y_acota() {
+        let mut l = ConfigLanzador::default();
+        // Insertar hasta pasar el límite: sólo se conservan los MAX_RECIENTES más nuevos.
+        for i in 0..(MAX_RECIENTES + 3) {
+            assert!(l.registrar_reciente(format!("/dir/{i}")));
+        }
+        assert_eq!(l.recientes.len(), MAX_RECIENTES);
+        // El último insertado queda al frente.
+        assert_eq!(l.recientes[0], format!("/dir/{}", MAX_RECIENTES + 2));
+        // Reelegir uno ya presente lo sube al frente sin duplicar ni crecer.
+        let objetivo = l.recientes[3].clone();
+        assert!(l.registrar_reciente(objetivo.clone()));
+        assert_eq!(l.recientes[0], objetivo);
+        assert_eq!(l.recientes.len(), MAX_RECIENTES);
+        assert_eq!(l.recientes.iter().filter(|r| **r == objetivo).count(), 1);
+        // Registrar el mismo que ya está al frente no cambia nada (no fuerza escritura).
+        assert!(!l.registrar_reciente(objetivo));
+        // Cadena vacía se ignora.
+        assert!(!l.registrar_reciente("   "));
+    }
+
+    #[test]
+    fn plantillas_guardar_y_actualizar_por_nombre() {
+        let mut l = ConfigLanzador::default();
+        assert!(l.guardar_plantilla("backend", "eres peer Rust"));
+        assert!(l.guardar_plantilla("frontend", "eres peer UI"));
+        assert_eq!(l.plantillas.len(), 2);
+        // Mismo nombre → actualiza el texto, no duplica.
+        assert!(l.guardar_plantilla("backend", "eres peer Rust senior"));
+        assert_eq!(l.plantillas.len(), 2);
+        let p = l.plantillas.iter().find(|p| p.nombre == "backend").unwrap();
+        assert_eq!(p.texto, "eres peer Rust senior");
+        // Nombre vacío se ignora.
+        assert!(!l.guardar_plantilla("  ", "x"));
+        assert_eq!(l.plantillas.len(), 2);
+    }
+
+    #[test]
+    fn roundtrip_config_con_lanzador() {
+        let mut cfg = Config::default();
+        cfg.lanzador.registrar_reciente("/Users/max/proyecto");
+        cfg.lanzador.guardar_plantilla("peer backend", "eres un peer");
+        let ruta = std::env::temp_dir().join("peers-desktop-test-lanzador.toml");
+        cfg.guardar_en(&ruta).unwrap();
+        let leido = Config::cargar_desde(&ruta).unwrap();
+        assert_eq!(cfg, leido);
+        assert_eq!(leido.lanzador.recientes, vec!["/Users/max/proyecto".to_string()]);
+        assert_eq!(leido.lanzador.plantillas.len(), 1);
+        let _ = std::fs::remove_file(&ruta);
     }
 }

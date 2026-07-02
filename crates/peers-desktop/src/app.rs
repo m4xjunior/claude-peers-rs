@@ -22,6 +22,7 @@ use crate::cliente::ClienteBroker;
 use crate::tema;
 use crate::vista;
 use crate::vista::config::PanelConfig;
+use crate::vista::lanzador::PanelLanzador;
 
 /// Las 9 pantallas de la app, espejo 1:1 de las pantallas de la TUI. `Copy` porque es un
 /// discriminante trivial que se compara y se guarda en el estado sin coste.
@@ -36,12 +37,14 @@ pub enum Pantalla {
     Tareas,
     Trazabilidad,
     Acceso,
+    /// 10ª pestaña — RFC Lanzador Fase 1 (Zona A: configuración de sesión + preview del comando).
+    Lanzador,
 }
 
 impl Pantalla {
     /// Orden de aparición en el sidebar. Fuente única para pintar la navegación y para
     /// no repetir la lista en varios sitios (añadir/quitar pantalla = tocar sólo aquí).
-    pub const TODAS: [Pantalla; 9] = [
+    pub const TODAS: [Pantalla; 10] = [
         Pantalla::Peers,
         Pantalla::Alertas,
         Pantalla::Broker,
@@ -51,6 +54,7 @@ impl Pantalla {
         Pantalla::Tareas,
         Pantalla::Trazabilidad,
         Pantalla::Acceso,
+        Pantalla::Lanzador,
     ];
 
     /// Etiqueta visible en el sidebar y en el título del contenido.
@@ -65,6 +69,7 @@ impl Pantalla {
             Pantalla::Tareas => "Tareas",
             Pantalla::Trazabilidad => "Trazabilidad",
             Pantalla::Acceso => "Acceso",
+            Pantalla::Lanzador => "Lanzador",
         }
     }
 
@@ -83,6 +88,7 @@ impl Pantalla {
             Pantalla::Tareas => "nav-tareas",
             Pantalla::Trazabilidad => "nav-trazabilidad",
             Pantalla::Acceso => "nav-acceso",
+            Pantalla::Lanzador => "nav-lanzador",
         }
     }
 }
@@ -294,6 +300,13 @@ pub struct EstadoPantalla {
     /// pura; la app la construye al arrancar. `None` sólo si la construcción no llegó a hacerse:
     /// la vista pinta "Config no inicializada" en ese caso (nunca `.unwrap()`).
     pub panel_config: Option<Entity<PanelConfig>>,
+
+    // --- Pantalla Lanzador (RFC Lanzador Fase 1) ---
+    /// Panel del Lanzador con estado propio (Inputs del kit para el system prompt, host SSH,
+    /// nombre tmux; destino, tareas, flags). Igual que `panel_config`, es una `Entity` porque los
+    /// `Input` del kit exigen estado; la app la construye al arrancar. `None` sólo si no se llegó
+    /// a construir: la vista pinta "Lanzador no inicializado" (nunca `.unwrap()`).
+    pub panel_lanzador: Option<Entity<PanelLanzador>>,
 }
 
 /// Estado raíz de la app: cliente del broker, pantalla activa y datos cacheados.
@@ -323,6 +336,9 @@ impl AppDesktop {
         // El panel de Acceso también es stateful (Inputs editables de url/token): se construye AQUÍ,
         // sembrado con la config del disco, para que la pantalla Acceso delegue en él la edición.
         let panel_acceso = Some(crate::vista::acceso::nuevo_panel(window, cx));
+        // El panel del Lanzador es stateful (Input multilínea del system prompt + inputs de host/
+        // tmux/tarea): se construye AQUÍ, sembrado con la config del disco (recientes + plantillas).
+        let panel_lanzador = Some(crate::vista::lanzador::nuevo_panel(window, cx));
         // La URL base y el token enmascarado son config fija del cliente: se copian una vez al
         // estado para que la pantalla Acceso (que sólo recibe `&EstadoPantalla`) pueda pintarlos
         // sin acceso al cliente. Nunca se guarda el token en claro, sólo su versión enmascarada.
@@ -339,6 +355,7 @@ impl AppDesktop {
             acceso_sin_token: cliente.sin_token(),
             panel_config,
             panel_acceso,
+            panel_lanzador,
             inputs_tareas,
             input_mensaje_peer,
             ..EstadoPantalla::default()
@@ -396,7 +413,8 @@ impl AppDesktop {
             Pantalla::Tareas => self.cargar_tareas(cx),
             Pantalla::Trazabilidad => self.cargar_trazabilidad(cx),
             Pantalla::Jornada => self.cargar_jornada(cx),
-            Pantalla::Config => {}
+            // Config y Lanzador editan estado local (no consultan el broker en Fase 1).
+            Pantalla::Config | Pantalla::Lanzador => {}
         }
     }
 
@@ -2324,7 +2342,7 @@ impl AppDesktop {
                         mover(self.datos.jornada_ses_sel, delta, j.sesiones.len());
                 }
             }
-            Pantalla::Broker | Pantalla::Config | Pantalla::Acceso => {}
+            Pantalla::Broker | Pantalla::Config | Pantalla::Acceso | Pantalla::Lanzador => {}
         }
         cx.notify();
     }
@@ -2516,10 +2534,11 @@ impl AppDesktop {
         }
         let tecla = ks.key.as_str();
         match tecla {
-            // Números 1..9 → pantalla por posición en el sidebar.
-            d @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+            // Números 1..9 → pantallas 1ª..9ª; `0` → 10ª (Lanzador), espejo del número del sidebar.
+            d @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "0") => {
                 if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10)) {
-                    let idx = (n as usize).saturating_sub(1);
+                    // `0` mapea a la 10ª posición (índice 9); 1..9 a los índices 0..8.
+                    let idx = if n == 0 { 9 } else { (n as usize) - 1 };
                     if let Some(p) = Pantalla::TODAS.get(idx) {
                         self.ir_a(*p, cx);
                     }
@@ -2616,13 +2635,19 @@ impl AppDesktop {
     /// Click → navega (`cx.listener` para poder mutar `self`).
     fn item_nav(&self, pantalla: Pantalla, indice: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let activa = self.activa == pantalla;
-        // Número de atajo (1-based) alineado a la izquierda, en mono/humo (o brasa si activa).
+        // Número de atajo alineado a la izquierda, en mono/humo (o brasa si activa). Las 9 primeras
+        // van 1..9; la 10ª muestra "0" (su atajo de teclado es la tecla 0, no "10" de dos dígitos).
+        let etiqueta_atajo = if indice == 9 {
+            "0".to_string()
+        } else {
+            (indice + 1).to_string()
+        };
         let numero = div()
             .w(gpui::px(18.0))
             .font_family(tema::FUENTE_MONO)
             .text_xs()
             .text_color(if activa { tema::BRASA } else { tema::HUMO })
-            .child(SharedString::from((indice + 1).to_string()));
+            .child(SharedString::from(etiqueta_atajo));
 
         let etiqueta = div()
             .flex_1()
@@ -2672,6 +2697,7 @@ impl AppDesktop {
             Pantalla::Tareas => vista::render_tareas(&self.datos).into_any_element(),
             Pantalla::Trazabilidad => vista::render_trazabilidad(&self.datos).into_any_element(),
             Pantalla::Acceso => vista::render_acceso(&self.datos).into_any_element(),
+            Pantalla::Lanzador => vista::render_lanzador(&self.datos).into_any_element(),
         }
     }
 
