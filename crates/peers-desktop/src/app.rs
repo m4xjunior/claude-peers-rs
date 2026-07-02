@@ -2513,10 +2513,33 @@ impl AppDesktop {
         if m.platform || m.control || m.alt || m.function {
             return;
         }
-        // Con un FORMULARIO abierto (CRUD de tareas o composer/kick de peers), las letras
-        // pertenecen a los Inputs (el jefe está escribiendo texto): sólo se intercepta Escape
-        // (cerrar). Sin este guard, teclear una descripción con 'b'/'x'/'a'/'m'/'k' dispararía
-        // acciones de pantalla debajo del modal.
+        // GUARD GENÉRICO DE ESCRITURA (fix del bug de teclado, QA s005): si el foco lo tiene
+        // CUALQUIER otro elemento — un Input del kit en Config/Acceso/Tareas/Peers o cualquier
+        // pantalla futura — el usuario está ESCRIBIENDO: ninguna tecla es atajo de navegación
+        // (teclear "7899" en BROKER_URL saltaba de pantalla con el guard viejo, que era una
+        // lista hardcodeada de formularios). EL FOCO DECIDE, no una lista. Única excepción:
+        // Escape, el "volver atrás" contextual — cierra el formulario/modal abierto aunque el
+        // Input retenga el foco, y DEVUELVE el foco a la raíz para que la navegación siga viva
+        // (si no, cerrar un modal con el Input enfocado dejaba el teclado muerto hasta un clic).
+        let otro_con_foco =
+            window.focused(cx).is_some() && !self.foco.is_focused(window);
+        if otro_con_foco {
+            if ks.key.as_str() == "escape" {
+                if self.datos.tareas_form.is_some() {
+                    self.cerrar_form_tareas(cx);
+                } else if self.datos.peers_form.is_some() {
+                    self.cerrar_form_peers(cx);
+                } else {
+                    self.manejar_escape(cx);
+                }
+                window.focus(&self.foco, cx);
+            }
+            return;
+        }
+        // Con un FORMULARIO abierto (CRUD de tareas o composer/kick de peers) pero el foco aún
+        // en la raíz (todavía no se clicó ningún Input), las letras pertenecen al formulario:
+        // sólo se intercepta Escape (cerrar). Sin este guard, teclear 'b'/'x'/'a'/'m'/'k' con
+        // el modal abierto dispararía acciones de pantalla debajo del modal.
         if self.datos.tareas_form.is_some() {
             if ks.key.as_str() == "escape" {
                 self.cerrar_form_tareas(cx);
