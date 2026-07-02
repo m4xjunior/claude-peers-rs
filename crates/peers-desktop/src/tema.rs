@@ -94,6 +94,45 @@ pub const LINEA: Rgba = Rgba {
 };
 
 // -------------------------------------------------------------------------------------------------
+// 1b) TEMA GLOBAL DEL KIT (gpui-component) — los componentes del kit (Input, Select, Dialog,
+//     Notification…) NO leen estos tokens: pintan su propio fondo/texto/borde desde `cx.theme()`,
+//     el Theme GLOBAL de gpui-component, que `gpui_component::init` deja en modo CLARO. Por eso
+//     los inputs salían con fondo blanco y texto dorado (ilegibles) aunque el wrapper pintara
+//     TINTA debajo: el Input pinta SU fondo encima y gana. Envolver en más divs no arregla nada;
+//     la corrección es registrar la paleta Ethos EN el tema del kit, una sola vez, al arrancar.
+// -------------------------------------------------------------------------------------------------
+
+/// Registra la paleta Ethos como tema global de gpui-component. Llamar en `main`, justo después
+/// de `gpui_component::init(cx)` y ANTES de abrir la ventana.
+///
+/// Se parte del modo Dark del kit (así los derivados como `input_background()` toman la rama
+/// oscura) y se pisan SOLO los tokens con equivalente Ethos; el resto (danger, success, charts…)
+/// se queda con el dark default del kit, que ya es legible sobre fondo oscuro. Nada en la app
+/// vuelve a llamar `Theme::change`/`sync_system_appearance`, así que estos valores persisten.
+pub fn aplicar_tema_kit(cx: &mut gpui::App) {
+    use gpui_component::{Theme, ThemeMode};
+
+    Theme::change(ThemeMode::Dark, None, cx);
+    let tema = Theme::global_mut(cx);
+    tema.background = TINTA.into();
+    tema.foreground = PAPEL.into();
+    tema.border = LINEA.into();
+    // `input` es el borde de los campos; su fondo lo deriva el kit mezclándolo hacia
+    // transparente (rama dark de `input_background`), que sobre TINTA queda un gris cálido.
+    tema.input = LINEA.into();
+    tema.ring = BRASA.into(); // anillo de foco
+    tema.caret = BRASA.into();
+    tema.muted = TINTA2.into();
+    tema.muted_foreground = HUMO.into(); // placeholders y texto atenuado del kit
+    tema.primary = BRASA.into();
+    tema.primary_foreground = SALMO.into();
+    tema.popover = TINTA2.into(); // menús de Select, tooltips
+    tema.popover_foreground = PAPEL.into();
+    tema.accent = BRASA_TENUE.into(); // hover/selección de listas del kit
+    tema.accent_foreground = PAPEL.into();
+}
+
+// -------------------------------------------------------------------------------------------------
 // 2) TOKENS DE FORMA — radios y familias tipográficas del Ethos, como constantes para no dispersar
 //    números mágicos. Los radios se usan vía `.rounded(px(RADIO_*))`.
 // -------------------------------------------------------------------------------------------------

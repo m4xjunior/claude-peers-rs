@@ -25,6 +25,11 @@ fn main() {
         // OBLIGATORIO antes de usar cualquier feature de gpui-component (tema, componentes…).
         gpui_component::init(cx);
 
+        // El init del kit deja su Theme global en modo CLARO → los Input/Select del kit pintaban
+        // fondo blanco sobre el Ethos oscuro (texto dorado sobre blanco, ilegible). Se registra la
+        // paleta Ethos como tema del kit ANTES de abrir la ventana; ver tema::aplicar_tema_kit.
+        tema::aplicar_tema_kit(cx);
+
         // Las opciones de ventana se calculan AQUÍ, con `cx: &mut App`, porque
         // `WindowBounds::centered` exige `&App` (no está disponible el `AsyncApp` del spawn).
         // Este es el patrón canónico de los ejemplos del kit (examples/input).
