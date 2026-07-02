@@ -18,3 +18,10 @@ con el mismo id, y el registro las colapsa a un id genérico. Confirma el diagn�
 (tar-79): la derivación del id por cwd + el TOCTOU del registro producen colisión cross-máquina.
 Refuerza la prioridad del fix: id estable NO derivado solo del cwd (o cwd+hostname), registro
 atómico, y detección de colisión que sufije en vez de colapsar.
+
+### RESUELTO 2026-07-02 (commit 1f4187f)
+El bug de colisión de ids está ARREGLADO: (1) lock atómico en el registro del broker
+(registro_lock) elimina el TOCTOU → varias instancias mismo dir se sufijan -2/-3; (2) fallback
+del cliente pasó de "instancia" (colapsaba en masa) a "peer" (el broker lo sufija). Test
+dos_instancias_mismo_dir_coexisten_con_sufijo. Broker recargado en vivo. Comportamiento pedido
+por Max logrado: varias instancias por directorio, filtrables por nombre (ejemplo, ejemplo-2…).
