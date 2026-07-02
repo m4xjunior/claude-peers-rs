@@ -954,12 +954,13 @@ impl AppDesktop {
         self.cargar_broker(cx);
     }
 
-    /// "Probar conexión" (acceso-05): check DEDICADO y ligero, SIN recargar el resto de la pantalla.
+    /// "Probar conexión" (acceso-05 y config-01): check DEDICADO y ligero, SIN recargar el resto.
     /// Dos pasos independientes para separar "broker vivo" de "token válido":
     ///   ① `GET /salud`  (ruta EXENTA de token) → ¿alcanzable y vivo?
     ///   ② `POST /listar` (ruta PROTEGIDA)       → ¿el token autentica? (401 = rechazado)
-    /// El resultado se inyecta en el `PanelAcceso` con `set_resultado_prueba`. Nunca `.unwrap()`.
-    fn probar_conexion(&mut self, cx: &mut Context<Self>) {
+    /// El resultado se inyecta en el panel que lo pidió (`hacia_config` decide: PanelConfig o
+    /// PanelAcceso) con `set_resultado_prueba` — MISMO check, dos consumidores. Nunca `.unwrap()`.
+    fn probar_conexion(&mut self, hacia_config: bool, cx: &mut Context<Self>) {
         use crate::vista::acceso::ResultadoPrueba;
         let cliente = self.cliente.clone();
         // El check corre en el executor de fondo (reqwest necesita su runtime tokio, no el de GPUI).
@@ -1001,7 +1002,12 @@ impl AppDesktop {
                     resumen,
                     en_curso: false,
                 };
-                if let Some(panel) = &esta.datos.panel_acceso {
+                // El resultado vuelve al panel que pidió la prueba (config-01 vs acceso-05).
+                if hacia_config {
+                    if let Some(panel) = &esta.datos.panel_config {
+                        panel.update(cx, |p, cx| p.set_resultado_prueba(resultado, cx));
+                    }
+                } else if let Some(panel) = &esta.datos.panel_acceso {
                     panel.update(cx, |p, cx| p.set_resultado_prueba(resultado, cx));
                 }
                 cx.notify();
@@ -3359,7 +3365,11 @@ impl Render for AppDesktop {
             }))
             // acceso-05: check dedicado de conexión (salud + token) sin recargar todo.
             .on_action(cx.listener(|esta, _a: &ProbarConexion, _window, cx| {
-                esta.probar_conexion(cx);
+                esta.probar_conexion(false, cx);
+            }))
+            // config-01: el MISMO check, pedido desde la pestaña Config (resultado a su panel).
+            .on_action(cx.listener(|esta, _a: &crate::vista::config::ProbarConexionConfig, _window, cx| {
+                esta.probar_conexion(true, cx);
             }))
             // --- Config (recargar desde disco; delega en el panel stateful) ---
             .on_action(cx.listener(|esta, _a: &RecargarConfig, window, cx| {

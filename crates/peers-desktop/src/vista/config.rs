@@ -35,9 +35,11 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     StyledExt,
 };
+
+use crate::vista::acceso::ResultadoPrueba;
 
 use crate::app::EstadoPantalla;
 use crate::config::Config;
@@ -55,6 +57,12 @@ use crate::tema;
 // -------------------------------------------------------------------------------------------------
 
 gpui::actions!(config, [RecargarConfig]);
+
+// config-01: "Probar conexión" desde la pestaña Config. El panel no tiene el `ClienteBroker`
+// (vive en `AppDesktop`), así que DESPACHA esta acción; la app ejecuta el MISMO check en dos
+// pasos de la pestaña Acceso (`/salud` exento de token + `/listar` protegido) y le inyecta el
+// `ResultadoPrueba` de vuelta con `set_resultado_prueba`. Reuso directo del flujo ya aprobado.
+gpui::actions!(config, [ProbarConexionConfig]);
 
 /// Color de feedback OK — verde salvia apagado, coherente con la paleta cálida (no el 0x22c55e
 /// genérico previo). Sólo se usa para la línea de estado tras un guardado correcto.
@@ -96,6 +104,12 @@ pub struct PanelConfig {
     entrada_refresh: Entity<InputState>,
     /// Feedback del último guardado.
     ultimo_guardado: EstadoGuardado,
+    /// Resultado del último "Probar conexión" (config-01/08). Lo inyecta `AppDesktop` — mismo
+    /// struct y mismo check en dos pasos que la pestaña Acceso (reuso, no duplicación).
+    prueba: ResultadoPrueba,
+    /// `true` mientras el botón "Restablecer" espera confirmación (config-02, 2 pasos inline:
+    /// restablecer descarta las ediciones no guardadas, no debe ser un mis-click).
+    confirmar_reset: bool,
 }
 
 impl PanelConfig {
@@ -125,18 +139,60 @@ impl PanelConfig {
                 .default_value(cfg.refresh_ms.to_string())
         });
 
+        // config-04: la validación de `broker_url` es EN VIVO — cada edición del Input notifica
+        // al panel para repintar el borde/nota del campo sin esperar al ciclo de refresco global.
+        cx.subscribe(&entrada_broker_url, |_esta, _input, _ev: &InputEvent, cx| {
+            cx.notify();
+        })
+        .detach();
+
         Self {
             entrada_broker_url,
             entrada_token,
             entrada_refresh,
             ultimo_guardado: EstadoGuardado::Inicial,
+            prueba: ResultadoPrueba::default(),
+            confirmar_reset: false,
         }
     }
 
-    /// Relee la config del disco y re-siembra los tres Inputs. Punto de entrada para la Action
-    /// `RecargarConfig` si la Fase 3 la cablea desde un menú global. Descarta ediciones no
-    /// guardadas (intencional: "recargar" significa volver a lo persistido).
-    #[allow(dead_code)] // Consumido por Fase 3 al cablear RecargarConfig; hoy queda declarado.
+    /// `AppDesktop` inyecta aquí el resultado de "Probar conexión" (config-01/08). Mismo contrato
+    /// que `PanelAcceso::set_resultado_prueba`.
+    pub fn set_resultado_prueba(&mut self, resultado: ResultadoPrueba, cx: &mut Context<Self>) {
+        self.prueba = resultado;
+        cx.notify();
+    }
+
+    /// Marca la prueba como EN CURSO ("Probando…") mientras el check corre en segundo plano.
+    pub fn marcar_prueba_en_curso(&mut self, cx: &mut Context<Self>) {
+        self.prueba = ResultadoPrueba {
+            en_curso: true,
+            resumen: "Probando…".to_string(),
+            ..ResultadoPrueba::default()
+        };
+        cx.notify();
+    }
+
+    /// Re-siembra los tres Inputs con `Config::default()` SIN guardar (config-02): el usuario
+    /// confirma persistiendo con "Guardar". Se llega aquí tras la confirmación en 2 pasos.
+    fn restablecer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cfg = Config::default();
+        self.entrada_broker_url
+            .update(cx, |s, cx| s.set_value(cfg.broker_url.clone(), window, cx));
+        self.entrada_token
+            .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        self.entrada_refresh
+            .update(cx, |s, cx| s.set_value(cfg.refresh_ms.to_string(), window, cx));
+        self.confirmar_reset = false;
+        self.ultimo_guardado = EstadoGuardado::Ok(
+            "Valores por defecto cargados — pulsa «Guardar» para persistirlos".to_string(),
+        );
+        cx.notify();
+    }
+
+    /// Relee la config del disco y re-siembra los tres Inputs (config-03). Descarta ediciones no
+    /// guardadas (intencional: "recargar" significa volver a lo persistido). Lo disparan el botón
+    /// "Recargar del disco" del panel y la Action global `RecargarConfig`.
     pub fn recargar(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let cfg = Config::cargar().unwrap_or_default();
         self.entrada_broker_url.update(cx, |s, cx| {
@@ -148,8 +204,34 @@ impl PanelConfig {
         self.entrada_refresh.update(cx, |s, cx| {
             s.set_value(cfg.refresh_ms.to_string(), _window, cx)
         });
-        self.ultimo_guardado = EstadoGuardado::Inicial;
+        self.ultimo_guardado = EstadoGuardado::Ok(format!(
+            "Config releída de {}",
+            Config::ruta().display()
+        ));
         cx.notify();
+    }
+
+    /// Valida `broker_url` en frontera (config-04): devuelve `Some(motivo)` si es inválida, o
+    /// `None` si está bien. Reglas: no vacía, con esquema `http://`/`https://`, host presente y
+    /// SIN barra final (el cliente concatena rutas con `{base}{ruta}`).
+    fn validar_url(url: &str) -> Option<String> {
+        let url = url.trim();
+        if url.is_empty() {
+            return Some("la URL no puede estar vacía".to_string());
+        }
+        let resto = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"));
+        let Some(resto) = resto else {
+            return Some("falta el esquema http:// o https://".to_string());
+        };
+        if resto.is_empty() {
+            return Some("falta el host (p.ej. 127.0.0.1:7899)".to_string());
+        }
+        if url.ends_with('/') {
+            return Some("sin barra final (el cliente concatena rutas)".to_string());
+        }
+        None
     }
 
     /// Lee los tres Inputs, valida y persiste el TOML. Equivale a la tecla 's' de la TUI.
@@ -159,10 +241,10 @@ impl PanelConfig {
         let token_bruto = self.entrada_token.read(cx).value().trim().to_string();
         let refresh_bruto = self.entrada_refresh.read(cx).value().trim().to_string();
 
-        // Validación de frontera (parse, don't validate): broker_url no puede ir vacío.
-        if broker_url.is_empty() {
-            self.ultimo_guardado =
-                EstadoGuardado::Error("broker_url no puede estar vacío".to_string());
+        // Validación de frontera (parse, don't validate): misma regla que la validación EN VIVO
+        // del campo (config-04) — vacía / sin esquema / sin host / con barra final no se persiste.
+        if let Some(motivo) = Self::validar_url(&broker_url) {
+            self.ultimo_guardado = EstadoGuardado::Error(format!("broker_url inválida: {motivo}"));
             cx.notify();
             return;
         }
@@ -236,18 +318,107 @@ impl Render for PanelConfig {
                 .child(SharedString::from(format!("⚠ {msg}"))),
         };
 
+        // config-04: validación EN VIVO de broker_url — borde terracota + motivo bajo el campo si
+        // es inválida; ayuda estática si está bien. El subscribe del constructor repinta al teclear.
+        let url_actual = self.entrada_broker_url.read(cx).value().to_string();
+        let url_invalida = Self::validar_url(&url_actual);
+        let (nota_url, url_ok) = match &url_invalida {
+            Some(motivo) => (format!("⚠ {motivo}"), false),
+            None => ("URL base del broker (sin barra final).".to_string(), true),
+        };
+
+        // Barra de acciones: Guardar (primario) · Probar conexión (config-01) · Recargar del
+        // disco (config-03) · Restablecer con confirmación en 2 pasos (config-02).
+        let botonera: gpui::AnyElement = if self.confirmar_reset {
+            div()
+                .v_flex()
+                .gap_2()
+                .child(tema::texto_terciario(
+                    "¿Restablecer los valores por defecto? Se descartan las ediciones no \
+                     guardadas (no se persiste hasta pulsar «Guardar»).",
+                ))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_3()
+                        .child(
+                            tema::boton_secundario("config-reset-cancelar", "Cancelar").on_click(
+                                cx.listener(|esta, _e, _window, cx| {
+                                    esta.confirmar_reset = false;
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            tema::boton_primario("config-reset-si", "Sí, restablecer").on_click(
+                                cx.listener(|esta, _e, window, cx| {
+                                    esta.restablecer(window, cx);
+                                }),
+                            ),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .h_flex()
+                .flex_wrap()
+                .gap_3()
+                .child(
+                    tema::boton_primario("config-guardar", "Guardar").on_click(cx.listener(
+                        |esta, _evento, window, cx| {
+                            esta.guardar(window, cx);
+                        },
+                    )),
+                )
+                .child(
+                    tema::boton_secundario("config-probar", "Probar conexión").on_click(
+                        cx.listener(|esta, _e, window, cx| {
+                            // Feedback inmediato + despacho: `AppDesktop` ejecuta el check (tiene
+                            // el cliente) y devuelve el resultado con `set_resultado_prueba`.
+                            esta.marcar_prueba_en_curso(cx);
+                            window.dispatch_action(Box::new(ProbarConexionConfig), cx);
+                        }),
+                    ),
+                )
+                .child(
+                    tema::boton_secundario("config-recargar", "Recargar del disco").on_click(
+                        cx.listener(|esta, _e, window, cx| {
+                            esta.recargar(window, cx);
+                        }),
+                    ),
+                )
+                .child(
+                    tema::boton_secundario("config-restablecer", "Restablecer").on_click(
+                        cx.listener(|esta, _e, _window, cx| {
+                            esta.confirmar_reset = true;
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .into_any_element()
+        };
+
         // Card contenedora del formulario: superficie elevada Ethos con padding generoso.
-        let tarjeta = tema::superficie_card()
+        let mut tarjeta = tema::superficie_card()
             .v_flex()
             .w_full()
             .gap_5()
             .p_6()
-            // Los tres campos configurables, ya con eyebrow + ayuda terciaria.
-            .child(Self::campo(
-                "broker_url",
-                "URL base del broker (sin barra final).",
-                self.input_tematizado(&self.entrada_broker_url, false),
-            ))
+            // Campo broker_url con validación en vivo (config-04): la nota de ayuda se vuelve el
+            // motivo del error y el marco se tiñe terracota si la URL no es válida.
+            .child(
+                div()
+                    .v_flex()
+                    .gap_2()
+                    .child(tema::eyebrow("broker_url"))
+                    .child(self.input_tematizado_validado(&self.entrada_broker_url, url_ok))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if url_ok { tema::HUMO } else { ROJO_ERROR })
+                            .child(SharedString::from(nota_url)),
+                    ),
+            )
             .child(Self::campo(
                 "token",
                 "Token X-Peers-Token. Vacío = broker sin token.",
@@ -258,20 +429,33 @@ impl Render for PanelConfig {
                 "Periodo de refresco de las pantallas, en milisegundos (entero > 0).",
                 self.input_tematizado(&self.entrada_refresh, false),
             ))
-            // Acción de guardado (botón Ethos dorado) + feedback semántico cálido.
-            .child(
+            // Botonera + feedback semántico cálido.
+            .child(div().v_flex().gap_3().pt_2().child(botonera).child(feedback));
+
+        // Resultado del último "Probar conexión" (config-01) + estado del token (config-08):
+        // chips de salud y de auth derivados del check en dos pasos (mismo contrato que Acceso).
+        if self.prueba.en_curso || self.prueba.salud_ok.is_some() || !self.prueba.resumen.is_empty()
+        {
+            let chip_salud = match self.prueba.salud_ok {
+                Some(true) => tema::chip_estado("broker vivo", VERDE_OK),
+                Some(false) => tema::chip_estado("broker caído", ROJO_ERROR),
+                None => tema::chip_estado("salud —", tema::HUMO),
+            };
+            let chip_token = match self.prueba.token_ok {
+                Some(true) => tema::chip_estado("token válido", VERDE_OK),
+                Some(false) => tema::chip_estado("token rechazado (401)", ROJO_ERROR),
+                None => tema::chip_estado("auth sin probar", tema::HUMO),
+            };
+            tarjeta = tarjeta.child(
                 div()
                     .v_flex()
-                    .gap_3()
+                    .gap_2()
                     .pt_2()
-                    .child(
-                        tema::boton_primario("config-guardar", "Guardar")
-                            .on_click(cx.listener(|esta, _evento, window, cx| {
-                                esta.guardar(window, cx);
-                            })),
-                    )
-                    .child(feedback),
+                    .child(tema::eyebrow("resultado de la prueba"))
+                    .child(div().h_flex().gap_2().child(chip_salud).child(chip_token))
+                    .child(tema::texto_terciario(self.prueba.resumen.clone())),
             );
+        }
 
         // Raíz de la pantalla: fondo app Ethos + cabecera (eyebrow + título + subtítulo) + card.
         tema::fondo_app()
@@ -326,6 +510,24 @@ impl PanelConfig {
             .border_1()
             .border_color(tema::LINEA)
             .child(input)
+    }
+
+    /// Como `input_tematizado`, pero el borde refleja la VALIDACIÓN en vivo (config-04):
+    /// LINEA si es válido, terracota si no. Solo lo usa el campo `broker_url`.
+    fn input_tematizado_validado(
+        &self,
+        estado: &Entity<InputState>,
+        valido: bool,
+    ) -> impl IntoElement {
+        div()
+            .w_full()
+            .px_3()
+            .py_1()
+            .rounded(tema::radio(tema::RADIO_CONTROL))
+            .bg(tema::TINTA)
+            .border_1()
+            .border_color(if valido { tema::LINEA } else { ROJO_ERROR })
+            .child(Input::new(estado).cleanable(true))
     }
 }
 

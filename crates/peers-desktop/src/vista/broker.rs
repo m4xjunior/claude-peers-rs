@@ -112,6 +112,9 @@ pub fn render_broker(datos: &EstadoPantalla) -> impl IntoElement {
     };
 
     // Bloque 2 — salud (GET /salud). El estado se pinta como chip: brasa si "ok", humo si no.
+    // NOTA de alcance (broker-02): el BACKEND activo (redis/sqlite) y el estado/latencia de Redis
+    // exigirían `GET /admin/metricas`, que NO existe en el broker — no se inventa; se deja la
+    // línea informativa para que el hueco sea visible (pendiente de backend).
     let bloque_salud = match &datos.salud {
         Some(s) => {
             let color = if s.estado == "ok" { tema::BRASA } else { tema::HUMO };
@@ -120,10 +123,32 @@ pub fn render_broker(datos: &EstadoPantalla) -> impl IntoElement {
                 .flex_col()
                 .child(campo_chip("estado", tema::chip_estado(s.estado.clone(), color)))
                 .child(campo("instancias vivas", s.instancias.to_string()))
+                .child(sin_datos(
+                    "backend / estado de redis: pendiente de backend (GET /admin/metricas)",
+                ))
                 .into_any_element()
         }
         None => sin_datos("Sin datos de /salud todavía").into_any_element(),
     };
+
+    // Bloque 4 — parámetros de LIVENESS (broker-04, solo lectura): los umbrales que gobiernan las
+    // alertas del supervisor (ocioso/atasco/ghosteo) + la ventana de latido. Son los DEFAULTS de
+    // compilación de `peers-core`; si el broker arrancó con flags distintos, el valor EFECTIVO
+    // exigiría `GET /admin/umbrales` (pendiente de backend) — la nota lo deja claro.
+    let bloque_liveness = div()
+        .flex()
+        .flex_col()
+        .child(campo("ocioso", formatear_umbral(peers_core::UMBRAL_OCIOSO_SEG)))
+        .child(campo("atasco", formatear_umbral(peers_core::UMBRAL_ATASCO_SEG)))
+        .child(campo("ghosteo", formatear_umbral(peers_core::UMBRAL_GHOSTEO_SEG)))
+        .child(campo(
+            "ventana de latido",
+            formatear_umbral(peers_core::VENCIMIENTO_MS / 1000),
+        ))
+        .child(sin_datos(
+            "Defaults de compilación (peers-core). El valor efectivo con flags de arranque \
+             requiere GET /admin/umbrales — pendiente de backend.",
+        ));
 
     // Bloque 3 — factor de estimación (GET /factor-estimacion). El broker lo aprende del tiempo
     // real; aquí sólo se muestra: "6.2x" destacado en brasa + "· N muestras" tenue (humo).
@@ -166,14 +191,88 @@ pub fn render_broker(datos: &EstadoPantalla) -> impl IntoElement {
             ),
         );
 
-    // Layout: fondo Ethos (tinta/papel/Inter) + cabecera + tres paneles apilados en columna.
+    // Banner de ESTADO DE CONEXIÓN (broker-03): conectado / degradado (offline · 401 · otro) con
+    // el último error y botón "Reintentar" cuando hace falta. Derivado de las cachés que ya
+    // rellena `cargar_broker` (salud + error_acceso), sin endpoint nuevo.
+    let banner_conexion = banner_estado_conexion(datos);
+
+    // Layout: fondo Ethos (tinta/papel/Inter) + cabecera + banner de conexión + paneles apilados.
     tema::fondo_app()
         .flex()
         .flex_col()
         .gap_5()
         .p_6()
         .child(cabecera)
+        .child(banner_conexion)
         .child(panel("Arranque", bloque_info))
         .child(panel("Salud", bloque_salud))
+        .child(panel("Liveness", bloque_liveness))
         .child(panel("Estimación", bloque_factor))
+}
+
+/// Formatea un umbral en segundos como "10m" / "45s" / "1h30" (legible de un vistazo).
+fn formatear_umbral(seg: i64) -> String {
+    if seg < 60 {
+        return format!("{seg}s");
+    }
+    let min = seg / 60;
+    if min < 60 {
+        return format!("{min}m");
+    }
+    format!("{}h{:02}", min / 60, min % 60)
+}
+
+/// Banner de estado de conexión (broker-03): punto de color + texto del estado y, si está
+/// degradado, el último error (`error_acceso`) con un botón "Reintentar" que re-dispara la carga
+/// (reutiliza `RecargarBroker`). Estados: conectado (salud llegó y no hay error) / degradado
+/// (offline · 401 · otro) / conectando (sin datos todavía).
+fn banner_estado_conexion(datos: &EstadoPantalla) -> impl IntoElement {
+    // (punto, texto, ¿mostrar reintentar?)
+    let (color, texto, degradado) = match (&datos.error_acceso, &datos.salud) {
+        (Some(err), _) => (
+            gpui::rgb(0xC9_6A_5A), // terracota: conexión degradada (offline/401/otro)
+            format!("conexión degradada — {err}"),
+            true,
+        ),
+        (None, Some(s)) => (
+            gpui::rgb(0x8F_B0_7B), // verde salvia: conectado
+            format!("conectado · {} instancia(s) viva(s)", s.instancias),
+            false,
+        ),
+        (None, None) => (tema::HUMO, "conectando…".to_string(), false),
+    };
+
+    let mut banner = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .gap_3()
+        .px_4()
+        .py_2()
+        .rounded(tema::radio(tema::RADIO_CONTROL))
+        .border_1()
+        .border_color(tema::LINEA)
+        // Punto de estado (8px) con el color semántico.
+        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(999.0)).bg(color))
+        .child(
+            div()
+                .flex_1()
+                .font_family(tema::FUENTE_MONO)
+                .text_sm()
+                .text_color(tema::PAPEL)
+                .child(SharedString::from(texto)),
+        );
+
+    if degradado {
+        banner = banner.child(
+            tema::boton_secundario("broker-reintentar", "Reintentar").on_click(
+                |_evento, window, cx| {
+                    window.dispatch_action(Box::new(RecargarBroker), cx);
+                },
+            ),
+        );
+    }
+
+    banner
 }
