@@ -141,13 +141,23 @@ pub struct EstadoPantalla {
     /// Índice de la fila seleccionada en la tabla de alertas. Resalta la fila y decide qué
     /// alerta expande su detalle. Se mantiene dentro de `alertas` (se acota al recargar).
     pub alertas_seleccion: usize,
-    /// Si `Some(i)`, se muestra el panel de DETALLE de la alerta `alertas[i]` con su texto
-    /// íntegro (la celda de la tabla lo recorta). Espejo del modal `Enter` de la TUI; aquí se
-    /// despliega inline para no depender del `Dialog` stateful del kit. `None` = tabla sin panel.
+    /// Si `Some(i)`, se muestra el MODAL de detalle (alertas-01) de la alerta `alertas[i]` con su
+    /// texto íntegro (la celda de la tabla lo recorta). `i` es el índice REAL en `alertas` (no el
+    /// visible): al abrir desde una fila se traduce el índice visible→real aplicando el filtro, para
+    /// que el modal apunte a la alerta correcta aunque haya filtro activo. `None` = sin modal.
     pub alerta_detalle: Option<usize>,
     /// Último error al hablar con el broker desde la pantalla Alertas (cargar lista o descartar).
     /// Se pinta como banner en vez de dejar la tabla muda. Separado de `error_peers` a propósito.
     pub error_alertas: Option<crate::cliente::ErrorBroker>,
+    /// Filtro por tipo de alerta activo (alertas-03), como tipos SERIALIZADOS ("ocioso",
+    /// "cierre_sospechoso"…). Vacío = mostrar TODAS. Multi-select: varios tipos suman (unión). La
+    /// vista pinta sólo las alertas cuyo tipo está en el conjunto (o todas si vacío) y el conteo de
+    /// la cabecera se recalcula. Se conserva entre recargas (no se toca en `cargar_alertas`).
+    pub alertas_filtro_tipos: Vec<String>,
+    /// Si `true`, el modal de detalle muestra el paso 2 de la confirmación de descarte (alertas-09):
+    /// "¿Seguro? [Sí, descartar]" en vez del botón normal. Se pone a `true` con
+    /// `PedirConfirmacionDescarte`; vuelve a `false` al cancelar, cerrar el modal o descartar.
+    pub alerta_confirmar_descarte: bool,
 
     // --- Pantalla Acceso (Fase 2) ---
     // host/puerto/versión salen de `info` (GET /admin/info) y el estado de salud de `salud`
@@ -160,9 +170,20 @@ pub struct EstadoPantalla {
     /// Token enmascarado (ej. `lexus…2026`) para mostrarlo sin revelarlo. Copia de
     /// `ClienteBroker::token_enmascarado` fijada al arrancar.
     pub acceso_token: String,
+    /// `true` si el cliente corre SIN token (modo anónimo). Copia tipada de `ClienteBroker::sin_token`
+    /// fijada al arrancar y en cada `aplicar_conexion`. La usa la pantalla Acceso (acceso-09) para el
+    /// aviso "broker expuesto sin token" en vez de comparar el string enmascarado (parse, don't
+    /// validate): el hecho "no hay token" es un booleano de dominio, no una coincidencia de texto.
+    pub acceso_sin_token: bool,
     /// Último error al comprobar el acceso al broker (cargar `/salud` o `/admin/info`). La pantalla
     /// lo pinta como banner (offline vs 401 vs otro) para explicar por qué faltan datos.
     pub error_acceso: Option<crate::cliente::ErrorBroker>,
+    /// Panel stateful de la pantalla Acceso: Inputs editables de url/token (acceso-01/02), resultado
+    /// de "Probar conexión" (acceso-05) y diagnóstico del último error (acceso-06). Es una
+    /// `Entity<PanelAcceso>` porque los `Input` del kit exigen estado que no cabe en una vista pura;
+    /// la app la construye al arrancar. `None` sólo si la construcción no llegó a hacerse: la vista
+    /// pinta la parte de solo-lectura igualmente (nunca `.unwrap()`).
+    pub panel_acceso: Option<Entity<crate::vista::acceso::PanelAcceso>>,
 
     // --- Pantalla Redis (Fase 2) ---
     /// Colas de mensajes + outbox pendientes por peer (`GET /admin/redis`). `None` mientras no
@@ -236,13 +257,18 @@ impl AppDesktop {
         // hay `window`/`cx`, y se guarda en `datos` para que la pantalla Config delegue en él. Si no
         // se construyera, la vista pinta "Config no inicializada" (nunca crashea).
         let panel_config = Some(crate::vista::config::nuevo_panel(window, cx));
+        // El panel de Acceso también es stateful (Inputs editables de url/token): se construye AQUÍ,
+        // sembrado con la config del disco, para que la pantalla Acceso delegue en él la edición.
+        let panel_acceso = Some(crate::vista::acceso::nuevo_panel(window, cx));
         // La URL base y el token enmascarado son config fija del cliente: se copian una vez al
         // estado para que la pantalla Acceso (que sólo recibe `&EstadoPantalla`) pueda pintarlos
         // sin acceso al cliente. Nunca se guarda el token en claro, sólo su versión enmascarada.
         let datos = EstadoPantalla {
             acceso_url: cliente.base().to_string(),
             acceso_token: cliente.token_enmascarado(),
+            acceso_sin_token: cliente.sin_token(),
             panel_config,
+            panel_acceso,
             ..EstadoPantalla::default()
         };
         // Arranca la carga inicial + el refresco periódico. El `cx` aquí es `Context<Self>` (viene
@@ -396,7 +422,12 @@ impl AppDesktop {
                 if let Ok(v) = factor {
                     esta.datos.factor = Some(v);
                 }
-                esta.datos.error_acceso = err;
+                esta.datos.error_acceso = err.clone();
+                // acceso-06: inyecta el diagnóstico (o `None` si fue OK) en el panel de Acceso para
+                // su banner tipado. El panel no habla con el broker; refleja lo que la app le pasa.
+                if let Some(panel) = &esta.datos.panel_acceso {
+                    panel.update(cx, |p, cx| p.set_diagnostico(err, cx));
+                }
                 cx.notify();
             });
         })
@@ -549,33 +580,165 @@ impl AppDesktop {
     // La vista es pura y despacha acciones; aquí se mutan `datos` y se dispara la escritura al
     // broker. Se registran con `.on_action(cx.listener(...))` en el contenedor raíz de `render`.
 
-    /// Abre el panel de detalle de la fila pulsada y la marca como seleccionada. Acota el índice a
-    /// la lista actual por seguridad (la lista pudo encoger entre el pintado y el click).
+    /// Traduce un índice de la lista VISIBLE de alertas (el que viaja en las acciones de fila, tras
+    /// aplicar el filtro por tipo) al índice REAL en `datos.alertas`. Reconstruye el mismo filtrado
+    /// que la vista (`pasa_filtro`) y toma el n-ésimo que pasa. `None` si el índice visible ya no
+    /// existe (la lista cambió entre el pintado y el click). Centraliza el mapeo para las acciones
+    /// de alertas que llegan con índice visible (abrir detalle, descarte rápido de fila).
+    fn indice_real_alerta(&self, indice_visible: usize) -> Option<usize> {
+        use crate::vista::alertas::pasa_filtro;
+        self.datos
+            .alertas
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| pasa_filtro(a, &self.datos.alertas_filtro_tipos))
+            .nth(indice_visible)
+            .map(|(idx_real, _)| idx_real)
+    }
+
+    /// Acota `alertas_seleccion` al número de alertas VISIBLES (post-filtro), saturando al último.
+    /// El cursor de selección se indexa sobre la lista visible (igual que las filas pintadas).
+    fn acotar_seleccion_alertas_visibles(&mut self) {
+        use crate::vista::alertas::pasa_filtro;
+        let visibles = self
+            .datos
+            .alertas
+            .iter()
+            .filter(|a| pasa_filtro(a, &self.datos.alertas_filtro_tipos))
+            .count();
+        if visibles == 0 {
+            self.datos.alertas_seleccion = 0;
+        } else if self.datos.alertas_seleccion >= visibles {
+            self.datos.alertas_seleccion = visibles - 1;
+        }
+    }
+
+    /// Abre el MODAL de detalle (alertas-01) de la fila pulsada y la marca como seleccionada. El
+    /// `indice` llega en coordenadas VISIBLES (post-filtro); se traduce a real para que el modal
+    /// —que `AppDesktop` monta leyendo `datos.alertas[real]`— apunte a la alerta correcta aunque
+    /// haya filtro activo. Resetea la confirmación de descarte (modal recién abierto = paso 1).
     fn abrir_detalle_alerta(&mut self, indice: usize, cx: &mut Context<Self>) {
-        if indice < self.datos.alertas.len() {
-            self.datos.alertas_seleccion = indice;
-            self.datos.alerta_detalle = Some(indice);
-            cx.notify();
-        }
-    }
-
-    /// Cierra el panel de detalle (deja la selección donde estaba).
-    fn cerrar_detalle_alerta(&mut self, cx: &mut Context<Self>) {
-        if self.datos.alerta_detalle.is_some() {
-            self.datos.alerta_detalle = None;
-            cx.notify();
-        }
-    }
-
-    /// Descarta una alerta: `POST /admin/alerta-resolver` y, si va bien, recarga la lista. La
-    /// escritura corre en un `cx.spawn` (no bloquea el hilo de UI); al volver se re-lee
-    /// `admin_alertas` para que la tabla refleje el descarte sin depender del refresco periódico.
-    /// Cualquier fallo se guarda en `error_alertas` para pintar el banner; nunca hace panic.
-    fn descartar_alerta(&mut self, tipo: String, sujeto: String, cx: &mut Context<Self>) {
-        // Cierra el panel de inmediato: la acción ya está en marcha, la UI no debe quedar abierta
-        // sobre una alerta que va a desaparecer. La recarga posterior repinta la tabla.
-        self.datos.alerta_detalle = None;
+        let Some(real) = self.indice_real_alerta(indice) else {
+            return; // el índice visible ya no existe (la lista cambió): no abrir nada
+        };
+        self.datos.alertas_seleccion = indice;
+        self.datos.alerta_detalle = Some(real);
+        self.datos.alerta_confirmar_descarte = false;
         cx.notify();
+    }
+
+    /// Cierra el modal de detalle y resetea la confirmación de descarte (deja la selección donde
+    /// estaba). Es el destino de `CerrarDetalleAlerta`, del ✕, del clic fuera y de `Esc`.
+    fn cerrar_detalle_alerta(&mut self, cx: &mut Context<Self>) {
+        if self.datos.alerta_detalle.is_some() || self.datos.alerta_confirmar_descarte {
+            self.datos.alerta_detalle = None;
+            self.datos.alerta_confirmar_descarte = false;
+            cx.notify();
+        }
+    }
+
+    /// Alterna un tipo en el filtro por tipo (alertas-03). `tipo` es la cadena serializada; se
+    /// mete/saca del conjunto `alertas_filtro_tipos` (multi-select, unión). Acota la selección de
+    /// fila a la nueva lista visible para que el cursor no apunte fuera de rango tras filtrar.
+    fn alternar_filtro_tipo(&mut self, tipo: String, cx: &mut Context<Self>) {
+        if let Some(pos) = self.datos.alertas_filtro_tipos.iter().position(|t| *t == tipo) {
+            self.datos.alertas_filtro_tipos.remove(pos);
+        } else {
+            self.datos.alertas_filtro_tipos.push(tipo);
+        }
+        self.acotar_seleccion_alertas_visibles();
+        cx.notify();
+    }
+
+    /// Limpia todos los filtros de tipo (chip "Todos"): vuelve a mostrar TODAS las alertas.
+    fn limpiar_filtro_tipos(&mut self, cx: &mut Context<Self>) {
+        if !self.datos.alertas_filtro_tipos.is_empty() {
+            self.datos.alertas_filtro_tipos.clear();
+            self.acotar_seleccion_alertas_visibles();
+            cx.notify();
+        }
+    }
+
+    /// Paso 1 → 2 de la confirmación de descarte (alertas-09): el botón "Descartar" del modal no
+    /// resuelve directo, pide confirmación. Sólo tiene efecto con el modal abierto.
+    fn pedir_confirmacion_descarte(&mut self, cx: &mut Context<Self>) {
+        if self.datos.alerta_detalle.is_some() {
+            self.datos.alerta_confirmar_descarte = true;
+            cx.notify();
+        }
+    }
+
+    /// Cancela la confirmación de descarte y vuelve al modal en su estado normal (paso 2 → 1).
+    fn cancelar_confirmacion_descarte(&mut self, cx: &mut Context<Self>) {
+        if self.datos.alerta_confirmar_descarte {
+            self.datos.alerta_confirmar_descarte = false;
+            cx.notify();
+        }
+    }
+
+    /// "Ir al sujeto" (alertas-02, portando la tecla `g` de la TUI): cierra el modal y navega a la
+    /// pantalla natural del sujeto según el tipo, preseleccionando/enfocando por `sujeto`:
+    ///   - Ocioso / CancelaciónExcesiva → Peers (marca la fila del peer `sujeto`).
+    ///   - Atascado / CierreSospechoso  → Tareas (marca la tarea `sujeto`, o la 1ª de ese peer).
+    ///   - Ghosteo                      → Trazabilidad (enfoca el peer `sujeto` y carga su historial).
+    /// Si el sujeto no se encuentra en la pantalla destino, navega igualmente (la recarga lo mostrará).
+    /// `tipo` llega serializado; una cadena desconocida se ignora (no navega).
+    fn ir_al_sujeto_alerta(&mut self, tipo: String, sujeto: String, cx: &mut Context<Self>) {
+        use crate::vista::alertas::tipo_desde_serializado;
+        let Some(tipo) = tipo_desde_serializado(&tipo) else {
+            return;
+        };
+        // Cierra el modal antes de saltar (el foco se va a otra pantalla).
+        self.datos.alerta_detalle = None;
+        self.datos.alerta_confirmar_descarte = false;
+
+        match tipo {
+            peers_core::TipoAlerta::Ocioso | peers_core::TipoAlerta::CancelacionExcesiva => {
+                // Peers: preselecciona la fila cuyo `id` coincide con el sujeto (si está en el roster).
+                if let Some(pos) = self.datos.instancias.iter().position(|i| i.id == sujeto) {
+                    self.datos.peers_seleccion = Some(pos);
+                }
+                self.ir_a(Pantalla::Peers, cx);
+            }
+            peers_core::TipoAlerta::Atascado | peers_core::TipoAlerta::CierreSospechoso => {
+                // Tareas: el sujeto de estas alertas es el id de la tarea; si no casa, se prueba como
+                // dueño (instancia_id) para al menos enfocar una tarea de ese peer.
+                let pos = self
+                    .datos
+                    .tareas
+                    .iter()
+                    .position(|t| t.id == sujeto)
+                    .or_else(|| self.datos.tareas.iter().position(|t| t.instancia_id == sujeto));
+                if let Some(pos) = pos {
+                    self.datos.tareas_seleccion = pos;
+                }
+                self.ir_a(Pantalla::Tareas, cx);
+            }
+            peers_core::TipoAlerta::Ghosteo => {
+                // Trazabilidad: el sujeto es el peer cuyo mensaje se ghosteó. `enfocar_traza` fija el
+                // foco, navega y dispara la carga del historial (reutiliza el manejador de Peers).
+                self.enfocar_traza(sujeto, cx);
+            }
+        }
+    }
+
+    /// Descarta una alerta: `POST /admin/alerta-resolver` y, si va bien, recarga la lista + emite un
+    /// toast de éxito/fallo (alertas-09). La escritura corre en un `cx.spawn` (no bloquea el hilo de
+    /// UI); al volver se re-lee `admin_alertas` para que la tabla refleje el descarte sin depender
+    /// del refresco periódico. Cualquier fallo se guarda en `error_alertas` (banner) y en el toast;
+    /// nunca hace panic. El `Notification` se empuja a la ventana activa desde el spawn vía su
+    /// `AnyWindowHandle` (capturado de `cx.active_window()`), ya que allí no hay `&mut Window` directo.
+    fn descartar_alerta(&mut self, tipo: String, sujeto: String, cx: &mut Context<Self>) {
+        // Cierra el modal/confirmación de inmediato: la acción ya está en marcha, la UI no debe
+        // quedar abierta sobre una alerta que va a desaparecer. La recarga posterior repinta la tabla.
+        self.datos.alerta_detalle = None;
+        self.datos.alerta_confirmar_descarte = false;
+        cx.notify();
+
+        // Handle de la ventana activa (Copy) para empujar el toast desde el spawn async. `Context`
+        // deref a `App`, que expone `active_window()`. Si no hubiera ventana activa, no hay toast.
+        let ventana = cx.active_window();
+        let sujeto_toast = sujeto.clone();
 
         let cliente = self.cliente.clone();
         cx.spawn(async move |esta, cx| {
@@ -585,6 +748,9 @@ impl AppDesktop {
                 Ok(_) => Some(cliente.admin_alertas().await),
                 Err(_) => None,
             };
+            // Éxito/motivo para el toast (se leen antes de mover `resultado` al match).
+            let ok = resultado.is_ok();
+            let motivo_fallo = resultado.as_ref().err().map(|e| e.to_string());
             // Vuelve al hilo de la entidad para mutar el estado con el resultado.
             let _ = esta.update(cx, |esta, cx| {
                 match resultado {
@@ -592,13 +758,7 @@ impl AppDesktop {
                         esta.datos.error_alertas = None;
                         if let Some(Ok(lista)) = recarga {
                             esta.datos.alertas = lista;
-                            // Acota la selección a la nueva longitud para no apuntar fuera de rango.
-                            let n = esta.datos.alertas.len();
-                            if n == 0 {
-                                esta.datos.alertas_seleccion = 0;
-                            } else if esta.datos.alertas_seleccion >= n {
-                                esta.datos.alertas_seleccion = n - 1;
-                            }
+                            esta.acotar_seleccion_alertas_visibles();
                         } else if let Some(Err(e)) = recarga {
                             // El descarte fue OK pero la recarga falló: informa sin romper la lista.
                             esta.datos.error_alertas = Some(e);
@@ -608,6 +768,135 @@ impl AppDesktop {
                         // El descarte falló (offline/401/otro): muestra el motivo, conserva la lista.
                         esta.datos.error_alertas = Some(e);
                     }
+                }
+                cx.notify();
+            });
+            // Toast de feedback (alertas-09): se empuja a través del handle de la ventana, que da un
+            // `&mut Window` + `&mut App` aun estando en el spawn. Si la ventana ya se cerró, `update`
+            // devuelve Err y se ignora (no hay a quién notificar).
+            if let Some(ventana) = ventana {
+                let _ = ventana.update(cx, |_raiz, win, app| {
+                    use gpui_component::notification::Notification;
+                    use gpui_component::WindowExt as _;
+                    let note = if ok {
+                        Notification::success(format!("Alerta «{sujeto_toast}» descartada"))
+                    } else {
+                        let motivo =
+                            motivo_fallo.unwrap_or_else(|| "error desconocido".to_string());
+                        Notification::error(format!("No se pudo descartar: {motivo}"))
+                    };
+                    win.push_notification(note, app);
+                });
+            }
+        })
+        .detach();
+    }
+
+    // --- Manejadores de la pantalla Acceso (acceso-01/02/05) ---
+    // La vista/panel despacha estas acciones; aquí se muta la config, se reconstruye el cliente y se
+    // dispara la recarga o el check. El cliente vive SÓLO aquí, de ahí que estas acciones existan.
+
+    /// Aplica una nueva conexión (acceso-01 + acceso-02): persiste `broker_url`/`token` en
+    /// `config.toml` (0600), reconfigura el `ClienteBroker` EN CALIENTE y recarga el estado contra el
+    /// nuevo destino. `token` vacío → `None` (broker sin token, modo anónimo). No hace `.unwrap()`:
+    /// un fallo al guardar el TOML va al banner (`error_acceso`) sin abortar la reconexión (la
+    /// conexión en caliente igual se aplica; sólo no queda persistida).
+    fn aplicar_conexion(
+        &mut self,
+        broker_url: String,
+        token: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Normaliza la URL (sin barra final) para consistencia entre config, cliente y lo que se pinta.
+        let broker_url = broker_url.trim().trim_end_matches('/').to_string();
+        // Token vacío = sin token (no se persiste una cadena vacía; el broker corre anónimo).
+        let token_opt = if token.trim().is_empty() {
+            None
+        } else {
+            Some(token.trim().to_string())
+        };
+
+        // 1) Persistir en config.toml (permisos 0600). Se conserva `refresh_ms` actual del disco para
+        //    no pisarlo (Acceso sólo gestiona url/token; el refresco lo lleva Config).
+        let mut cfg = crate::config::Config::cargar().unwrap_or_default();
+        cfg.broker_url = broker_url.clone();
+        cfg.token = token_opt.clone();
+        if let Err(e) = cfg.guardar() {
+            // No abortamos: reconfiguramos igual en caliente; sólo avisamos que no quedó persistido.
+            self.datos.error_acceso = Some(crate::cliente::ErrorBroker::Otro(format!(
+                "conexión aplicada, pero no se pudo guardar config.toml: {e}"
+            )));
+        }
+
+        // 2) Reconfigurar el cliente EN CALIENTE (reusa runtime tokio + pool reqwest).
+        self.cliente.reconfigurar(broker_url, token_opt);
+        // Refresca la copia cacheada que la vista pura muestra (url + token enmascarado + flag anónimo).
+        self.datos.acceso_url = self.cliente.base().to_string();
+        self.datos.acceso_token = self.cliente.token_enmascarado();
+        self.datos.acceso_sin_token = self.cliente.sin_token();
+
+        // 3) Re-sembrar los Inputs del panel desde el disco: refleja la URL ya NORMALIZADA (sin barra
+        //    final, token trim) en los campos editables, para que lo que ve el jefe coincida con lo
+        //    persistido y con el destino real del cliente (evita "escribí http://x/ pero se guardó
+        //    http://x"). Sólo si el panel existe; nunca `.unwrap()`.
+        if let Some(panel) = &self.datos.panel_acceso {
+            panel.update(cx, |p, cx| p.resembrar_desde_disco(window, cx));
+        }
+
+        // 4) Recargar el estado contra el nuevo broker (poblará info/salud + diagnóstico en el panel).
+        self.cargar_broker(cx);
+    }
+
+    /// "Probar conexión" (acceso-05): check DEDICADO y ligero, SIN recargar el resto de la pantalla.
+    /// Dos pasos independientes para separar "broker vivo" de "token válido":
+    ///   ① `GET /salud`  (ruta EXENTA de token) → ¿alcanzable y vivo?
+    ///   ② `POST /listar` (ruta PROTEGIDA)       → ¿el token autentica? (401 = rechazado)
+    /// El resultado se inyecta en el `PanelAcceso` con `set_resultado_prueba`. Nunca `.unwrap()`.
+    fn probar_conexion(&mut self, cx: &mut Context<Self>) {
+        use crate::vista::acceso::ResultadoPrueba;
+        let cliente = self.cliente.clone();
+        // El check corre en el executor de fondo (reqwest necesita su runtime tokio, no el de GPUI).
+        let fondo = cx.background_executor().spawn(async move {
+            let salud = cliente.bloquear_en(cliente.salud());
+            // Sólo probamos el token si el broker respondió a /salud (si está caído, el 2º paso no
+            // aporta: no hay a quién autenticar). `None` = no se llegó a probar.
+            let auth = if salud.is_ok() {
+                Some(cliente.bloquear_en(cliente.listar_instancias()))
+            } else {
+                None
+            };
+            (salud, auth)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (salud, auth) = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                let salud_ok = salud.is_ok();
+                // Distingue token válido (200) de rechazado (401) de "no probado" (broker caído).
+                let token_ok = match &auth {
+                    Some(Ok(_)) => Some(true),
+                    Some(Err(crate::cliente::ErrorBroker::NoAutorizado)) => Some(false),
+                    Some(Err(_)) => None, // otro error tras salud ok: no concluyente sobre el token
+                    None => None,         // no se probó (broker no respondió a /salud)
+                };
+                // Resumen legible del intento para el pie del bloque de prueba.
+                let resumen = match (salud_ok, token_ok) {
+                    (false, _) => match &salud {
+                        Err(e) => format!("broker inalcanzable: {e}"),
+                        Ok(_) => "broker inalcanzable".to_string(),
+                    },
+                    (true, Some(true)) => "broker vivo · token válido".to_string(),
+                    (true, Some(false)) => "broker vivo · token RECHAZADO (401)".to_string(),
+                    (true, None) => "broker vivo · validación de token no concluyente".to_string(),
+                };
+                let resultado = ResultadoPrueba {
+                    salud_ok: Some(salud_ok),
+                    token_ok,
+                    resumen,
+                    en_curso: false,
+                };
+                if let Some(panel) = &esta.datos.panel_acceso {
+                    panel.update(cx, |p, cx| p.set_resultado_prueba(resultado, cx));
                 }
                 cx.notify();
             });
@@ -1250,6 +1539,52 @@ impl AppDesktop {
             Pantalla::Acceso => vista::render_acceso(&self.datos).into_any_element(),
         }
     }
+
+    /// Overlay del MODAL de detalle de alerta (alertas-01), si `alerta_detalle` apunta a una alerta
+    /// válida. Devuelve un backdrop `absolute inset_0` (tinta translúcido) que centra el contenido
+    /// puro `render_modal_detalle`. Clic en el backdrop → `CerrarDetalleAlerta` (clic fuera cierra);
+    /// el contenido usa `occlude` para que el clic dentro NO cierre. El `Esc` ya lo cubre
+    /// `manejar_escape` → `cerrar_detalle_alerta`. Se monta como último hijo del render raíz para
+    /// quedar POR ENCIMA del layout de dos columnas.
+    ///
+    /// DECISIÓN DE DISEÑO (por qué overlay propio y no el `Dialog` del kit): igual que la Fundación
+    /// evitó el `Sidebar` stateful, el `Dialog` del kit exige una `Entity` + `window.open_dialog`,
+    /// lo que rompería el patrón "vista pura + estado en `EstadoPantalla`" que respeta toda la app.
+    /// Un overlay `absolute` con backdrop da el mismo resultado (foco visual, backdrop, Esc, clic
+    /// fuera) sin `Entity`, leyendo `datos.alerta_detalle` como el resto de modales inline previos.
+    fn overlay_alerta(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let idx = self.datos.alerta_detalle?;
+        let alerta = self.datos.alertas.get(idx)?;
+        let contenido = crate::vista::alertas::render_modal_detalle(
+            alerta,
+            self.datos.alertas_seleccion,
+            self.datos.alerta_confirmar_descarte,
+        );
+
+        Some(
+            div()
+                .id("overlay-alerta")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                // Backdrop tinta translúcido: atenúa el fondo y capta el clic-fuera.
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                // Clic en el backdrop cierra el modal (clic fuera).
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::vista::alertas::CerrarDetalleAlerta),
+                        cx,
+                    );
+                })
+                // El contenido ocluye el ratón para que un clic DENTRO del modal no burbujee al
+                // backdrop (no cierre). `occlude` es la vía del propio kit para esto.
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for AppDesktop {
@@ -1336,8 +1671,11 @@ impl Render for AppDesktop {
         // Acciones de las 9 pantallas. Cada vista pura DESPACHA su Action (`window.dispatch_action`);
         // GPUI la burbujea hasta este contenedor raíz, donde `cx.listener` permite mutar el estado y
         // (si aplica) disparar el fetch + recarga. Es el puente único vista-pura → estado de la app.
-        use crate::vista::acceso::RecargarAcceso;
-        use crate::vista::alertas::{AbrirDetalle, CerrarDetalleAlerta, Descartar};
+        use crate::vista::acceso::{AplicarConexion, ProbarConexion, RecargarAcceso};
+        use crate::vista::alertas::{
+            AbrirDetalle, AlternarFiltroTipo, CancelarConfirmacionDescarte, CerrarDetalleAlerta,
+            Descartar, IrAlSujeto, LimpiarFiltroTipos, PedirConfirmacionDescarte,
+        };
         use crate::vista::broker::RecargarBroker;
         use crate::vista::config::RecargarConfig;
         use crate::vista::jornada::{SeleccionarSesion, SeleccionarTareaJornada};
@@ -1365,6 +1703,25 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, accion: &Descartar, _window, cx| {
                 esta.descartar_alerta(accion.tipo.clone(), accion.sujeto.clone(), cx);
+            }))
+            // --- Alertas (nuevas: RFC alertas-02/03/09) ---
+            // alertas-02: "Ir al sujeto" (portar tecla `g` de la TUI).
+            .on_action(cx.listener(|esta, a: &IrAlSujeto, _window, cx| {
+                esta.ir_al_sujeto_alerta(a.tipo.clone(), a.sujeto.clone(), cx);
+            }))
+            // alertas-03: filtro por tipo (chips multi-select).
+            .on_action(cx.listener(|esta, a: &AlternarFiltroTipo, _window, cx| {
+                esta.alternar_filtro_tipo(a.tipo.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &LimpiarFiltroTipos, _window, cx| {
+                esta.limpiar_filtro_tipos(cx);
+            }))
+            // alertas-09: confirmación de descarte en 2 pasos dentro del modal.
+            .on_action(cx.listener(|esta, _a: &PedirConfirmacionDescarte, _window, cx| {
+                esta.pedir_confirmacion_descarte(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CancelarConfirmacionDescarte, _window, cx| {
+                esta.cancelar_confirmacion_descarte(cx);
             }))
             // --- Peers ---
             .on_action(cx.listener(|esta, a: &SeleccionarPeer, _window, cx| {
@@ -1426,6 +1783,14 @@ impl Render for AppDesktop {
             .on_action(cx.listener(|esta, _a: &RecargarAcceso, _window, cx| {
                 esta.cargar_broker(cx);
             }))
+            // acceso-01/02: aplicar nueva conexión (persistir + reconfigurar cliente + resembrar + recargar).
+            .on_action(cx.listener(|esta, a: &AplicarConexion, window, cx| {
+                esta.aplicar_conexion(a.broker_url.clone(), a.token.clone(), window, cx);
+            }))
+            // acceso-05: check dedicado de conexión (salud + token) sin recargar todo.
+            .on_action(cx.listener(|esta, _a: &ProbarConexion, _window, cx| {
+                esta.probar_conexion(cx);
+            }))
             // --- Config (recargar desde disco; delega en el panel stateful) ---
             .on_action(cx.listener(|esta, _a: &RecargarConfig, window, cx| {
                 if let Some(panel) = &esta.datos.panel_config {
@@ -1434,5 +1799,8 @@ impl Render for AppDesktop {
             }))
             .child(sidebar)
             .child(contenido)
+            // Overlay del modal de detalle de alerta (alertas-01), por encima del layout. `children`
+            // acepta el `Option` (0 o 1 elemento): sin modal abierto no pinta nada.
+            .children(self.overlay_alerta())
     }
 }

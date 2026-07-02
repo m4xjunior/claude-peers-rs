@@ -130,6 +130,33 @@ impl ClienteBroker {
         &self.base
     }
 
+    /// Reconfigura la conexión EN CALIENTE: cambia URL base y/o token sin recrear el cliente HTTP
+    /// ni el runtime tokio (ambos se conservan por su coste de creación). Lo usa la pantalla Acceso
+    /// (acceso-01/02) cuando el jefe edita `broker_url`/`token` in-situ: `AppDesktop` llama a este
+    /// método y luego dispara una recarga (`cargar_broker`) contra el nuevo destino.
+    ///
+    /// INTENCIÓN (por qué mutar en vez de construir uno nuevo): reconstruir con `nuevo(...)` crearía
+    /// otro `Runtime` tokio y otro pool reqwest en cada cambio de broker; mutar los dos campos de
+    /// conexión reusa ambos y deja el cliente listo al instante. `token` vacío → `None` (broker sin
+    /// token, modo anónimo), coherente con `Config::guardar`. La URL se normaliza quitando barras
+    /// finales para que `format!("{base}{ruta}")` no genere `//` (parse, don't validate en frontera).
+    pub fn reconfigurar(&mut self, base: impl Into<String>, token: Option<String>) {
+        let base = base.into();
+        self.base = base.trim_end_matches('/').to_string();
+        // Normaliza el token: una cadena vacía equivale a "sin token" (no se manda el header).
+        self.token = match token {
+            Some(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+            _ => None,
+        };
+    }
+
+    /// `true` si el cliente NO tiene token configurado (modo anónimo). Lo usa la pantalla Acceso
+    /// para el aviso de seguridad "broker expuesto sin token" (acceso-09): sin token + broker en un
+    /// host no-loopback = agujero de seguridad. Evita exponer el `Option<String>` interno.
+    pub fn sin_token(&self) -> bool {
+        self.token.is_none()
+    }
+
     /// Token enmascarado para pintarlo en pantalla sin revelarlo (ej. `lexus…2026`). NUNCA
     /// exponemos el token en claro en la UI: se delega en `enmascarar_token`, que deja pista
     /// mínima. Devuelve el mismo texto que usa la TUI para que ambas interfaces coincidan.

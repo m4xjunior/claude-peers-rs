@@ -34,6 +34,10 @@ tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `time` para calcular la antigüedad relativa de las alertas ("hace 12m", alertas-07): parsea el
+# `creada_en` (RFC 3339) que timbra el broker y lo resta de `now_utc()`. Mismo crate/versión que
+# el resto del workspace (feature `parsing` para `Rfc3339`).
+time = { workspace = true }
 # Config persistida en ~/.config/claude-peers/config.toml — mismo formato y ruta que la TUI
 # (peers-tui/src/config.rs). `toml` (de)serializa el archivo; `dirs` localiza el config-dir
 # multiplataforma. Se reusa el modelo de la TUI para que ambos frontends compartan el mismo
