@@ -110,39 +110,63 @@ pub fn hostname() -> String {
         .unwrap_or_default()
 }
 
-/// Id estable derivado del directorio de trabajo, para el caso "sin --id".
+/// Id estable y ÚNICO POR TERMINAL, derivado del directorio + el TTY, para el caso "sin --id".
 ///
-/// INTENCIÓN: Max quiere lanzar `claude` sin pasar CLAUDE_PEERS_ID ni --id y aun así
-/// tener un id ESTABLE por terminal (para heredar la cola al reiniciar). El nombre de la
-/// carpeta es el id BASE (rol implícito por proyecto). VARIAS instancias en el mismo
-/// directorio están PERMITIDAS: comparten el id base, y el broker las diferencia con sufijo
-/// (`ejemplo`, `ejemplo-2`, `ejemplo-3`…) al detectar la colisión en el registro. Así se puede
-/// filtrar por nombre distinto sin que Max escriba nada.
+/// INTENCIÓN (solución definitiva a la colisión de ids): Max quiere lanzar `claude` sin pasar
+/// CLAUDE_PEERS_ID ni --id y aun así tener un id ESTABLE (hereda la cola al reiniciar) y ÚNICO por
+/// ventana. El problema anterior: dos sesiones en el MISMO directorio derivaban el MISMO id base y
+/// dependían del sufijo del broker (-2) para diferenciarse — frágil bajo concurrencia (TOCTOU) y no
+/// estable al reiniciar (la que era `-2` podía tomar el id base). AHORA el id incluye el TTY como
+/// discriminador: `<nombre-dir>-<ttys>` (ej. `claude-peers-rs-s003` y `claude-peers-rs-s012`).
+/// El TTY es estable por ventana de terminal y distinto entre ventanas → dos Claudes en el mismo
+/// repo obtienen ids DISTINTOS y ESTABLES desde el arranque, sin depender de la carrera del broker.
+/// La misma ventana conserva su id al reiniciar (mismo TTY) → hereda su cola. Esto es lo que Max
+/// pidió: varias instancias por directorio, filtrables por nombre distinto (ejemplo-s003, …).
 ///
-/// Sanea el nombre a [a-z0-9-] (el broker y el harness tratan el id como string opaco,
-/// pero un id limpio evita sorpresas en logs/labels de GitHub).
+/// Sanea a [a-z0-9-] (el broker y el harness tratan el id como string opaco, pero un id limpio
+/// evita sorpresas en logs/labels de GitHub).
 ///
-/// FALLBACK (sin nombre de carpeta usable, p.ej. cwd `/`): NO se cae a un genérico fijo como
-/// "instancia" — eso hacía que TODAS las sesiones con cwd degradado colapsaran al mismo id y se
-/// pisaran (bug real observado: id="instancia", cwd="/"). En su lugar se usa "peer" como base y
-/// se deja que el broker sufije por colisión, de modo que cada sesión conserve una identidad única.
+/// FALLBACK sin nombre de carpeta usable (cwd `/`): base "peer" en vez de un genérico fijo tipo
+/// "instancia" (ese colapsaba en masa las sesiones con cwd degradado). Sin TTY (proceso sin
+/// terminal, p.ej. lanzado por un servicio): se usa solo la base + el broker sufija por colisión.
 pub fn id_desde_directorio(directorio: &str) -> String {
+    id_desde_directorio_y_tty(directorio, tty().as_deref())
+}
+
+/// Núcleo testeable: construye el id desde el directorio y un TTY opcional. Separado de
+/// `id_desde_directorio` para poder probarlo sin depender del TTY real del proceso.
+pub fn id_desde_directorio_y_tty(directorio: &str, tty: Option<&str>) -> String {
+    let sanear = |s: &str| -> String {
+        s.to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    };
+
     let crudo = Path::new(directorio)
         .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let limpio: String = crudo
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if limpio.is_empty() {
-        // Base neutra; el broker la sufija (-2, -3…) si varias sesiones caen aquí, evitando el
-        // colapso a un id compartido. No es "instancia" a propósito (ese colisionaba en masa).
-        "peer".into()
-    } else {
-        limpio
+    let base = {
+        let b = sanear(&crudo);
+        // Base neutra si no hay nombre de carpeta usable (cwd `/`). No "instancia" (colisionaba
+        // en masa); "peer" + discriminador de TTY da identidad única sin colapso.
+        if b.is_empty() { "peer".to_string() } else { b }
+    };
+
+    // Discriminador de sesión: sufijo compacto del TTY (ej. "ttys003" → "s003"). Hace el id ÚNICO
+    // por ventana y estable al reiniciar la misma ventana. Sin TTY (proceso sin terminal), se deja
+    // solo la base y el broker sufija por colisión si hiciera falta.
+    match tty.map(sanear).filter(|t| !t.is_empty()) {
+        Some(t) => {
+            // "ttys003" → "s003"; cualquier otro formato → los últimos ~4 chars alfanuméricos.
+            let disc = t.rsplit('-').next().unwrap_or(&t);
+            let disc = disc.trim_start_matches("tty");
+            format!("{base}-{disc}")
+        }
+        None => base,
     }
 }
 
@@ -180,26 +204,46 @@ fn salida_git(directorio: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod pruebas {
-    use super::{id_desde_directorio, parsear_repo_github};
+    use super::{id_desde_directorio_y_tty, parsear_repo_github};
 
     #[test]
-    fn id_desde_directorio_usa_nombre_carpeta() {
-        assert_eq!(id_desde_directorio("/Users/max/claude-peers-rs"), "claude-peers-rs");
-        assert_eq!(id_desde_directorio("/home/aistudio/ds"), "ds");
+    fn id_incluye_nombre_carpeta_y_tty() {
+        // Con TTY, el id es <nombre-dir>-<disc>: único por ventana, estable al reiniciar.
+        assert_eq!(id_desde_directorio_y_tty("/Users/max/claude-peers-rs", Some("ttys003")), "claude-peers-rs-s003");
+        assert_eq!(id_desde_directorio_y_tty("/home/aistudio/ds", Some("ttys012")), "ds-s012");
     }
 
     #[test]
-    fn id_desde_directorio_sanea_y_minuscula() {
-        assert_eq!(id_desde_directorio("/tmp/P2V Grupo KH"), "p2v-grupo-kh");
-        assert_eq!(id_desde_directorio("/x/Mi_Proyecto"), "mi-proyecto");
+    fn mismo_dir_distinto_tty_da_ids_distintos() {
+        // EL FIX DEFINITIVO: dos Claudes en el MISMO repo pero distintas ventanas → ids DISTINTOS
+        // desde el arranque, sin depender del sufijo -2 del broker. Es lo que Max pidió.
+        let a = id_desde_directorio_y_tty("/Users/max/claude-peers-rs", Some("ttys003"));
+        let b = id_desde_directorio_y_tty("/Users/max/claude-peers-rs", Some("ttys012"));
+        assert_ne!(a, b);
+        assert_eq!(a, "claude-peers-rs-s003");
+        assert_eq!(b, "claude-peers-rs-s012");
     }
 
     #[test]
-    fn id_desde_directorio_fallback_si_vacio() {
-        // Sin nombre de carpeta usable → base neutra "peer" (NO "instancia": ese colapsaba
-        // en masa todas las sesiones con cwd degradado a un id compartido). El broker la sufija.
-        assert_eq!(id_desde_directorio("/"), "peer");
-        assert_eq!(id_desde_directorio(""), "peer");
+    fn mismo_dir_mismo_tty_da_id_estable() {
+        // La MISMA ventana (mismo TTY) conserva su id al reiniciar → hereda su cola de mensajes.
+        let a = id_desde_directorio_y_tty("/Users/max/claude-peers-rs", Some("ttys003"));
+        let b = id_desde_directorio_y_tty("/Users/max/claude-peers-rs", Some("ttys003"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn id_sanea_y_minuscula() {
+        assert_eq!(id_desde_directorio_y_tty("/tmp/P2V Grupo KH", Some("ttys001")), "p2v-grupo-kh-s001");
+        assert_eq!(id_desde_directorio_y_tty("/x/Mi_Proyecto", None), "mi-proyecto");
+    }
+
+    #[test]
+    fn id_fallback_si_vacio() {
+        // Sin nombre de carpeta usable → base neutra "peer" (NO "instancia": ese colapsaba en masa).
+        // Con TTY, cada sesión degradada sigue siendo única (peer-sNNN).
+        assert_eq!(id_desde_directorio_y_tty("/", Some("ttys009")), "peer-s009");
+        assert_eq!(id_desde_directorio_y_tty("", None), "peer");
     }
 
     #[test]
