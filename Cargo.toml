@@ -8,6 +8,7 @@ members = [
     "crates/peers-broker",
     "crates/peers-client",
     "crates/peers-tui",
+    "crates/peers-desktop",
 ]
 
 # Metadatos compartidos. `license-file` (no `license`) porque es propietaria, no SPDX OSI.

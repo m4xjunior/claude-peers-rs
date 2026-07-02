@@ -1,0 +1,42 @@
+# peers-desktop — app desktop nativa (GPUI) que porta la TUI de claude-peers-rs.
+#
+# INTENCIÓN: la TUI (peers-tui) SIGUE VIVA; esto es un frontend alternativo que reusa los
+# mismos tipos de peers-core y la misma lógica de consumo HTTP del broker. No duplica el
+# protocolo: los DTOs viven en peers-core y aquí sólo se pintan.
+[package]
+name = "peers-desktop"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+# GPUI + gpui-component desde git: no hay releases en crates.io todavía. gpui_platform aporta
+# la capa de ventana/fuentes (font-kit) y gpui-component-assets los iconos/tema del kit.
+#
+# CRÍTICO (por qué el `rev` fijo): gpui-component ancla gpui/gpui_platform a un rev EXACTO de
+# zed. Si aquí pedimos zed HEAD, Cargo intenta resolver dos revisiones distintas del mismo repo
+# y choca en `core-foundation` (=0.10.0 vs =0.10.1 vía cocoa). Fijando el MISMO rev que usa
+# gpui-component, Cargo unifica en un único checkout de zed y la resolución cierra. Al subir la
+# versión de gpui-component, re-sincronizar este rev con su Cargo.toml (línea `gpui = { rev }`).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+
+# Tipos del protocolo compartidos con broker/TUI. NUNCA redefinir DTOs aquí.
+peers-core = { path = "../peers-core" }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+# rustls (no OpenSSL nativo) para mantener el binario portable, igual que el resto del workspace.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Config persistida en ~/.config/claude-peers/config.toml — mismo formato y ruta que la TUI
+# (peers-tui/src/config.rs). `toml` (de)serializa el archivo; `dirs` localiza el config-dir
+# multiplataforma. Se reusa el modelo de la TUI para que ambos frontends compartan el mismo
+# archivo de config sin divergir.
+toml = "1"
+dirs = "6"

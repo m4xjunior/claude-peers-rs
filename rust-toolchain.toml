@@ -1,0 +1,6 @@
+# Toolchain fijo del workspace. Requerido por peers-desktop: gpui (de Zed) usa
+# `std::hint::cold_path()`, estable solo desde Rust 1.95.0. Con toolchains anteriores
+# (p.ej. 1.94.1) el build de gpui falla con E0658 (feature `cold_path` inestable).
+# Verificado: el workspace entero (broker/client/tui/core/desktop) compila con 1.95.0.
+[toolchain]
+channel = "1.95.0"
