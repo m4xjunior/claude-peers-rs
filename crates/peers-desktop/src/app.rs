@@ -3264,6 +3264,15 @@ impl Render for AppDesktop {
                     window,
                     cx,
                 );
+                // jornada-05: el MISMO formulario se abre también desde la pantalla Jornada
+                // ("quiero crear tareas desde la jornada"). Si se abre ahí, el peer cuya jornada
+                // se está mirando es la elección natural → se preselecciona en el selector
+                // (sigue siendo cambiable; en Tareas el comportamiento no varía: sin preselección).
+                if esta.activa == Pantalla::Jornada {
+                    if let Some(peer) = esta.datos.jornada_peer.clone() {
+                        esta.elegir_peer_form(peer, cx);
+                    }
+                }
             }))
             .on_action(cx.listener(|esta, a: &AbrirFormReasignar, window, cx| {
                 esta.abrir_form_reasignar(a.tarea_id.clone(), window, cx);

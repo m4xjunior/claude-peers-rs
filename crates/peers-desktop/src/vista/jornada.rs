@@ -268,7 +268,27 @@ pub fn render_jornada(datos: &EstadoPantalla) -> impl IntoElement {
                 .items_center()
                 .justify_between()
                 .child(tema::titulo(format!("Jornada · {id_peer}")))
-                .child(selector_peer_jornada(datos)),
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        // jornada-05: crear una tarea sin salir de la jornada. REUTILIZA el
+                        // formulario de Tareas (misma Action `AbrirFormAsignar`; el overlay vive
+                        // en el render raíz, así que se abre desde cualquier pantalla). El handler
+                        // preselecciona este peer como destino al venir de Jornada.
+                        .child(
+                            tema::boton_primario("jornada-crear-tarea", "Crear tarea").on_click(
+                                |_e, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::vista::tareas::AbrirFormAsignar),
+                                        cx,
+                                    );
+                                },
+                            ),
+                        )
+                        .child(selector_peer_jornada(datos)),
+                ),
         )
         .child(
             div()
