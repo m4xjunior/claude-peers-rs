@@ -218,6 +218,21 @@ pub struct EstadoPantalla {
     /// `None`. Alimenta el botón "Purgar" (que actúa sobre el peer de esa fila) y resalta la fila.
     /// Espejo del cursor + tecla `p` de la TUI. Tras purgar se pone a `None` (ese peer desaparece).
     pub redis_seleccion_cola: Option<usize>,
+    /// Si `Some(id)`, está abierto el pop-up de INSPECCIÓN de la cola de ese peer (redis-01).
+    pub redis_cola_detalle: Option<String>,
+    /// Mensajes pendientes de la cola inspeccionada (historial `estado=enviado` del peer). Se
+    /// cargan al abrir el pop-up y se refrescan tras un reenvío desde él.
+    pub redis_cola_mensajes: Vec<peers_core::Mensaje>,
+    /// `true` mientras el fetch del contenido de la cola está en vuelo (el modal pinta "Cargando…"
+    /// en vez de confundir "aún no llegó" con "no hay pendientes").
+    pub redis_cola_cargando: bool,
+    /// Si `Some(id)`, está abierto el diálogo de CONFIRMACIÓN de purga (redis-04) para ese peer.
+    /// El POST `/admin/purgar` sólo sale al confirmar.
+    pub redis_confirmar_purga: Option<String>,
+    /// Instante MONOTÓNICO local de la última respuesta OK de `/admin/redis` (redis-05): alimenta
+    /// el sello "actualizado hace Xs". Es frescura de la UI, no un tiempo de trabajo (esos los
+    /// timbra siempre el broker).
+    pub redis_actualizado_en: Option<std::time::Instant>,
 
     // --- Pantalla Tareas (Fase 2) ---
     /// TODAS las tareas de TODOS los peers (`GET /admin/tareas`), cada `Tarea` con su `instancia_id`,
@@ -510,6 +525,8 @@ impl AppDesktop {
                     Ok(v) => {
                         esta.datos.redis = Some(v);
                         esta.datos.error_redis = None;
+                        // redis-05: timbra la frescura del snapshot (reloj monotónico local).
+                        esta.datos.redis_actualizado_en = Some(std::time::Instant::now());
                     }
                     Err(e) => esta.datos.error_redis = Some(e),
                 }
@@ -1263,6 +1280,67 @@ impl AppDesktop {
         self.reenviar_mensaje(msg_id, cx);
     }
 
+    /// Reenvío disparado desde el pop-up de cola de Redis (redis-03): mismo POST que el flujo de
+    /// Trazabilidad, pero la recarga es la de la COLA inspeccionada (`estado=enviado`) + el
+    /// snapshot de contadores (`/admin/redis`). Toast tipado igual que allí. Red en fondo con
+    /// `bloquear_en`, sin `.unwrap()`.
+    fn reenviar_desde_redis(&mut self, msg_id: i64, peer: String, cx: &mut Context<Self>) {
+        let ventana = cx.active_window();
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            let resultado = cliente.bloquear_en(cliente.reenviar(msg_id));
+            let recarga = match &resultado {
+                Ok(r) if r.ok => Some((
+                    cliente.bloquear_en(
+                        cliente.historial(&peer, Some(peers_core::EstadoMensaje::Enviado)),
+                    ),
+                    cliente.bloquear_en(cliente.admin_redis()),
+                )),
+                _ => None,
+            };
+            (resultado, recarga)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (resultado, recarga) = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                if let Some((cola, snapshot)) = recarga {
+                    if let Ok(lista) = cola {
+                        esta.datos.redis_cola_mensajes = lista;
+                    }
+                    if let Ok(v) = snapshot {
+                        esta.datos.redis = Some(v);
+                        esta.datos.redis_actualizado_en = Some(std::time::Instant::now());
+                    }
+                }
+                cx.notify();
+            });
+            if let Some(ventana) = ventana {
+                let _ = ventana.update(cx, |_raiz, win, app| {
+                    use gpui_component::notification::Notification;
+                    use gpui_component::WindowExt as _;
+                    let note = match &resultado {
+                        Ok(r) if r.ok => match r.msg_id {
+                            Some(nuevo) => Notification::success(format!(
+                                "Mensaje #{msg_id} reenviado como #{nuevo}"
+                            )),
+                            None => Notification::success(format!("Mensaje #{msg_id} reenviado")),
+                        },
+                        Ok(r) => {
+                            let motivo = r
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "el broker lo rechazó".to_string());
+                            Notification::error(format!("No se pudo reenviar: {motivo}"))
+                        }
+                        Err(e) => Notification::error(format!("No se pudo reenviar: {e}")),
+                    };
+                    win.push_notification(note, app);
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Cambia el filtro por estado del historial (trazabilidad-02) y recarga contra el broker.
     /// `None` = "Todos". Resetea el cursor de fila (la lista cambia de composición).
     fn filtrar_estado_traza(
@@ -1285,6 +1363,13 @@ impl AppDesktop {
     /// como #N" si el broker devolvió el id nuevo (trazabilidad-05). Red SIEMPRE en fondo con
     /// `bloquear_en` (fix anti-SIGABRT), sin `.unwrap()`.
     fn reenviar_mensaje(&mut self, msg_id: i64, cx: &mut Context<Self>) {
+        // CONTEXTO REDIS (redis-03): si el pop-up de inspección de cola está abierto, el reenvío
+        // viene de ahí — la recarga correcta es la de ESA cola (+ los contadores del snapshot),
+        // no el historial de Trazabilidad.
+        if let Some(peer) = self.datos.redis_cola_detalle.clone() {
+            self.reenviar_desde_redis(msg_id, peer, cx);
+            return;
+        }
         let Some(peer) = self.datos.traza_peer.clone() else {
             return; // sin peer en foco no hay historial que refrescar
         };
@@ -1974,6 +2059,67 @@ impl AppDesktop {
         .detach();
     }
 
+    /// Abre el pop-up de INSPECCIÓN de cola (redis-01) y carga sus mensajes pendientes vía
+    /// `GET /admin/historial?id=&estado=enviado` (aproximación con endpoint EXISTENTE — el
+    /// contenido crudo exacto exigiría `/admin/bandeja`, pendiente de backend, y no se inventa).
+    fn abrir_cola_redis(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.redis_cola_detalle = Some(id.clone());
+        self.datos.redis_cola_mensajes.clear();
+        self.datos.redis_cola_cargando = true;
+        cx.notify();
+
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            cliente.bloquear_en(cliente.historial(&id, Some(peers_core::EstadoMensaje::Enviado)))
+        });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                esta.datos.redis_cola_cargando = false;
+                match r {
+                    Ok(lista) => esta.datos.redis_cola_mensajes = lista,
+                    // Un fallo deja la lista vacía y el motivo en el banner de la pantalla.
+                    Err(e) => esta.datos.error_redis = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Cierra el pop-up de inspección de cola (✕, Cerrar, clic fuera, Esc).
+    fn cerrar_cola_redis(&mut self, cx: &mut Context<Self>) {
+        if self.datos.redis_cola_detalle.is_some() {
+            self.datos.redis_cola_detalle = None;
+            self.datos.redis_cola_mensajes.clear();
+            self.datos.redis_cola_cargando = false;
+            cx.notify();
+        }
+    }
+
+    /// Abre la CONFIRMACIÓN de purga (redis-04) para el peer `id`.
+    fn pedir_purga(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.redis_confirmar_purga = Some(id);
+        cx.notify();
+    }
+
+    /// Cancela la purga pendiente (Cancelar / clic fuera / Esc): no toca nada.
+    fn cancelar_purga(&mut self, cx: &mut Context<Self>) {
+        if self.datos.redis_confirmar_purga.is_some() {
+            self.datos.redis_confirmar_purga = None;
+            cx.notify();
+        }
+    }
+
+    /// Confirma la purga pendiente: cierra el diálogo y dispara el POST real (`purgar_peer`).
+    fn confirmar_purga(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.datos.redis_confirmar_purga.take() else {
+            return;
+        };
+        cx.notify();
+        self.purgar_peer(id, cx);
+    }
+
     // --- Manejadores de Jornada (sólo UI) ---
 
     /// Marca la fila `indice` de la tabla de SESIONES de Jornada (sólo feedback visual).
@@ -2196,6 +2342,17 @@ impl AppDesktop {
                 let idx = self.datos.peers_seleccion.unwrap_or(0);
                 self.abrir_detalle_peer(idx, cx);
             }
+            Pantalla::Redis => {
+                // redis-01: Enter abre la inspección de la cola seleccionada.
+                let id = self
+                    .datos
+                    .redis_seleccion_cola
+                    .and_then(|i| self.datos.redis.as_ref().and_then(|r| r.colas.get(i)))
+                    .map(|c| c.id.clone());
+                if let Some(id) = id {
+                    self.abrir_cola_redis(id, cx);
+                }
+            }
             Pantalla::Trazabilidad => {
                 // trazabilidad-01: Enter abre el MODAL de timeline del mensaje seleccionado.
                 let idx = self.datos.traza_seleccion;
@@ -2289,7 +2446,8 @@ impl AppDesktop {
                     .and_then(|i| self.datos.redis.as_ref().and_then(|r| r.colas.get(i)))
                     .map(|c| c.id.clone());
                 if let Some(id) = id {
-                    self.purgar_peer(id, cx);
+                    // redis-04: la tecla `p` también pasa por la confirmación destructiva.
+                    self.pedir_purga(id, cx);
                     true
                 } else {
                     false
@@ -2420,6 +2578,16 @@ impl AppDesktop {
                     self.cerrar_detalle_tarea(cx);
                 } else {
                     self.cerrar_sesion_jornada(cx);
+                }
+            }
+            Pantalla::Redis => {
+                // Prioridad: confirmación de reenvío > confirmación de purga > pop-up de cola.
+                if self.datos.traza_confirmar_reenvio.is_some() {
+                    self.cancelar_reenvio(cx);
+                } else if self.datos.redis_confirmar_purga.is_some() {
+                    self.cancelar_purga(cx);
+                } else {
+                    self.cerrar_cola_redis(cx);
                 }
             }
             _ => {}
@@ -2698,13 +2866,82 @@ impl AppDesktop {
         )
     }
 
+    /// Overlay del pop-up de INSPECCIÓN de cola de Redis (redis-01/03).
+    fn overlay_cola_redis(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let id = self.datos.redis_cola_detalle.as_deref()?;
+        let contenido = crate::vista::redis::render_modal_cola(
+            id,
+            &self.datos.redis_cola_mensajes,
+            self.datos.redis_cola_cargando,
+        );
+
+        Some(
+            div()
+                .id("overlay-cola-redis")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::redis::CerrarColaRedis), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
+    /// Overlay del diálogo de CONFIRMACIÓN de purga (redis-04), con los recuentos exactos sacados
+    /// del snapshot ya cargado. Clic fuera = cancelar (no purga).
+    fn overlay_purga_redis(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let id = self.datos.redis_confirmar_purga.as_deref()?;
+        // Recuentos exactos del snapshot (0 si el peer ya no aparece en él).
+        let contar = |lista: &[peers_core::ColaResumen]| {
+            lista
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.pendientes)
+                .unwrap_or(0)
+        };
+        let (en_cola, en_outbox) = match &self.datos.redis {
+            Some(r) => (contar(&r.colas), contar(&r.outbox)),
+            None => (0, 0),
+        };
+        let contenido = crate::vista::redis::render_modal_purga(id, en_cola, en_outbox);
+
+        Some(
+            div()
+                .id("overlay-purga-redis")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::redis::CancelarPurga), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
     /// Overlay del mini-modal de CONFIRMACIÓN de reenvío (trazabilidad-05), por encima del modal
     /// de timeline si ambos están abiertos. Clic fuera = cancelar (no reenvía).
     fn overlay_confirmar_reenvio(&self) -> Option<gpui::AnyElement> {
         use gpui::IntoElement as _;
         let msg_id = self.datos.traza_confirmar_reenvio?;
-        // El mensaje original, si sigue en la caché, da contexto al texto de confirmación.
-        let mensaje = self.datos.historial.iter().find(|m| m.id == msg_id);
+        // El mensaje original, si sigue en alguna caché, da contexto al texto de confirmación
+        // (historial de Trazabilidad o la cola inspeccionada de Redis, redis-03).
+        let mensaje = self
+            .datos
+            .historial
+            .iter()
+            .find(|m| m.id == msg_id)
+            .or_else(|| self.datos.redis_cola_mensajes.iter().find(|m| m.id == msg_id));
         let contenido =
             crate::vista::trazabilidad::render_modal_confirmar_reenvio(msg_id, mensaje);
 
@@ -2875,7 +3112,10 @@ impl Render for AppDesktop {
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
             DeseleccionarPeer, EnviarMensajePeer, PedirKickPeer, SeleccionarPeer, VerJornadaPeer,
         };
-        use crate::vista::redis::{PurgarPeer, SeleccionarColaRedis};
+        use crate::vista::redis::{
+            AbrirColaRedis, CancelarPurga, CerrarColaRedis, ConfirmarPurga, PedirPurga,
+            PurgarPeer, RefrescarRedis, SeleccionarColaRedis,
+        };
         use crate::vista::tareas::{
             AbrirDetalleTarea, AbrirFormAmpliar, AbrirFormAsignar, AbrirFormBloquear,
             AbrirFormEditar, AbrirFormReasignar, AsignarTarea, CambiarEstadoTarea,
@@ -3058,6 +3298,25 @@ impl Render for AppDesktop {
             .on_action(cx.listener(|esta, a: &PurgarPeer, _window, cx| {
                 esta.purgar_peer(a.id.clone(), cx);
             }))
+            // --- Redis: inspección de cola + purga confirmada + refresco (fase 6) ---
+            .on_action(cx.listener(|esta, a: &AbrirColaRedis, _window, cx| {
+                esta.abrir_cola_redis(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarColaRedis, _window, cx| {
+                esta.cerrar_cola_redis(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &PedirPurga, _window, cx| {
+                esta.pedir_purga(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &ConfirmarPurga, _window, cx| {
+                esta.confirmar_purga(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CancelarPurga, _window, cx| {
+                esta.cancelar_purga(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &RefrescarRedis, _window, cx| {
+                esta.cargar_redis(cx);
+            }))
             // --- Jornada (sólo UI) ---
             .on_action(cx.listener(|esta, a: &SeleccionarSesion, _window, cx| {
                 esta.seleccionar_sesion_jornada(a.indice, cx);
@@ -3122,6 +3381,9 @@ impl Render for AppDesktop {
             // Overlays de la jornada: detalle de tarea (reutiliza el modal de fase 1) y de sesión.
             .children(self.overlay_tarea_jornada())
             .children(self.overlay_sesion_jornada())
+            // Overlays de Redis: inspección de cola (redis-01) y confirmación de purga (redis-04).
+            .children(self.overlay_cola_redis())
+            .children(self.overlay_purga_redis())
             // Overlays de formularios (CRUD de tareas y composer/kick de peers), por encima.
             .children(self.overlay_form_tareas())
             .children(self.overlay_form_peers())
