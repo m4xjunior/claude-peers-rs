@@ -7,8 +7,9 @@
 
 use async_trait::async_trait;
 use peers_core::{
-    aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, EstadoMensaje, EstadoTarea,
-    FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
+    aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, BloqueoComunicacion,
+    EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Politica,
+    Sesion, Tarea, TipoAlerta, MAX_ALERTAS, MAX_BLOQUEOS,
 };
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
@@ -191,6 +192,21 @@ impl AlmacenSqlite {
                 valor INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO tareaseq (id, valor) VALUES (1, 0);
+            -- Política de comunicación (RFC politica-comunicacion R8): fila única con el JSON
+            -- completo. Blob A PROPÓSITO (no columnas): la política se reemplaza entera
+            -- (POST /admin/politica) y su modelo aún crece (Patron::Grupo futuro) — un blob
+            -- evita una migración por cada variante nueva. Ausente → default Permitir (AC6).
+            CREATE TABLE IF NOT EXISTS politica_comunicacion (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                json TEXT NOT NULL
+            );
+            -- Intentos de envío bloqueados por la política (R7), cola acotada a MAX_BLOQUEOS
+            -- (mismo patrón de poda que `alertas`).
+            CREATE TABLE IF NOT EXISTS comunicacion_bloqueada (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                de_id TEXT NOT NULL, para_id TEXT NOT NULL,
+                motivo TEXT NOT NULL, cuando TEXT NOT NULL
+            );
             "#,
         )?;
         // Migración para bases YA existentes (R10/AC6): `CREATE TABLE IF NOT EXISTS` no añade
@@ -972,6 +988,76 @@ impl Almacen for AlmacenSqlite {
             .map(|m| (m.para_id.clone(), m))
             .collect())
     }
+
+    // --- Política de comunicación (RFC politica-comunicacion R8) ---
+
+    async fn politica_leer(&self) -> anyhow::Result<Politica> {
+        let json: Option<String> = {
+            let conexion = self.bloquear();
+            conexion
+                .query_row("SELECT json FROM politica_comunicacion WHERE id=1", [], |r| r.get(0))
+                .ok()
+        };
+        // Fila ausente O JSON corrupto → default Permitir (AC6, fail-open: una política
+        // ilegible no deja sin habla al equipo). Espejo exacto del backend Redis.
+        Ok(match json {
+            Some(j) => match serde_json::from_str(&j) {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(
+                        "política de comunicación corrupta en SQLite (se usa default Permitir): {err:#}"
+                    );
+                    Politica::default()
+                }
+            },
+            None => Politica::default(),
+        })
+    }
+
+    async fn politica_guardar(&self, politica: &Politica) -> anyhow::Result<()> {
+        // UPSERT sobre la fila única id=1 (reemplazo completo, R6).
+        self.bloquear().execute(
+            "INSERT INTO politica_comunicacion (id,json) VALUES (1,?1)
+             ON CONFLICT(id) DO UPDATE SET json=excluded.json",
+            params![serde_json::to_string(politica)?],
+        )?;
+        Ok(())
+    }
+
+    async fn registrar_bloqueo(&self, bloqueo: &BloqueoComunicacion) -> anyhow::Result<()> {
+        let conexion = self.bloquear();
+        conexion.execute(
+            "INSERT INTO comunicacion_bloqueada (de_id,para_id,motivo,cuando) VALUES (?1,?2,?3,?4)",
+            params![bloqueo.de_id, bloqueo.para_id, bloqueo.motivo, bloqueo.cuando],
+        )?;
+        // Poda a los últimos MAX_BLOQUEOS (R7): conserva los seq más altos (los recientes),
+        // mismo patrón que la poda de `alertas`.
+        conexion.execute(
+            "DELETE FROM comunicacion_bloqueada WHERE seq IN (
+                SELECT seq FROM comunicacion_bloqueada a
+                WHERE (SELECT COUNT(*) FROM comunicacion_bloqueada a2 WHERE a2.seq > a.seq) >= ?1
+            )",
+            params![MAX_BLOQUEOS as i64],
+        )?;
+        Ok(())
+    }
+
+    async fn bloqueos_recientes(&self) -> anyhow::Result<Vec<BloqueoComunicacion>> {
+        let conexion = self.bloquear();
+        // seq DESC = más reciente primero (contrato del trait, igual que el LPUSH de Redis).
+        let mut stmt = conexion.prepare(
+            "SELECT de_id,para_id,motivo,cuando FROM comunicacion_bloqueada ORDER BY seq DESC",
+        )?;
+        let filas = stmt.query_map([], |f| {
+            Ok(BloqueoComunicacion {
+                de_id: f.get(0)?,
+                para_id: f.get(1)?,
+                motivo: f.get(2)?,
+                cuando: f.get(3)?,
+            })
+        })?;
+        Ok(filas.filter_map(Result::ok).collect())
+    }
 }
 
 fn fila_a_instancia(f: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
@@ -1015,6 +1101,57 @@ fn fila_a_tarea(f: &rusqlite::Row<'_>) -> rusqlite::Result<Tarea> {
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    /// R8/AC6: sin fila guardada, `politica_leer` devuelve el default Permitir; el roundtrip
+    /// conserva reglas/orden/default; guardar dos veces REEMPLAZA (fila única, no acumula).
+    #[tokio::test]
+    async fn politica_default_roundtrip_y_reemplazo() {
+        use peers_core::{AccionPolitica, DecisionPolitica, Patron, ReglaComunicacion};
+        let b = base();
+
+        // Sin configurar → default: todo permitido (AC6).
+        let p0 = b.politica_leer().await.unwrap();
+        assert!(p0.reglas.is_empty());
+        assert_eq!(p0.evaluar("a", "b"), DecisionPolitica::Permitida);
+
+        // Guardar una política con 1 bloqueo → roundtrip fiel.
+        let p1 = Politica {
+            reglas: vec![ReglaComunicacion {
+                de: Patron::try_from("a".to_string()).expect("patrón"),
+                para: Patron::try_from("b".to_string()).expect("patrón"),
+                accion: AccionPolitica::Bloquear,
+                motivo: Some("prueba".into()),
+            }],
+            accion_por_defecto: AccionPolitica::Permitir,
+        };
+        b.politica_guardar(&p1).await.unwrap();
+        assert_eq!(b.politica_leer().await.unwrap(), p1);
+
+        // Reemplazo completo (R6): guardar la vacía deja la vacía, no acumula reglas.
+        b.politica_guardar(&Politica::default()).await.unwrap();
+        assert!(b.politica_leer().await.unwrap().reglas.is_empty());
+    }
+
+    /// R7: los bloqueos se registran, salen MÁS RECIENTE PRIMERO y la cola queda acotada a
+    /// MAX_BLOQUEOS (los viejos se podan).
+    #[tokio::test]
+    async fn bloqueos_acotados_y_recientes_primero() {
+        let b = base();
+        for i in 0..(MAX_BLOQUEOS + 5) {
+            b.registrar_bloqueo(&BloqueoComunicacion {
+                de_id: format!("de-{i}"),
+                para_id: "para".into(),
+                motivo: "prueba".into(),
+                cuando: format!("2026-01-01T00:00:{:02}Z", i % 60),
+            })
+            .await
+            .unwrap();
+        }
+        let recientes = b.bloqueos_recientes().await.unwrap();
+        assert_eq!(recientes.len(), MAX_BLOQUEOS, "la cola debe podarse a MAX_BLOQUEOS");
+        // El último registrado es el primero de la lista (más reciente primero).
+        assert_eq!(recientes[0].de_id, format!("de-{}", MAX_BLOQUEOS + 4));
+    }
 
     fn base() -> AlmacenSqlite {
         AlmacenSqlite::abrir(":memory:").expect("base en memoria")

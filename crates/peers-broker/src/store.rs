@@ -26,8 +26,9 @@ use async_trait::async_trait;
 use deadpool_redis::redis::{cmd, AsyncCommands};
 use deadpool_redis::{Config, Pool, Runtime};
 use peers_core::{
-    aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, EstadoMensaje, EstadoTarea,
-    FactorEstimacion, Instancia, ItemOutbox, Mensaje, Sesion, Tarea, TipoAlerta, MAX_ALERTAS,
+    aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, BloqueoComunicacion,
+    EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Politica,
+    Sesion, Tarea, TipoAlerta, MAX_ALERTAS, MAX_BLOQUEOS,
 };
 
 const NS: &str = "cprs:";
@@ -87,6 +88,12 @@ fn k_alertas() -> String {
 }
 fn k_alertas_activas() -> String {
     format!("{NS}alertas_activas")
+}
+fn k_politica() -> String {
+    format!("{NS}politica_comunicacion")
+}
+fn k_bloqueos() -> String {
+    format!("{NS}comunicacion_bloqueada")
 }
 
 /// Forma textual lowercase de un `TipoAlerta` (sin comillas JSON), para componer la clave
@@ -848,6 +855,55 @@ impl Almacen for AlmacenRedis {
             }
         }
         Ok(out)
+    }
+
+    // --- Política de comunicación (RFC politica-comunicacion R8) ---
+
+    async fn politica_leer(&self) -> anyhow::Result<Politica> {
+        let mut conn = self.conn().await?;
+        // Clave única STRING con el JSON completo. Ausente → default Permitir (AC6). Un JSON
+        // corrupto también degrada al default con warn: una política ilegible no debe dejar
+        // sin habla al equipo (fail-open — el estado seguro de ESTE sistema es permitir).
+        let crudo: Option<String> = conn.get(k_politica()).await?;
+        Ok(match crudo {
+            Some(json) => match serde_json::from_str(&json) {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(
+                        "política de comunicación corrupta en Redis (se usa default Permitir): {err:#}"
+                    );
+                    Politica::default()
+                }
+            },
+            None => Politica::default(),
+        })
+    }
+
+    async fn politica_guardar(&self, politica: &Politica) -> anyhow::Result<()> {
+        let mut conn = self.conn().await?;
+        let _: () = conn.set(k_politica(), serde_json::to_string(politica)?).await?;
+        Ok(())
+    }
+
+    async fn registrar_bloqueo(&self, bloqueo: &BloqueoComunicacion) -> anyhow::Result<()> {
+        let mut conn = self.conn().await?;
+        // LPUSH + LTRIM 0..MAX-1: el más reciente queda al frente y la LIST queda acotada (R7).
+        let _: () = conn.lpush(k_bloqueos(), serde_json::to_string(bloqueo)?).await?;
+        let _: () = conn
+            .ltrim(k_bloqueos(), 0, (MAX_BLOQUEOS as isize) - 1)
+            .await?;
+        Ok(())
+    }
+
+    async fn bloqueos_recientes(&self) -> anyhow::Result<Vec<BloqueoComunicacion>> {
+        let mut conn = self.conn().await?;
+        // LRANGE completo (la LIST ya está acotada); con LPUSH el orden natural es el pedido
+        // por el trait: más reciente primero. Uno corrupto se descarta, no aborta la lectura.
+        let crudos: Vec<String> = conn.lrange(k_bloqueos(), 0, -1).await?;
+        Ok(crudos
+            .into_iter()
+            .filter_map(|c| serde_json::from_str::<BloqueoComunicacion>(&c).ok())
+            .collect())
     }
 }
 

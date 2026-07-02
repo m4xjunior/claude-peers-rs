@@ -9,8 +9,8 @@
 //! en pánico; el handler traduce el error a un 500 con JSON.
 
 use crate::{
-    Alcance, Alerta, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox, Mensaje,
-    Sesion, Tarea,
+    Alcance, Alerta, BloqueoComunicacion, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia,
+    ItemOutbox, Mensaje, Politica, Sesion, Tarea,
 };
 use async_trait::async_trait;
 
@@ -281,4 +281,26 @@ pub trait Almacen: Send + Sync {
         &self,
         estado: EstadoMensaje,
     ) -> anyhow::Result<Vec<(String, Mensaje)>>;
+
+    // --- Política de comunicación (RFC politica-comunicacion R8) ---
+
+    /// Lee la política de comunicación. Clave ausente O JSON corrupto → `Politica::default()`
+    /// (todo permitido, AC6): la falta/rotura de configuración NUNCA deja al equipo sin habla
+    /// (fail-open por diseño — el default del sistema es permitir). Redis: STRING JSON en
+    /// `cprs:politica_comunicacion`. SQLite: fila única en `politica_comunicacion`.
+    async fn politica_leer(&self) -> anyhow::Result<Politica>;
+
+    /// Reemplaza la política COMPLETA (R6: `POST /admin/politica` es reemplazo idempotente,
+    /// no parche). La validación de patrones ocurre en la frontera (serde de `Patron`), aquí
+    /// solo se persiste.
+    async fn politica_guardar(&self, politica: &Politica) -> anyhow::Result<()>;
+
+    /// Registra un intento de envío bloqueado por la política (R7), en cola acotada a los
+    /// últimos `MAX_BLOQUEOS`. Redis: LPUSH + LTRIM en `cprs:comunicacion_bloqueada`. SQLite:
+    /// INSERT + poda (mismo patrón que `alertas`). El `cuando` lo timbra el broker.
+    async fn registrar_bloqueo(&self, bloqueo: &BloqueoComunicacion) -> anyhow::Result<()>;
+
+    /// Últimos intentos bloqueados, MÁS RECIENTE PRIMERO (R7/AC5): es lo que la UI pinta como
+    /// "N intentos bloqueados" — Max ve que la política actúa, no en silencio.
+    async fn bloqueos_recientes(&self) -> anyhow::Result<Vec<BloqueoComunicacion>>;
 }

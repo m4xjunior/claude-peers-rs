@@ -804,6 +804,246 @@ pub fn tarea_overrun_seg(transcurrido_seg: i64, estimado_seg: Option<i64>) -> bo
     }
 }
 
+// ===========================================================================
+// POLÍTICA DE COMUNICACIÓN — firewall peer↔peer evaluado por el broker (RFC
+// politica-comunicacion, R1/R2/R3). Aquí viven SOLO los tipos y la evaluación
+// PURA (sin I/O ni reloj); la intercepción (enviar) y la persistencia son del
+// broker/almacén. Default: todo permitido (AC6 — compat total con hoy).
+// ===========================================================================
+
+/// Id reservado del broker como remitente (`de_id`) de sus propios mensajes (asignaciones,
+/// recordatorios, reenvíos). Ya se usa así en los handlers del broker; se nombra aquí para que
+/// la exención R3 no dependa de un literal disperso.
+pub const ID_BROKER: &str = "broker";
+
+/// Id reservado del OPERADOR (Max desde la desktop/TUI) — R3 y §5.3 del RFC del lanzador.
+/// HOY la desktop/TUI aún envían con sus ids propios (ver `REMITENTES_EXENTOS`); este id queda
+/// reservado para cuando el fix de colisión de STATE.md unifique el `de` del operador. Al
+/// reservarlo YA en la exención, ese cambio futuro no tocará la política.
+pub const ID_OPERADOR: &str = "operador";
+
+/// Remitentes que la política NUNCA bloquea (R3/AC3), ni con una regla `*→*: bloquear`:
+/// el broker (alertas, forzar tarea, reenvíos) y el operador en TODAS sus identidades actuales
+/// (`peers-tui` y `peers-desktop` son los `de_id` fijos con los que Max escribe hoy desde los
+/// paneles; `operador` es el id reservado futuro). Max y el broker siempre pueden hablar.
+pub const REMITENTES_EXENTOS: &[&str] = &[ID_BROKER, ID_OPERADOR, "peers-tui", "peers-desktop"];
+
+/// ¿Es `de_id` un remitente exento de la política? (R3). Función PURA.
+#[must_use]
+pub fn remitente_exento(de_id: &str) -> bool {
+    REMITENTES_EXENTOS.contains(&de_id)
+}
+
+/// Patrón de coincidencia de una regla (R1): `*` (cualquiera) o un id de instancia exacto.
+///
+/// EN EL WIRE es una CADENA simple (`"*"` o el id), no un objeto: legible para la UI y para
+/// el JSON que edita Max. `try_from` valida en la frontera (parse, don't validate): un patrón
+/// vacío se rechaza al deserializar, así el motor nunca ve basura. El enum queda abierto a la
+/// variante futura `Grupo` (§5.4 — YAGNI en v1; una cadena `grupo:x` cabría sin romper el wire).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Patron {
+    /// Casa con cualquier id (`"*"` en el wire).
+    Cualquiera,
+    /// Casa solo con el id exacto.
+    Id(String),
+}
+
+impl Patron {
+    /// ¿El patrón casa con `id`? Función PURA.
+    #[must_use]
+    pub fn casa(&self, id: &str) -> bool {
+        match self {
+            Patron::Cualquiera => true,
+            Patron::Id(p) => p == id,
+        }
+    }
+}
+
+impl TryFrom<String> for Patron {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("patrón vacío: usa \"*\" o un id de instancia".to_string());
+        }
+        Ok(if s == "*" {
+            Patron::Cualquiera
+        } else {
+            Patron::Id(s.to_string())
+        })
+    }
+}
+
+impl From<Patron> for String {
+    fn from(p: Patron) -> Self {
+        match p {
+            Patron::Cualquiera => "*".to_string(),
+            Patron::Id(id) => id,
+        }
+    }
+}
+
+/// Acción de una regla o de la política por defecto (R1/R2). Serializa en minúsculas
+/// (`permitir`/`bloquear`), como el resto del protocolo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AccionPolitica {
+    /// El mensaje pasa. Default (AC6): sin política configurada todo se permite.
+    #[default]
+    Permitir,
+    /// El mensaje NO se encola; el emisor recibe `ok:false` con el motivo (R4).
+    Bloquear,
+}
+
+/// Una regla de comunicación `(de, para) → acción` (R1). `motivo` es lo que verá el emisor
+/// bloqueado (y la trazabilidad R7); opcional.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReglaComunicacion {
+    pub de: Patron,
+    pub para: Patron,
+    pub accion: AccionPolitica,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motivo: Option<String>,
+}
+
+/// La política de comunicación completa (R2): lista ORDENADA de reglas + acción por defecto.
+/// Se evalúa de arriba abajo y la PRIMERA regla que casa gana (como un firewall); si ninguna
+/// casa, decide `accion_por_defecto`. `Default` = sin reglas + Permitir → compat total (AC6):
+/// un JSON `{}` o la ausencia de la clave en el store deserializan a "todo permitido".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Politica {
+    #[serde(default)]
+    pub reglas: Vec<ReglaComunicacion>,
+    #[serde(default)]
+    pub accion_por_defecto: AccionPolitica,
+}
+
+/// Resultado de evaluar la política para un envío concreto. `Bloqueada` lleva el motivo YA
+/// resuelto (el de la regla, o uno derivado) listo para el `error` de `RespuestaEnviar`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionPolitica {
+    Permitida,
+    Bloqueada { motivo: String },
+}
+
+impl Politica {
+    /// Evalúa `(de_id, para_id)` contra la política (R2/R3). Función PURA, O(n reglas) sobre
+    /// memoria — pensada para la ruta caliente de `enviar` (R9: nunca toca el store).
+    ///
+    /// Orden de decisión:
+    ///   1. R3: remitente exento (operador/broker) → SIEMPRE permitida, ni se miran las reglas.
+    ///   2. Primera regla cuyo `de` Y `para` casan → su acción gana (firewall).
+    ///   3. Ninguna casa → `accion_por_defecto`.
+    #[must_use]
+    pub fn evaluar(&self, de_id: &str, para_id: &str) -> DecisionPolitica {
+        if remitente_exento(de_id) {
+            return DecisionPolitica::Permitida;
+        }
+        for regla in &self.reglas {
+            if regla.de.casa(de_id) && regla.para.casa(para_id) {
+                return match regla.accion {
+                    AccionPolitica::Permitir => DecisionPolitica::Permitida,
+                    AccionPolitica::Bloquear => DecisionPolitica::Bloqueada {
+                        motivo: regla.motivo.clone().unwrap_or_else(|| {
+                            format!(
+                                "regla {}→{}",
+                                String::from(regla.de.clone()),
+                                String::from(regla.para.clone())
+                            )
+                        }),
+                    },
+                };
+            }
+        }
+        match self.accion_por_defecto {
+            AccionPolitica::Permitir => DecisionPolitica::Permitida,
+            AccionPolitica::Bloquear => DecisionPolitica::Bloqueada {
+                motivo: "acción por defecto de la política".to_string(),
+            },
+        }
+    }
+}
+
+/// Un intento de envío bloqueado por la política, para trazabilidad (R7/AC5). El `cuando` lo
+/// timbra el broker (su reloj, como siempre). Se retiene acotado (`MAX_BLOQUEOS`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BloqueoComunicacion {
+    pub de_id: String,
+    pub para_id: String,
+    pub motivo: String,
+    pub cuando: String, // ISO 8601, timbrado por el broker
+}
+
+/// Tope de intentos bloqueados retenidos en `cprs:comunicacion_bloqueada` (R7, últimos N).
+pub const MAX_BLOQUEOS: usize = 100;
+
+// ===========================================================================
+// REGISTRO DE ACCIONES — bitácora por peer visible en la Jornada (RFC
+// registro-acciones R1/R2/R3). Aquí viven SOLO los tipos del protocolo; el
+// timbrado (`cuando`) y la persistencia son del broker (regla sagrada: el
+// tiempo lo pone el broker, nunca la IA ni la UI).
+// ===========================================================================
+
+/// Tipo de acción registrable en la bitácora (R2). Serializa en español snake_case
+/// (`crear_tarea`, `definir_resumen`…), misma decisión de nombres que `TipoAlerta`.
+///
+/// `#[non_exhaustive]`: la lista CRECERÁ (nuevas mutaciones del broker = nuevas variantes);
+/// los consumidores (TUI/desktop) deben llevar un brazo comodín para que añadir una variante
+/// no sea un breaking change (R2: extensible sin romper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TipoAccion {
+    /// Tarea creada/asignada (`/crear-tarea`, `/tarea/abrir`, `/tarea/asignar`).
+    CrearTarea,
+    /// Nota de progreso sobre una tarea (`/tarea/reportar`).
+    ReportarTarea,
+    /// Tarea cerrada (`/cerrar-tarea`, `/tarea/cerrar`).
+    CerrarTarea,
+    /// Edición de metadatos de una tarea (`/tarea/editar` — descripción/estimado).
+    EditarTarea,
+    /// Transición de estado de una tarea (`/tarea/estado`).
+    CambiarEstadoTarea,
+    /// Cambio de dueño de una tarea (`/tarea/reasignar`).
+    ReasignarTarea,
+    /// "Tócale el hombro" (`/tarea/forzar`).
+    ForzarTarea,
+    /// Cambio del resumen visible de la instancia (`/definir-resumen`).
+    DefinirResumen,
+    /// Mensaje directo a otro peer (`/enviar`).
+    EnviarMensaje,
+    /// Baja de una instancia (`/salir` — voluntaria o kick del operador).
+    Kick,
+    /// Purga de cola + outbox de un peer (`/admin/purgar`).
+    Purgar,
+    /// Descarte manual de una alerta (`/admin/alerta-resolver`).
+    ResolverAlerta,
+}
+
+/// Un evento de la bitácora de acciones (R1): QUIÉN hizo QUÉ, sobre QUÉ sujeto, CUÁNDO.
+///
+/// `quien` es el emisor real de la acción (el `instancia_id`/`de` del payload); las acciones
+/// del operador se atribuyen a su id reservado (`ID_OPERADOR`/identidades de los paneles —
+/// unificado con la política de comunicación, R5). `sujeto` = id de la tarea/peer/cola
+/// afectada. `cuando` SIEMPRE lo timbra el broker. Compat (R3/AC5): los opcionales llevan
+/// `#[serde(default)]` — un JSON viejo/parco deserializa sin romper.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccionRegistrada {
+    pub quien: String,
+    pub accion: TipoAccion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sujeto: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detalle: Option<String>,
+    pub cuando: String, // ISO 8601, timbrado por el broker
+}
+
+/// Cuántas acciones retiene la bitácora por peer (R7, las más recientes). Espejo de
+/// `RETENCION_HISTORIAL`/`RETENCION_TAREAS`; la poda corre en el barrido periódico del broker.
+pub const RETENCION_ACCIONES: usize = 500;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,5 +1523,124 @@ mod tests {
         assert!(!tarea_overrun_seg(99_999, None)); // sin estimado no se puede superar nada
         assert!(!tarea_overrun_seg(99_999, Some(0))); // estimado 0 no es positivo
         assert!(!tarea_overrun_seg(99_999, Some(-5))); // estimado negativo (basura) no dispara
+    }
+
+    // --- Política de comunicación (RFC politica-comunicacion R1/R2/R3 — AC1/AC2/AC3/AC6) ---
+
+    /// Regla de test con patrones desde cadena (misma vía que el wire real).
+    fn regla(
+        de: &str,
+        para: &str,
+        accion: AccionPolitica,
+        motivo: Option<&str>,
+    ) -> ReglaComunicacion {
+        ReglaComunicacion {
+            de: Patron::try_from(de.to_string()).expect("patrón de test válido"),
+            para: Patron::try_from(para.to_string()).expect("patrón de test válido"),
+            accion,
+            motivo: motivo.map(str::to_string),
+        }
+    }
+
+    /// AC1: con `a→b: bloquear`, a→b se bloquea CON su motivo; a→c (sin regla) pasa por el
+    /// default Permitir; la dirección contraria (b→a) no casa y también pasa.
+    #[test]
+    fn politica_bloquea_a_b_y_permite_el_resto() {
+        let p = Politica {
+            reglas: vec![regla("a", "b", AccionPolitica::Bloquear, Some("en tarea sensible"))],
+            accion_por_defecto: AccionPolitica::Permitir,
+        };
+        assert_eq!(
+            p.evaluar("a", "b"),
+            DecisionPolitica::Bloqueada { motivo: "en tarea sensible".into() }
+        );
+        assert_eq!(p.evaluar("a", "c"), DecisionPolitica::Permitida);
+        assert_eq!(p.evaluar("b", "a"), DecisionPolitica::Permitida);
+    }
+
+    /// AC2: la PRIMERA regla que casa gana (firewall) — con `[a→b permitir, *→b bloquear]`,
+    /// a→b pasa (regla 1) y cualquier otro→b se bloquea (regla 2).
+    #[test]
+    fn politica_primera_regla_que_casa_gana() {
+        let p = Politica {
+            reglas: vec![
+                regla("a", "b", AccionPolitica::Permitir, None),
+                regla("*", "b", AccionPolitica::Bloquear, None),
+            ],
+            accion_por_defecto: AccionPolitica::Permitir,
+        };
+        assert_eq!(p.evaluar("a", "b"), DecisionPolitica::Permitida);
+        assert!(matches!(p.evaluar("x", "b"), DecisionPolitica::Bloqueada { .. }));
+    }
+
+    /// AC3: el broker y el operador (todas sus identidades: reservada y las actuales de los
+    /// paneles) NUNCA se bloquean, ni con `*→*: bloquear` (modo solo-operador). Un peer normal
+    /// sí cae en esa regla.
+    #[test]
+    fn politica_exentos_nunca_se_bloquean() {
+        let p = Politica {
+            reglas: vec![regla("*", "*", AccionPolitica::Bloquear, Some("modo solo-operador"))],
+            accion_por_defecto: AccionPolitica::Permitir,
+        };
+        for exento in REMITENTES_EXENTOS {
+            assert_eq!(
+                p.evaluar(exento, "peer-x"),
+                DecisionPolitica::Permitida,
+                "'{exento}' debe estar exento (R3)"
+            );
+        }
+        assert!(matches!(p.evaluar("peer-x", "peer-y"), DecisionPolitica::Bloqueada { .. }));
+    }
+
+    /// R2: sin regla que case decide `accion_por_defecto`; con default Bloquear, lo no listado
+    /// se corta con un motivo derivado (nunca un motivo vacío).
+    #[test]
+    fn politica_default_bloquear_corta_lo_no_listado() {
+        let p = Politica {
+            reglas: vec![regla("a", "b", AccionPolitica::Permitir, None)],
+            accion_por_defecto: AccionPolitica::Bloquear,
+        };
+        assert_eq!(p.evaluar("a", "b"), DecisionPolitica::Permitida);
+        match p.evaluar("a", "c") {
+            DecisionPolitica::Bloqueada { motivo } => assert!(!motivo.is_empty()),
+            otra => panic!("esperaba bloqueo por default, fue {otra:?}"),
+        }
+    }
+
+    /// AC6 compat: `{}` (clave ausente / JSON viejo sin la sección) deserializa al default —
+    /// sin reglas + Permitir — y todo pasa. Es el contrato de retrocompatibilidad.
+    #[test]
+    fn politica_json_vacio_es_todo_permitido() {
+        let p: Politica = serde_json::from_str("{}").expect("deser {} como Politica");
+        assert!(p.reglas.is_empty());
+        assert_eq!(p.accion_por_defecto, AccionPolitica::Permitir);
+        assert_eq!(p.evaluar("a", "b"), DecisionPolitica::Permitida);
+    }
+
+    /// R1: el wire de `Patron` es una CADENA (`"*"` / id) y el vacío (o solo espacios) se
+    /// rechaza al deserializar (parse, don't validate). Roundtrip completo de una política.
+    #[test]
+    fn patron_wire_cadena_valida_y_politica_roundtrip() {
+        let p = Politica {
+            reglas: vec![
+                regla("*", "claudia", AccionPolitica::Bloquear, Some("bucle de mensajes")),
+                regla("a", "*", AccionPolitica::Permitir, None),
+            ],
+            accion_por_defecto: AccionPolitica::Bloquear,
+        };
+        let json = serde_json::to_string(&p).expect("serializar");
+        assert!(json.contains("\"de\":\"*\""), "Patron::Cualquiera debe ser '*': {json}");
+        assert!(json.contains("\"para\":\"claudia\""), "Patron::Id debe ser el id: {json}");
+        let vuelta: Politica = serde_json::from_str(&json).expect("deserializar");
+        assert_eq!(vuelta, p);
+        // Patrón vacío → error en la frontera, el motor nunca ve un Id("").
+        assert!(serde_json::from_str::<ReglaComunicacion>(
+            r#"{"de":"","para":"*","accion":"bloquear"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ReglaComunicacion>(
+            r#"{"de":"   ","para":"*","accion":"bloquear"}"#
+        )
+        .is_err());
     }
 }

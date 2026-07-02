@@ -28,13 +28,14 @@ use axum::{
 use clap::Parser;
 use github::GitHub;
 use peers_core::{
-    corregir_estimado, supera_umbral, Alerta, Almacen, ColaResumen, EstadoMensaje, EstadoTarea,
+    corregir_estimado, supera_umbral, Alerta, Almacen, BloqueoComunicacion, ColaResumen,
+    DecisionPolitica, EstadoMensaje, EstadoTarea,
     FactorEstimacion, Mensaje, PeticionAbrirTarea, PeticionAsignarTarea, PeticionCerrarTarea,
     PeticionConfirmar, PeticionDefinirResumen, PeticionEditarTarea, PeticionEnviar,
     PeticionEstadoTarea, PeticionForzarTarea, PeticionHistorial, PeticionJornada, PeticionLatido,
     PeticionListar, PeticionPurgar, PeticionReasignarTarea, PeticionRecibir, PeticionRegistrar,
     PeticionReenviar, PeticionReportarTarea, PeticionReportesTarea, PeticionResolverAlerta,
-    PeticionSalir,
+    PeticionSalir, Politica,
     RespuestaAbrirTarea, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar,
     RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, TipoAlerta,
     PUERTO_DEFECTO, VENCIMIENTO_MS,
@@ -117,6 +118,12 @@ struct EstadoApp {
     /// que es justo el comportamiento deseado: varias instancias por dir, filtrables por nombre.
     /// El broker es un único proceso, así que un Mutex async basta (no hace falta lock distribuido).
     registro_lock: tokio::sync::Mutex<()>,
+    /// Política de comunicación VIGENTE en memoria (RFC politica-comunicacion R9): se carga del
+    /// almacén UNA vez al arrancar y se refresca en caliente en `POST /admin/politica`. `enviar`
+    /// la evalúa AQUÍ, nunca contra el store (es la ruta caliente). `RwLock` porque las lecturas
+    /// (cada envío) dominan a las escrituras (ediciones de Max). Regla de oro del proyecto: el
+    /// guard JAMÁS se sostiene a través de un `.await` — se lee/escribe y se suelta.
+    politica: tokio::sync::RwLock<Politica>,
 }
 
 type Estado = Arc<EstadoApp>;
@@ -361,6 +368,22 @@ async fn listar(
     Ok(Json(r))
 }
 
+/// Evalúa la política de comunicación para un envío (RFC politica-comunicacion R2/R3/R9).
+///
+/// Lee la copia EN MEMORIA (`RwLock`) — nunca el store en la ruta caliente (R9) — y suelta el
+/// guard en la misma expresión: la evaluación es síncrona y la decisión se devuelve por valor,
+/// así el lock jamás cruza un `.await` (regla Rust del proyecto).
+///
+/// DECISIÓN R5 (documentada para que no sorprenda): la política se evalúa SOLO en `/enviar`.
+/// Los demás caminos que encolan (`tarea/forzar`, `tarea/asignar`, `tarea/reasignar`,
+/// `admin/reenviar`) son acciones del OPERADOR y escriben con `de_id = "broker"` → exentos por
+/// R3 igualmente (forzar una tarea nunca se bloquea: es Max actuando). NOTA de alcance: la
+/// exención confía en el `de_id` DECLARADO por el cliente; hacerlo no-suplantable es el fix
+/// aparte de STATE.md (registro atómico / id reservado), fuera de esta feature.
+async fn evaluar_politica(e: &Estado, de_id: &str, para_id: &str) -> DecisionPolitica {
+    e.politica.read().await.evaluar(de_id, para_id)
+}
+
 async fn enviar(
     State(e): State<Estado>,
     Json(p): Json<PeticionEnviar>,
@@ -370,6 +393,29 @@ async fn enviar(
         return Ok(Json(RespuestaEnviar {
             ok: false,
             error: Some(format!("La instancia '{}' no existe", p.para_id)),
+        }));
+    }
+    // Política de comunicación (R4): tras el chequeo de existencia y ANTES de encolar. Un
+    // bloqueo es una respuesta de NEGOCIO (`ok:false` con motivo), nunca un 500: el emisor la
+    // ve y decide. El mensaje NO se encola.
+    if let DecisionPolitica::Bloqueada { motivo } =
+        evaluar_politica(&e, &p.de_id, &p.para_id).await
+    {
+        // R7: el intento queda trazado (best-effort: si el registro falla, el bloqueo sigue
+        // siendo la respuesta — un warn, jamás un error hacia el emisor).
+        let bloqueo = BloqueoComunicacion {
+            de_id: p.de_id.clone(),
+            para_id: p.para_id.clone(),
+            motivo: motivo.clone(),
+            cuando: ahora_iso(),
+        };
+        if let Err(err) = e.almacen.registrar_bloqueo(&bloqueo).await {
+            warn!("no se pudo registrar el bloqueo de política (se responde igual): {err:#}");
+        }
+        info!("envío bloqueado por política: '{}' → '{}' ({motivo})", p.de_id, p.para_id);
+        return Ok(Json(RespuestaEnviar {
+            ok: false,
+            error: Some(format!("comunicación bloqueada por política: {motivo}")),
         }));
     }
     e.almacen
@@ -1158,6 +1204,39 @@ async fn admin_tareas(State(e): State<Estado>) -> Result<Json<Vec<Tarea>>, Error
     Ok(Json(e.almacen.tareas_todas().await?))
 }
 
+// --- Handlers de la política de comunicación (RFC politica-comunicacion R6/R7) ---
+
+/// `GET /admin/politica` → la política VIGENTE: la copia en memoria que `enviar` está usando
+/// (la verdad operativa), no una relectura del store. Bajo token; nunca en /salud.
+async fn admin_politica_leer(State(e): State<Estado>) -> Json<Politica> {
+    Json(e.politica.read().await.clone())
+}
+
+/// `POST /admin/politica` → REEMPLAZA la política completa (R6: reemplazo idempotente, no
+/// parche) y la aplica EN CALIENTE (R9/AC4: el siguiente `/enviar` ya la respeta, sin
+/// reiniciar). Los patrones llegan validados por serde (`Patron` rechaza vacío → 422 del
+/// extractor Json). Orden deliberado: persistir PRIMERO, refrescar la copia caliente DESPUÉS —
+/// si el store falla, la vigente no cambia (500 y todo queda como estaba). El write-guard se
+/// toma y suelta sin ningún `.await` dentro.
+async fn admin_politica_guardar(
+    State(e): State<Estado>,
+    Json(p): Json<Politica>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    e.almacen.politica_guardar(&p).await?;
+    let reglas = p.reglas.len();
+    *e.politica.write().await = p;
+    info!("política de comunicación actualizada en caliente: {reglas} regla(s)");
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+/// `GET /admin/politica/bloqueos` → últimos intentos bloqueados (R7/AC5), más reciente
+/// primero, acotados a MAX_BLOQUEOS por el almacén. La UI pinta el contador/lista.
+async fn admin_politica_bloqueos(
+    State(e): State<Estado>,
+) -> Result<Json<Vec<BloqueoComunicacion>>, ErrorApp> {
+    Ok(Json(e.almacen.bloqueos_recientes().await?))
+}
+
 /// Evalúa los 3 detectores del supervisor y emite/resuelve alertas (R1–R4, R7).
 ///
 /// El tiempo lo mide el broker: recibe `ahora` (su reloj) y lo compara contra los timestamps
@@ -1405,12 +1484,33 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Política de comunicación (R9): se carga UNA vez al arrancar; `POST /admin/politica` la
+    // refresca en caliente. Si el store falla la lectura, se arranca con el default Permitir y
+    // un warn (fail-open, AC6: la falta de política nunca deja al equipo sin habla).
+    let politica_inicial = match almacen.politica_leer().await {
+        Ok(p) => p,
+        Err(err) => {
+            warn!("no se pudo leer la política de comunicación (arranco con default Permitir): {err:#}");
+            Politica::default()
+        }
+    };
+    if politica_inicial.reglas.is_empty() {
+        info!("política de comunicación: sin reglas (todo permitido)");
+    } else {
+        info!(
+            "política de comunicación activa: {} regla(s), default {:?}",
+            politica_inicial.reglas.len(),
+            politica_inicial.accion_por_defecto
+        );
+    }
+
     let estado: Estado = Arc::new(EstadoApp {
         almacen,
         github,
         host: args.host.clone(),
         puerto: args.puerto,
         registro_lock: tokio::sync::Mutex::new(()),
+        politica: tokio::sync::RwLock::new(politica_inicial),
     });
 
     // Umbrales del supervisor (R8): resueltos una vez, copiados al spawn (Copy).
@@ -1506,6 +1606,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/alerta-resolver", post(admin_alerta_resolver))
         // #14/R1: vista global de todas las tareas (cuadro de mando del jefe).
         .route("/admin/tareas", get(admin_tareas))
+        // Política de comunicación (RFC politica-comunicacion R6/R7): leer/reemplazar en
+        // caliente + trazabilidad de bloqueos. Bajo token, nunca en /salud.
+        .route(
+            "/admin/politica",
+            get(admin_politica_leer).post(admin_politica_guardar),
+        )
+        .route("/admin/politica/bloqueos", get(admin_politica_bloqueos))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));
 
     let app = Router::new()
