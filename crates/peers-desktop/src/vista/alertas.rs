@@ -519,15 +519,31 @@ fn tabla(datos: &EstadoPantalla, visibles: &[(usize, &Alerta)]) -> AnyElement {
         // Columna reservada para la acción rápida de descarte (alertas-10); label vacío.
         .child(div().w(px(40.0)));
 
-    let mut cuerpo = div().v_flex().w_full().gap_1().pt_2();
+    // Cuerpo SCROLLABLE: con muchas alertas (p.ej. 50 vigentes) las filas desbordaban la ventana y
+    // no se podían ver todas. `flex_1` + `overflow_y_scroll` hace que el cuerpo ocupe el alto
+    // disponible bajo el encabezado (que queda FIJO) y las filas scrollen dentro. `min_h(0)` deja
+    // que el flex encoja el cuerpo en vez de empujar el layout (requisito para que el scroll aplique).
+    let mut cuerpo = div()
+        .id("alertas-cuerpo-scroll")
+        .v_flex()
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .gap_1()
+        .pt_2();
     // `pos_visible` es el índice en la lista VISIBLE (el que viajan las acciones); `a` la alerta.
     for (pos_visible, (_idx_real, a)) in visibles.iter().enumerate() {
         cuerpo = cuerpo.child(fila(pos_visible, a, datos.alertas_seleccion));
     }
 
+    // El contenedor de la tabla ocupa todo el alto (size_full/flex) para que el cuerpo tenga un
+    // límite contra el cual scrollear; el encabezado fijo arriba, el cuerpo scrollable debajo.
     div()
         .v_flex()
         .w_full()
+        .flex_1()
+        .min_h_0()
         .child(encabezado)
         .child(cuerpo)
         .into_any_element()
