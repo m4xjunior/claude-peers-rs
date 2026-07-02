@@ -19,7 +19,7 @@
 //! usando `tema::fila_seleccionable`, blindando la pantalla contra cambios de API del kit.
 
 use gpui::{
-    div, px, Action, IntoElement, ParentElement, SharedString,
+    div, px, Action, AnyElement, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled,
 };
 // `v_flex`/`h_flex` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
@@ -55,6 +55,55 @@ pub struct SeleccionarSesion {
 #[action(namespace = jornada, no_json)]
 pub struct SeleccionarTareaJornada {
     pub indice: usize,
+}
+
+// Acciones sin datos: alternar el dropdown del selector de peer (jornada-03) y cerrar el modal
+// de detalle de sesión (jornada-02). El modal de detalle de TAREA (jornada-01) reutiliza
+// `tareas::CerrarDetalleTarea` porque su contenido ES el modal de la pestaña Tareas (fase 1).
+gpui::actions!(jornada, [AlternarDropdownJornada, CerrarSesionJornada]);
+
+/// Abrir el pop-up de DETALLE de la tarea `indice` de la jornada (jornada-01): doble-click en la
+/// fila de tarea. Índice dentro de `jornada.tareas`. El contenido del modal se REUTILIZA de la
+/// fase 1 (`tareas::render_modal_detalle_tarea`); `AppDesktop` lo monta en `overlay_tarea_jornada`.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = jornada, no_json)]
+pub struct AbrirTareaJornada {
+    pub indice: usize,
+}
+
+/// Abrir el pop-up de DETALLE de la sesión `indice` (jornada-02): doble-click en la fila de
+/// sesión. Índice dentro de `jornada.sesiones`. Muestra id, inicio/fin absolutos, duración y las
+/// tareas cuyo `sesion_id` coincide (correlación local, sin endpoint nuevo).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = jornada, no_json)]
+pub struct AbrirSesionJornada {
+    pub indice: usize,
+}
+
+/// Elegir un peer concreto en el DROPDOWN del selector (jornada-03, parte A de la decisión de
+/// Max). `AppDesktop` cierra el dropdown, fija el foco y recarga `POST /jornada`.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = jornada, no_json)]
+pub struct ElegirPeerJornada {
+    pub id: String,
+}
+
+/// Ciclar al peer anterior/siguiente con los chevrones `‹`/`›` (jornada-03, parte B de la
+/// decisión de Max — espejo de `[`/`]` de la TUI). `delta` = -1 (anterior) o +1 (siguiente).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = jornada, no_json)]
+pub struct CiclarPeerJornada {
+    pub delta: i32,
+}
+
+/// Transicionar el estado de una tarea DESDE el detalle de jornada (jornada-04): Hecha /
+/// Cancelada / Reabrir. `AppDesktop` cierra el modal y delega en el flujo de la fase 2
+/// (`cambiar_estado_tarea` → `mutar_tarea`: validación del broker + recarga + toast).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = jornada, no_json)]
+pub struct CambiarEstadoTareaJornada {
+    pub tarea_id: String,
+    pub estado: EstadoTarea,
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -178,18 +227,20 @@ pub fn render_jornada(datos: &EstadoPantalla) -> impl IntoElement {
     // Raíz sobre fondo app (tinta + papel + Inter). `fondo_app` ya fija size_full/color/fuente.
     let base = tema::fondo_app().v_flex().gap_4().p_6();
 
-    // Sin peer enfocado: card guía (espejo del `else` de la TUI), con eyebrow + título Ethos.
+    // Sin peer enfocado: card guía CON el selector de peer (jornada-03) — la queja era justamente
+    // que había que irse a la pantalla Peers para poder ver una jornada.
     let Some(jornada) = &datos.jornada else {
         return base.child(
             tema::superficie_card()
                 .v_flex()
-                .gap_2()
+                .gap_3()
                 .p_6()
                 .child(tema::eyebrow("Fichaje"))
                 .child(tema::titulo("Jornada"))
                 .child(tema::texto_terciario(
-                    "No hay peer enfocado. Selecciona uno en la pantalla Peers.",
-                )),
+                    "No hay peer enfocado. Elige uno aquí mismo:",
+                ))
+                .child(selector_peer_jornada(datos)),
         );
     };
 
@@ -209,7 +260,16 @@ pub fn render_jornada(datos: &EstadoPantalla) -> impl IntoElement {
         .gap_3()
         .p_5()
         .child(tema::eyebrow("Fichaje"))
-        .child(tema::titulo(format!("Jornada · {id_peer}")))
+        // Título + selector de peer inline (jornada-03) en la misma fila: el selector vive donde
+        // se lee el nombre del peer, sin salir de la pestaña.
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .child(tema::titulo(format!("Jornada · {id_peer}")))
+                .child(selector_peer_jornada(datos)),
+        )
         .child(
             div()
                 .h_flex()
@@ -310,8 +370,13 @@ fn fila_sesion(idx: usize, s: &Sesion, seleccion: usize) -> impl IntoElement {
         .child(celda_dato(hora_iso(&s.inicio), 120.0))
         .child(celda_dato(fin, 120.0))
         .child(celda_dato_flex(formatear_duracion(s.duracion_seg)))
-        .on_click(move |_evento, window, cx| {
-            window.dispatch_action(Box::new(SeleccionarSesion { indice: idx }), cx);
+        .on_click(move |evento, window, cx| {
+            // Doble-click abre el detalle de la sesión (jornada-02); click simple selecciona.
+            if evento.click_count() >= 2 {
+                window.dispatch_action(Box::new(AbrirSesionJornada { indice: idx }), cx);
+            } else {
+                window.dispatch_action(Box::new(SeleccionarSesion { indice: idx }), cx);
+            }
         })
 }
 
@@ -327,9 +392,346 @@ fn fila_tarea(idx: usize, t: &Tarea, seleccion: usize) -> impl IntoElement {
                 .w(px(120.0))
                 .child(tema::chip_estado(etiqueta_estado(t.estado), color_estado(t.estado))),
         )
-        .on_click(move |_evento, window, cx| {
-            window.dispatch_action(Box::new(SeleccionarTareaJornada { indice: idx }), cx);
+        .on_click(move |evento, window, cx| {
+            // Doble-click abre el detalle de la tarea (jornada-01, modal reutilizado de la
+            // fase 1); click simple selecciona.
+            if evento.click_count() >= 2 {
+                window.dispatch_action(Box::new(AbrirTareaJornada { indice: idx }), cx);
+            } else {
+                window.dispatch_action(Box::new(SeleccionarTareaJornada { indice: idx }), cx);
+            }
         })
+}
+
+// -------------------------------------------------------------------------------------------------
+// SELECTOR DE PEER (jornada-03) — DECISIÓN de Max (2026-07-02): variantes A+B COMBINADAS en un
+// solo control  ‹ [ peer ▾ ] › . El dropdown dorado central (A) salta a cualquier peer vivo; los
+// chevrones (B) ciclan anterior/siguiente, espejo de `[`/`]` de la TUI. La lista desplegada se
+// pinta INLINE bajo el control (no flotante): la vista es pura y así se evita pelear con el orden
+// de pintado del árbol; el estado abierto/cerrado vive en `EstadoPantalla.jornada_dropdown`.
+// -------------------------------------------------------------------------------------------------
+
+/// El control combinado ‹ [peer ▾] › + (si está abierto) la lista de peers vivos debajo.
+fn selector_peer_jornada(datos: &EstadoPantalla) -> AnyElement {
+    let etiqueta = datos
+        .jornada_peer
+        .clone()
+        .unwrap_or_else(|| "elegir peer…".to_string());
+
+    // Pill central (variante A): borde línea radio 999, texto papel, chevron ▾ en brasa. Click →
+    // alterna el desplegable.
+    let pill = div()
+        .id("jornada-peer-dropdown")
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .rounded(tema::radio(tema::RADIO_PILL))
+        .border_1()
+        .border_color(tema::LINEA)
+        .cursor_pointer()
+        .hover(|s| s.bg(tema::TINTA2).border_color(tema::BRASA))
+        .child(
+            div()
+                .font_family(tema::FUENTE_MONO)
+                .text_sm()
+                .text_color(tema::PAPEL)
+                .child(SharedString::from(etiqueta)),
+        )
+        .child(div().text_color(tema::BRASA).text_sm().child(SharedString::from("▾")))
+        .on_click(|_e, window, cx| {
+            window.dispatch_action(Box::new(AlternarDropdownJornada), cx);
+        });
+
+    let fila = div()
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .child(chevron_peer("jornada-peer-prev", "‹", -1))
+        .child(pill)
+        .child(chevron_peer("jornada-peer-next", "›", 1));
+
+    let mut raiz = div().v_flex().gap_2().items_end().child(fila);
+
+    // Desplegable (abierto): lista de peers vivos, el actual resaltado. Click → salta y recarga.
+    if datos.jornada_dropdown {
+        let actual = datos.jornada_peer.as_deref();
+        let mut lista = div()
+            .id("jornada-peer-lista")
+            .v_flex()
+            .gap_1()
+            .p_2()
+            .max_h(px(180.0))
+            .overflow_y_scroll()
+            .rounded(tema::radio(tema::RADIO_CONTROL))
+            .bg(tema::TINTA2)
+            .border_1()
+            .border_color(tema::LINEA);
+        if datos.instancias.is_empty() {
+            lista = lista.child(tema::texto_terciario("No hay peers vivos."));
+        } else {
+            for inst in &datos.instancias {
+                let activo = actual == Some(inst.id.as_str());
+                let id = inst.id.clone();
+                lista = lista.child(
+                    tema::fila_seleccionable(
+                        SharedString::from(format!("jornada-peer-op-{}", inst.id)),
+                        activo,
+                    )
+                    .child(
+                        div()
+                            .font_family(tema::FUENTE_MONO)
+                            .text_sm()
+                            .text_color(tema::PAPEL)
+                            .child(SharedString::from(inst.id.clone())),
+                    )
+                    .on_click(move |_e, window, cx| {
+                        window.dispatch_action(Box::new(ElegirPeerJornada { id: id.clone() }), cx);
+                    }),
+                );
+            }
+        }
+        raiz = raiz.child(lista);
+    }
+
+    raiz.into_any_element()
+}
+
+/// Chevrón de ciclado (variante B de la decisión): botón ghost cuadrado con el glifo en brasa.
+/// `delta` = -1 (anterior) / +1 (siguiente). Espejo de `[`/`]` de la TUI.
+fn chevron_peer(id: &'static str, glifo: &'static str, delta: i32) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded(tema::radio(tema::RADIO_CONTROL))
+        .text_color(tema::BRASA)
+        .cursor_pointer()
+        .hover(|s| s.bg(tema::TINTA2))
+        .child(SharedString::from(glifo))
+        .on_click(move |_e, window, cx| {
+            window.dispatch_action(Box::new(CiclarPeerJornada { delta }), cx);
+        })
+}
+
+// -------------------------------------------------------------------------------------------------
+// MODALES (jornada-01/02/04) — contenido puro que `AppDesktop` monta como overlays. El detalle de
+// TAREA reutiliza ÍNTEGRO el modal de la fase 1 (`tareas::render_modal_detalle_tarea`); aquí sólo
+// se añade la card de TRANSICIONES (jornada-04) que lo acompaña en el mismo overlay.
+// -------------------------------------------------------------------------------------------------
+
+/// Card de transiciones de estado (jornada-04) que acompaña al modal de detalle de tarea en el
+/// overlay de jornada: terminal → Reabrir; viva → Hecha (primario) + Cancelar (rojo). Las
+/// destructivas (Cancelar/Reabrir) pasan por la confirmación de la fase 2 (`AppDesktop` decide).
+pub fn render_acciones_tarea_jornada(t: &Tarea) -> AnyElement {
+    let mut botones = div().h_flex().flex_wrap().gap_3();
+
+    if t.estado.es_terminal() {
+        botones = botones.child(boton_transicion(t, "Reabrir", EstadoTarea::Abierta, false));
+    } else {
+        botones = botones
+            .child(boton_transicion(t, "Hecha", EstadoTarea::Hecha, true))
+            .child(boton_transicion(t, "Cancelar", EstadoTarea::Cancelada, false));
+    }
+
+    div()
+        .v_flex()
+        .w(px(560.0))
+        .gap_2()
+        .p_4()
+        .rounded(px(tema::RADIO_CARD))
+        .bg(tema::TINTA2)
+        .border_1()
+        .border_color(tema::LINEA)
+        .child(tema::eyebrow("transiciones"))
+        .child(botones)
+        .into_any_element()
+}
+
+/// Botón de transición del detalle de jornada. `primario` = relleno brasa (Hecha); el resto va
+/// secundario. Despacha `CambiarEstadoTareaJornada`; el broker valida con `transicion_valida`.
+fn boton_transicion(
+    t: &Tarea,
+    label: &'static str,
+    estado: EstadoTarea,
+    primario: bool,
+) -> AnyElement {
+    let tarea_id = t.id.clone();
+    let id = SharedString::from(format!("jornada-transicion-{label}-{}", t.id));
+    let al_click = move |_e: &gpui::ClickEvent, window: &mut gpui::Window, cx: &mut gpui::App| {
+        window.dispatch_action(
+            Box::new(CambiarEstadoTareaJornada {
+                tarea_id: tarea_id.clone(),
+                estado,
+            }),
+            cx,
+        );
+    };
+    if primario {
+        tema::boton_primario(id, label).on_click(al_click).into_any_element()
+    } else {
+        tema::boton_secundario(id, label).on_click(al_click).into_any_element()
+    }
+}
+
+/// Contenido del pop-up "Detalle de sesión" (jornada-02): id de sesión, inicio/fin ABSOLUTOS (ISO
+/// completo, en mono — aquí sí cabe, la tabla sólo muestra la hora), duración timbrada por el
+/// broker, chip abierta/cerrada, y las TAREAS cuyo `sesion_id` coincide (correlación local sobre
+/// los datos de `/jornada`, sin endpoint nuevo).
+pub fn render_modal_sesion(s: &Sesion, tareas: &[Tarea]) -> AnyElement {
+    let abierta = s.fin.as_deref().map(str::is_empty).unwrap_or(true);
+    let chip = if abierta {
+        tema::chip_estado("● abierta", gpui::rgb(0x22C55E))
+    } else {
+        tema::chip_estado("○ cerrada", tema::HUMO)
+    };
+
+    // Tareas contenidas en esta sesión (correlación por `sesion_id`).
+    let contenidas: Vec<&Tarea> = tareas.iter().filter(|t| t.sesion_id == s.id).collect();
+
+    let mut lista = div().v_flex().gap_1().max_h(px(180.0)).overflow_hidden();
+    if contenidas.is_empty() {
+        lista = lista.child(tema::texto_terciario("(ninguna tarea en esta sesión)"));
+    } else {
+        let mut scroll = div()
+            .id("modal-sesion-tareas-scroll")
+            .v_flex()
+            .gap_1()
+            .max_h(px(180.0))
+            .overflow_y_scroll();
+        for t in contenidas {
+            scroll = scroll.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_color(tema::PAPEL)
+                            .child(SharedString::from(recortar_texto(&t.descripcion, 56))),
+                    )
+                    .child(
+                        div()
+                            .font_family(tema::FUENTE_MONO)
+                            .text_xs()
+                            .text_color(tema::HUMO)
+                            .child(SharedString::from(format!(
+                                "{} / {}",
+                                formatear_duracion(t.estimado_seg),
+                                formatear_duracion(t.duracion_seg)
+                            ))),
+                    )
+                    .child(tema::chip_estado(etiqueta_estado(t.estado), color_estado(t.estado))),
+            );
+        }
+        lista = lista.child(scroll);
+    }
+
+    div()
+        .v_flex()
+        .w(px(560.0))
+        .gap_3()
+        .p_5()
+        .rounded(px(tema::RADIO_CARD))
+        .bg(tema::TINTA2)
+        .border_1()
+        .border_color(tema::LINEA)
+        // Cabecera: chip + título display + ✕.
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_3()
+                        .child(chip)
+                        .child(tema::titulo("Detalle de sesión").text_size(px(18.0))),
+                )
+                .child(
+                    div()
+                        .id("modal-sesion-cerrar-x")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(tema::radio(tema::RADIO_CONTROL))
+                        .text_color(tema::HUMO)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(tema::TINTA).text_color(tema::PAPEL))
+                        .child(SharedString::from("✕"))
+                        .on_click(|_e, window, cx| {
+                            window.dispatch_action(Box::new(CerrarSesionJornada), cx);
+                        }),
+                ),
+        )
+        .child(campo_mono_sesion("id sesión", s.id.clone()))
+        .child(campo_mono_sesion("inicio", s.inicio.clone()))
+        .child(campo_mono_sesion(
+            "fin",
+            match &s.fin {
+                Some(f) if !f.is_empty() => f.clone(),
+                _ => "(abierta)".to_string(),
+            },
+        ))
+        .child(campo_mono_sesion("duración", formatear_duracion(s.duracion_seg)))
+        .child(
+            div()
+                .v_flex()
+                .gap_1()
+                .child(tema::eyebrow(format!(
+                    "tareas de esta sesión ({})",
+                    tareas.iter().filter(|t| t.sesion_id == s.id).count()
+                )))
+                .child(lista),
+        )
+        .child(
+            div().h_flex().gap_3().pt_2().child(
+                tema::boton_secundario("modal-sesion-cerrar", "Cerrar").on_click(
+                    |_e, window, cx| {
+                        window.dispatch_action(Box::new(CerrarSesionJornada), cx);
+                    },
+                ),
+            ),
+        )
+        .into_any_element()
+}
+
+/// Fila "eyebrow humo + valor mono papel" del detalle de sesión (ids/timestamps/duración).
+fn campo_mono_sesion(etiqueta: impl Into<SharedString>, valor: String) -> impl IntoElement {
+    div()
+        .h_flex()
+        .items_baseline()
+        .gap_3()
+        .child(div().w(px(110.0)).flex_shrink_0().child(tema::eyebrow(etiqueta)))
+        .child(
+            div()
+                .font_family(tema::FUENTE_MONO)
+                .text_color(tema::PAPEL)
+                .child(SharedString::from(valor)),
+        )
+}
+
+/// Recorta a `max` caracteres con elipsis, respetando fronteras de carácter. Copia local del
+/// helper que usan las demás vistas (6 líneas; más barato que exponerlo cruzado entre vistas).
+fn recortar_texto(texto: &str, max: usize) -> String {
+    if texto.chars().count() <= max {
+        return texto.to_string();
+    }
+    let recortado: String = texto.chars().take(max.saturating_sub(1)).collect();
+    format!("{recortado}…")
 }
 
 #[cfg(test)]

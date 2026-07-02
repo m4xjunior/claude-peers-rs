@@ -262,6 +262,16 @@ pub struct EstadoPantalla {
     pub jornada_ses_sel: usize,
     /// Índice de la tarea seleccionada en la tabla de tareas de Jornada. Sólo UI.
     pub jornada_tar_sel: usize,
+    /// Si `Some(i)`, está abierto el pop-up de detalle (jornada-01) de la tarea `jornada.tareas[i]`.
+    /// El contenido REUTILIZA el modal de la fase 1 (`tareas::render_modal_detalle_tarea`) más la
+    /// card de transiciones (jornada-04). Se cierra si queda fuera de rango al recargar.
+    pub jornada_tarea_detalle: Option<usize>,
+    /// Si `Some(i)`, está abierto el pop-up de detalle de sesión (jornada-02) de
+    /// `jornada.sesiones[i]`, con las tareas correlacionadas por `sesion_id`.
+    pub jornada_sesion_detalle: Option<usize>,
+    /// Si `true`, el DROPDOWN del selector de peer (jornada-03, decisión A+B de Max) está
+    /// desplegado mostrando los peers vivos.
+    pub jornada_dropdown: bool,
 
     // --- Pantalla Config (Fase 2) ---
     /// Panel de configuración con estado propio (Inputs editables + feedback de guardado). Es una
@@ -599,6 +609,17 @@ impl AppDesktop {
                     }
                     if esta.datos.jornada_tar_sel >= j.tareas.len() {
                         esta.datos.jornada_tar_sel = 0;
+                    }
+                    // Detalles abiertos fuera de rango → cerrar (la lista pudo encoger).
+                    if let Some(i) = esta.datos.jornada_tarea_detalle {
+                        if i >= j.tareas.len() {
+                            esta.datos.jornada_tarea_detalle = None;
+                        }
+                    }
+                    if let Some(i) = esta.datos.jornada_sesion_detalle {
+                        if i >= j.sesiones.len() {
+                            esta.datos.jornada_sesion_detalle = None;
+                        }
                     }
                     esta.datos.jornada = Some(j);
                 }
@@ -1342,10 +1363,13 @@ impl AppDesktop {
     }
 
     /// Cierra el pop-up de detalle de tarea (deja la selección donde estaba). Destino de
-    /// `CerrarDetalleTarea` (✕, botón Cerrar, clic en el backdrop) y de `Esc` en la pantalla Tareas.
+    /// `CerrarDetalleTarea` (✕, botón Cerrar, clic en el backdrop) y de `Esc` en la pantalla
+    /// Tareas. También cierra el detalle de tarea de JORNADA (jornada-01): ese overlay reutiliza
+    /// el mismo modal de la fase 1, así que sus ✕/Cerrar despachan esta misma acción.
     fn cerrar_detalle_tarea(&mut self, cx: &mut Context<Self>) {
-        if self.datos.tarea_detalle.is_some() {
+        if self.datos.tarea_detalle.is_some() || self.datos.jornada_tarea_detalle.is_some() {
             self.datos.tarea_detalle = None;
+            self.datos.jornada_tarea_detalle = None;
             cx.notify();
         }
     }
@@ -1964,6 +1988,133 @@ impl AppDesktop {
         cx.notify();
     }
 
+    /// Abre el pop-up de detalle (jornada-01) de la tarea `indice` de la jornada. Además refresca
+    /// la caché GLOBAL de tareas: las acciones colgadas del modal reutilizado (Editar/Ampliar,
+    /// fase 2) buscan la tarea por id en `datos.tareas`, y en esta pantalla esa caché no se
+    /// recarga sola.
+    fn abrir_tarea_jornada(&mut self, indice: usize, cx: &mut Context<Self>) {
+        let total = self.datos.jornada.as_ref().map(|j| j.tareas.len()).unwrap_or(0);
+        if indice >= total {
+            return;
+        }
+        self.datos.jornada_tar_sel = indice;
+        self.datos.jornada_tarea_detalle = Some(indice);
+        self.cargar_tareas(cx);
+        cx.notify();
+    }
+
+    /// Abre el pop-up de detalle de sesión (jornada-02) de `jornada.sesiones[indice]`.
+    fn abrir_sesion_jornada(&mut self, indice: usize, cx: &mut Context<Self>) {
+        let total = self.datos.jornada.as_ref().map(|j| j.sesiones.len()).unwrap_or(0);
+        if indice >= total {
+            return;
+        }
+        self.datos.jornada_ses_sel = indice;
+        self.datos.jornada_sesion_detalle = Some(indice);
+        cx.notify();
+    }
+
+    /// Cierra el pop-up de detalle de sesión (✕, Cerrar, clic fuera, Esc).
+    fn cerrar_sesion_jornada(&mut self, cx: &mut Context<Self>) {
+        if self.datos.jornada_sesion_detalle.is_some() {
+            self.datos.jornada_sesion_detalle = None;
+            cx.notify();
+        }
+    }
+
+    /// Alterna el DROPDOWN del selector de peer (jornada-03). Al abrirlo refresca el roster para
+    /// que la lista de peers vivos no esté rancia (en esta pantalla ya se recarga con la jornada,
+    /// pero el desplegable debe reflejar el ahora).
+    fn alternar_dropdown_jornada(&mut self, cx: &mut Context<Self>) {
+        self.datos.jornada_dropdown = !self.datos.jornada_dropdown;
+        if self.datos.jornada_dropdown {
+            self.recargar_roster(cx);
+        }
+        cx.notify();
+    }
+
+    /// Salta al peer `id` desde el dropdown (jornada-03 A): cierra el desplegable, fija el foco y
+    /// recarga la jornada (reutiliza `ver_jornada_peer`, que resetea selecciones y fuerza fetch).
+    fn elegir_peer_jornada(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.jornada_dropdown = false;
+        self.datos.jornada_tarea_detalle = None;
+        self.datos.jornada_sesion_detalle = None;
+        self.ver_jornada_peer(id, cx);
+    }
+
+    /// Cicla al peer anterior/siguiente con los chevrones ‹ › (jornada-03 B, espejo de `[`/`]` de
+    /// la TUI). Rota circularmente sobre el roster; sin foco actual, `›` va al primero y `‹` al
+    /// último. Sin peers vivos no hace nada.
+    fn ciclar_peer_jornada(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let n = self.datos.instancias.len();
+        if n == 0 {
+            return;
+        }
+        let pos = self
+            .datos
+            .jornada_peer
+            .as_deref()
+            .and_then(|id| self.datos.instancias.iter().position(|i| i.id == id));
+        let idx = match pos {
+            Some(p) => ((p as i64 + delta as i64).rem_euclid(n as i64)) as usize,
+            None if delta >= 0 => 0,
+            None => n - 1,
+        };
+        let Some(inst) = self.datos.instancias.get(idx) else {
+            return;
+        };
+        let id = inst.id.clone();
+        self.datos.jornada_dropdown = false;
+        self.datos.jornada_tarea_detalle = None;
+        self.datos.jornada_sesion_detalle = None;
+        self.ver_jornada_peer(id, cx);
+    }
+
+    /// Transición de estado desde el detalle de jornada (jornada-04). Las DESTRUCTIVAS
+    /// (Cancelar/Reabrir) pasan por la confirmación de la fase 2 (`FormTareas::Confirmar`, con la
+    /// descripción sacada de la PROPIA jornada para no depender de la caché global); Hecha va
+    /// directa vía `cambiar_estado_tarea` (fase 2: `mutar_tarea` + validación del broker + toast).
+    /// En ambos casos se cierra el detalle y se re-pide la jornada para reflejar el cambio.
+    fn cambiar_estado_tarea_jornada(
+        &mut self,
+        tarea_id: String,
+        estado: peers_core::EstadoTarea,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use peers_core::EstadoTarea;
+        self.datos.jornada_tarea_detalle = None;
+        match estado {
+            EstadoTarea::Cancelada | EstadoTarea::Abierta => {
+                let descripcion = self
+                    .datos
+                    .jornada
+                    .as_ref()
+                    .and_then(|j| j.tareas.iter().find(|t| t.id == tarea_id))
+                    .map(|t| t.descripcion.clone())
+                    .unwrap_or_default();
+                self.abrir_form_tareas(
+                    crate::vista::tareas::FormTareas::Confirmar {
+                        tarea_id,
+                        estado,
+                        descripcion,
+                    },
+                    "",
+                    "",
+                    window,
+                    cx,
+                );
+            }
+            _ => {
+                self.cambiar_estado_tarea(tarea_id, estado, cx);
+                // La tabla de la jornada no se recarga con `admin_tareas`: re-pide `/jornada` ya
+                // (el timer de 2s también lo haría, pero el feedback inmediato es mejor).
+                self.cargar_jornada(cx);
+            }
+        }
+        cx.notify();
+    }
+
     // --- Navegación por teclado (espejo de la TUI) ---
     // Se maneja en el `on_key_down` del contenedor raíz (que rastrea el foco). Documentación del
     // mapa completo en el comentario de `manejar_tecla`.
@@ -2260,6 +2411,17 @@ impl AppDesktop {
                     self.deseleccionar_peer(cx);
                 }
             }
+            Pantalla::Jornada => {
+                // Prioridad: dropdown > detalle de tarea > detalle de sesión.
+                if self.datos.jornada_dropdown {
+                    self.datos.jornada_dropdown = false;
+                    cx.notify();
+                } else if self.datos.jornada_tarea_detalle.is_some() {
+                    self.cerrar_detalle_tarea(cx);
+                } else {
+                    self.cerrar_sesion_jornada(cx);
+                }
+            }
             _ => {}
         }
     }
@@ -2436,6 +2598,69 @@ impl AppDesktop {
                 .bg(gpui::rgba(0x0A_08_06_CC))
                 .on_click(|_e, window, cx| {
                     window.dispatch_action(Box::new(crate::vista::peers::CerrarDetallePeer), cx);
+                })
+                .child(div().occlude().child(contenido))
+                .into_any_element(),
+        )
+    }
+
+    /// Overlay del detalle de TAREA de la jornada (jornada-01/04): REUTILIZA íntegro el modal de
+    /// la fase 1 (`tareas::render_modal_detalle_tarea`) y le añade debajo, en la misma columna, la
+    /// card de TRANSICIONES (jornada-04). Cerrar despacha `tareas::CerrarDetalleTarea` (la misma
+    /// acción que usan el ✕/Cerrar del modal reutilizado).
+    fn overlay_tarea_jornada(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let idx = self.datos.jornada_tarea_detalle?;
+        let tarea = self.datos.jornada.as_ref()?.tareas.get(idx)?;
+        let detalle = crate::vista::tareas::render_modal_detalle_tarea(tarea);
+        let acciones = crate::vista::jornada::render_acciones_tarea_jornada(tarea);
+
+        Some(
+            div()
+                .id("overlay-tarea-jornada")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(Box::new(crate::vista::tareas::CerrarDetalleTarea), cx);
+                })
+                .child(
+                    div()
+                        .occlude()
+                        .v_flex()
+                        .gap_3()
+                        .child(detalle)
+                        .child(acciones),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Overlay del detalle de SESIÓN (jornada-02), con las tareas correlacionadas por `sesion_id`.
+    fn overlay_sesion_jornada(&self) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let idx = self.datos.jornada_sesion_detalle?;
+        let jornada = self.datos.jornada.as_ref()?;
+        let sesion = jornada.sesiones.get(idx)?;
+        let contenido = crate::vista::jornada::render_modal_sesion(sesion, &jornada.tareas);
+
+        Some(
+            div()
+                .id("overlay-sesion-jornada")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0A_08_06_CC))
+                .on_click(|_e, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::vista::jornada::CerrarSesionJornada),
+                        cx,
+                    );
                 })
                 .child(div().occlude().child(contenido))
                 .into_any_element(),
@@ -2641,7 +2866,11 @@ impl Render for AppDesktop {
         };
         use crate::vista::broker::RecargarBroker;
         use crate::vista::config::RecargarConfig;
-        use crate::vista::jornada::{SeleccionarSesion, SeleccionarTareaJornada};
+        use crate::vista::jornada::{
+            AbrirSesionJornada, AbrirTareaJornada, AlternarDropdownJornada,
+            CambiarEstadoTareaJornada, CerrarSesionJornada, CiclarPeerJornada, ElegirPeerJornada,
+            SeleccionarSesion, SeleccionarTareaJornada,
+        };
         use crate::vista::peers::{
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
             DeseleccionarPeer, EnviarMensajePeer, PedirKickPeer, SeleccionarPeer, VerJornadaPeer,
@@ -2836,6 +3065,28 @@ impl Render for AppDesktop {
             .on_action(cx.listener(|esta, a: &SeleccionarTareaJornada, _window, cx| {
                 esta.seleccionar_tarea_jornada(a.indice, cx);
             }))
+            // --- Jornada: detalle de tarea/sesión + selector de peer A+B (fase 5) ---
+            .on_action(cx.listener(|esta, a: &AbrirTareaJornada, _window, cx| {
+                esta.abrir_tarea_jornada(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AbrirSesionJornada, _window, cx| {
+                esta.abrir_sesion_jornada(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarSesionJornada, _window, cx| {
+                esta.cerrar_sesion_jornada(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &AlternarDropdownJornada, _window, cx| {
+                esta.alternar_dropdown_jornada(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ElegirPeerJornada, _window, cx| {
+                esta.elegir_peer_jornada(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, a: &CiclarPeerJornada, _window, cx| {
+                esta.ciclar_peer_jornada(a.delta, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &CambiarEstadoTareaJornada, window, cx| {
+                esta.cambiar_estado_tarea_jornada(a.tarea_id.clone(), a.estado, window, cx);
+            }))
             // --- Broker / Acceso (recarga manual) ---
             .on_action(cx.listener(|esta, _a: &RecargarBroker, _window, cx| {
                 esta.cargar_broker(cx);
@@ -2868,6 +3119,9 @@ impl Render for AppDesktop {
             .children(self.overlay_peer())
             // Overlay del modal de timeline de mensaje (trazabilidad-01).
             .children(self.overlay_mensaje())
+            // Overlays de la jornada: detalle de tarea (reutiliza el modal de fase 1) y de sesión.
+            .children(self.overlay_tarea_jornada())
+            .children(self.overlay_sesion_jornada())
             // Overlays de formularios (CRUD de tareas y composer/kick de peers), por encima.
             .children(self.overlay_form_tareas())
             .children(self.overlay_form_peers())
