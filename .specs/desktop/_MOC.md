@@ -26,6 +26,13 @@
 
 **Total: 164 features** · 44 alta · 74 media · 40 baja.
 
+## 🆕 RFCs nuevas (fuera del recuento de 164 — features grandes, 2026-07-02)
+
+| Pestaña / Área | RFC | Foco |
+|----------------|-----|------|
+| Lanzador | [[lanzador/RFC-lanzador\|RFC Lanzador]] | file picker de directorio, system prompt, tareas, destino local/SSH/tmux, **terminal PTY embebido**, **chat privado** no renderizado en el TUI |
+| Política comunicación | [[politica-comunicacion/RFC-politica-comunicacion\|RFC Política de comunicación]] | bloquear quién habla con quién (firewall peer↔peer en el broker); RabbitMQ descartado |
+
 ## 🥇 Top-10 MVP (recuperar el control cuanto antes)
 
 Del [[INDICE-RFCS|índice]] — las de prioridad ALTA que desbloquean el uso real:

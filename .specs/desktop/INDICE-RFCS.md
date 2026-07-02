@@ -27,6 +27,17 @@
 | Config | 18 | `.specs/desktop/config/RFC-config.md` | 3 alta · 10 media · 5 baja |
 | **Total** | **164** | 9 RFCs | **44 alta · 74 media · 40 baja** |
 
+### RFCs nuevas (features grandes, fuera del recuento de 164 — 2026-07-02)
+
+| Área | Ruta del RFC | Naturaleza |
+|------|--------------|------------|
+| Lanzador | `.specs/desktop/lanzador/RFC-lanzador.md` | pestaña nueva: elegir directorio (file picker nativo GPUI) + system prompt + tareas + destino local/SSH/tmux + **terminal PTY embebido** (reusa crates `terminal`/`terminal_view` de Zed) + **chat privado** (tools MCP pull, no `<channel>`) |
+| Política de comunicación | `.specs/desktop/politica-comunicacion/RFC-politica-comunicacion.md` | firewall peer↔peer evaluado en el broker (`enviar()` main.rs:352); **ámbito mixto** (control en desktop, motor en broker); RabbitMQ descartado |
+
+> Estas dos NO están desglosadas en features `<pestaña>-NN` como las 9 originales: son propuestas
+> arquitectónicas grandes con requisitos R1..Rn y criterios de aceptación propios. Al aprobarlas,
+> pueden partirse en features numeradas o en fases (p.ej. Lanzador Fase 1 sin PTY / Fase 2 con PTY).
+
 ---
 
 ## 2. MVP de control — features de prioridad ALTA (todas las pestañas)

@@ -53,7 +53,7 @@ Es decir: **es casi idéntica a la TUI (solo lectura)**. Toda la interacción re
 
 **Modelo de auth actual (verificado):** `token_autorizado(configurado, recibido)` — sin token en el broker → todo autorizado (compat local); con token → header `X-Peers-Token` debe coincidir exacto; si no, `401 "token inválido o ausente"`. El token del broker se fija por `--token`/`env CLAUDE_PEERS_TOKEN` **al arrancar el proceso** (no hay endpoint para rotarlo en caliente). El broker emite un `warn!` si escucha en un host no-loopback **sin** token.
 
-**Consecuencia de diseño (importante para las features):** el broker **NO** expone hoy endpoints de: rotar token, gestionar allowlist de IPs, probar conexión dedicado, ni auditar auth. Las features marcadas *(requiere endpoint nuevo)* proponen añadirlos; las demás se construyen con lo que YA existe (`/salud`, `/admin/info`) + estado local en la app (`config.toml`, ampliado).
+**Consecuencia de diseño (importante para las features):** el broker **NO** expone hoy endpoints de: rotar token, gestionar allowlist de IPs, probar conexión dedicado, ni auditar auth. Las features marcadas *(requiere endpoint nuevo)* quiero que se añada; las demás se construyen con lo que YA existe (`/salud`, `/admin/info`) + estado local en la app (`config.toml`, ampliado).
 
 ### Design System Ethos (tokens usados en las variantes)
 

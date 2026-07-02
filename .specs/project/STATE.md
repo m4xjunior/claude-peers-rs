@@ -33,3 +33,49 @@ por Max logrado: varias instancias por directorio, filtrables por nombre (ejempl
   "ir al sujeto" de un ghosteo abra el MENSAJE concreto (su timeline), no el historial de un peer.
 - La trazabilidad rica de mensajes (timeline enviado→entregado→leído→procesado, abrir mensaje,
   reenviar) es la pestaña Trazabilidad — pendiente, fase futura de Fable.
+
+## Sesión 2026-07-02 (noche) — Jefim s004 (dev) + Julio s003 (coord/QA)
+
+### RESUELTO — P0 crash SIGABRT de peers-desktop al crear tareas
+Causa raíz (crash reports .ips simbolizados, NO adivinada): el binario `target/release/peers-desktop`
+que corría Max se compiló a las 16:27, ANTERIOR al fix anti-SIGABRT ee96677 (17:45) — contenía el
+`.await` directo de reqwest en `cx.spawn` (tokio `Handle::current` → "no reactor running" → abort).
+El código en HEAD ya estaba sano (grep: cero awaits de red fuera de `bloquear_en`). Fix = recompilar
+release (21:56, UUID 099DF34F) y relanzar. Lección operativa reforzada: **tras cada fix, recompilar
+TAMBIÉN el release que Max ejecuta** — el binario en disco no se actualiza solo.
+
+### IMPLEMENTADO — Política de comunicación (RFC politica-comunicacion, Fase 1: motor+endpoints)
+- peers-core: `Patron`/`AccionPolitica`/`ReglaComunicacion`/`Politica::evaluar` (primera regla gana,
+  default Permitir) + `BloqueoComunicacion` + 6 tests. **Id del operador UNIFICADO** (§5.3 política +
+  lanzador + colisión): `ID_BROKER`, `ID_OPERADOR` (reservado) y `REMITENTES_EXENTOS`
+  (broker/operador/peers-tui/peers-desktop) con `remitente_exento()` — R3: jamás se bloquean.
+- Trait `Almacen`: politica_leer/politica_guardar/registrar_bloqueo/bloqueos_recientes en AMBOS
+  backends (Redis `cprs:politica_comunicacion` + `cprs:comunicacion_bloqueada` LPUSH/LTRIM 100;
+  SQLite tablas espejo con poda) + 2 tests sqlite.
+- Broker: `RwLock<Politica>` en memoria (R9, guard nunca cruza `.await`), carga fail-open al arrancar,
+  gancho en `enviar()` (tras existencia, antes de encolar → `ok:false` "comunicación bloqueada por
+  política: <motivo>", NO encola, NO 500), endpoints `GET/POST /admin/politica` (reemplazo completo,
+  caliente) y `GET /admin/politica/bloqueos`. R5: forzar/asignar/reasignar/reenviar van con
+  de="broker" → exentos. Limitación anotada: la exención confía en el `de_id` declarado
+  (anti-spoofing = fix de colisión pendiente arriba).
+- Verificación: build Redis+sqlite+workspace ✅, 89 tests ✅, E2E broker aislado :7898 AC1-AC6 ✅.
+- Falta: UI (R10-R12 tabla/matriz desktop + TUI) y despliegue al broker de producción (autorizado
+  por Max 2026-07-02 ~22:19, en curso).
+
+### IMPLEMENTADO — Desktop: tema Ethos en el kit + crear tarea desde Jornada (pendiente QA visual)
+- Contraste (bug Max "inputs ilegibles"): `tema::aplicar_tema_kit()` registra la paleta Ethos como
+  Theme GLOBAL de gpui-component (base Dark + tokens pisados) en `main.rs` tras `init` — los Input/
+  Select del kit pintaban su fondo BLANCO por el Theme default claro; envolver en divs NO bastaba.
+- Jornada: botón "Crear tarea" en la cabecera reutilizando la Action `AbrirFormAsignar` y el overlay
+  raíz del form de Tareas (cero duplicación); al abrir desde Jornada se preselecciona el peer enfocado.
+- Build verde; QA visual de Julio + recompilación release de la desktop PENDIENTES.
+
+### EN CURSO — Registro de acciones (RFC registro-acciones, decisión Max: SQLx+FK)
+- Hecho: DTOs R1-R3 en peers-core (`AccionRegistrada`, `TipoAccion` #[non_exhaustive] snake_case,
+  `RETENCION_ACCIONES=500`).
+- Diseño en revisión con Julio ANTES de codificar el motor. Punto de arquitectura levantado por
+  Jefim: FK `instancias(id) ON DELETE CASCADE` de la spec borraría la bitácora con cada
+  `limpiar_vencidas`/kick (instancias = PRESENCIA efímera, no entidad durable) y en producción el
+  backend es Redis (no existen esas tablas) → propuesta: .db PROPIO de bitácora vía SQLx (ambos
+  backends) con tablas de identidad durable mínimas (`peers_conocidos`/`tareas_conocidas` upsert)
+  y FK reales contra ESAS, sin CASCADE destructivo.
