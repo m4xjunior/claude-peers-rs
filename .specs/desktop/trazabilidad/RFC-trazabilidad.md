@@ -1,5 +1,7 @@
 # RFC — Trazabilidad (desktop GPUI): mensajería operable, no solo lectura
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 > Estado: **propuesta** (RFC pre-decisión). Fecha: 2026-07-02.
 > Ámbito: `crates/peers-desktop` — pestaña **Trazabilidad** (`src/vista/trazabilidad.rs`).
 > Referencia de paridad: TUI `crates/peers-tui/src/ui/trazabilidad.rs` + teclas en `peers-tui/src/main.rs`.

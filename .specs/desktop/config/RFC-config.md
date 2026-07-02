@@ -1,5 +1,7 @@
 # RFC-desktop-config — Configuración operable en la pestaña Config (peers-desktop)
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 ## Header & Metadata
 
 | Campo | Valor |

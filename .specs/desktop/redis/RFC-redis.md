@@ -1,5 +1,7 @@
 # RFC — Pestaña Redis (peers-desktop): control, CRUD y trazabilidad del almacén
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 | Campo | Valor |
 |-------|-------|
 | **Ámbito** | `crates/peers-desktop` → `src/vista/redis.rs` |

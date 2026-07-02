@@ -1,5 +1,7 @@
 # RFC — Pestaña Acceso (desktop GPUI): controles de conexión, seguridad y trazabilidad
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 | Campo | Valor |
 |-------|-------|
 | **Título** | CRUD, controles de conexión/seguridad y trazabilidad de auth para la pestaña Acceso de `peers-desktop` |

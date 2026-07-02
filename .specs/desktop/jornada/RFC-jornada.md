@@ -1,5 +1,7 @@
 # RFC — Pestaña Jornada (peers-desktop / GPUI): CRUD, controles y trazabilidad
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 | Campo | Valor |
 |-------|-------|
 | **Título** | Dotar de acciones, pop-ups y trazabilidad temporal a la pestaña Jornada de la app desktop |

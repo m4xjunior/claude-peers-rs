@@ -1,5 +1,7 @@
 # RFC — Pestaña Alertas (peers-desktop)
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 - **Estado:** propuesta (Request For Comments — pre-implementación)
 - **Ámbito:** `crates/peers-desktop/src/vista/alertas.rs` + `AppDesktop` (acciones/estado)
 - **Autor:** orquestación desktop-CRUD

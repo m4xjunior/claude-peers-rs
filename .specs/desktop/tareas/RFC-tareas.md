@@ -1,5 +1,7 @@
 # RFC — Pestaña Tareas (desktop GPUI): CRUD, pop-ups y trazabilidad
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 ## Header & Metadata
 
 | Campo | Valor |

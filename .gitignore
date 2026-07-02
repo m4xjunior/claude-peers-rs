@@ -3,3 +3,6 @@
 
 # Documentación de diseño interno (no va en el repo público — datos y decisiones privadas)
 /docs/INTERNO/
+
+# Config personal de Obsidian de la vault de RFCs (no versionar; el MOC y las RFCs sí van)
+/.specs/desktop/.obsidian/

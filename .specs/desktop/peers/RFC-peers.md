@@ -1,5 +1,7 @@
 # RFC — Pestaña **Peers** de la desktop GPUI (gestión + trazabilidad)
 
+> ⬆ [[_MOC|Mapa de la vault]] · [[INDICE-RFCS|Índice]]
+
 > Fecha: 2026-07-02. Estado: **borrador para comentarios** (propone features ANTES de decidir/implementar).
 > Ámbito: `crates/peers-desktop/src/vista/peers.rs`. Referencias de paridad: `crates/peers-tui/src/ui/peers.rs`,
 > teclas en `crates/peers-tui/src/main.rs`, endpoints en `crates/peers-broker/src/main.rs`.
