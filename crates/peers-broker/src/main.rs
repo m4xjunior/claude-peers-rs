@@ -109,6 +109,14 @@ struct EstadoApp {
     github: Option<GitHub>,
     host: String,
     puerto: u16,
+    /// Lock que serializa el REGISTRO de instancias. INTENCIÓN: `resolver_id_sin_colision`
+    /// (lee el índice) y `almacen.registrar` (escribe) son dos pasos; sin este lock, dos
+    /// `claude` arrancando a la vez en el MISMO directorio (mismo id base, ambos vivos) leen
+    /// ambos "id libre" ANTES de que ninguno escriba (TOCTOU) → se registran con el MISMO id y
+    /// se pisan la cola. Con el lock, el segundo ve al primero ya escrito y se sufija (-2, -3…),
+    /// que es justo el comportamiento deseado: varias instancias por dir, filtrables por nombre.
+    /// El broker es un único proceso, así que un Mutex async basta (no hace falta lock distribuido).
+    registro_lock: tokio::sync::Mutex<()>,
 }
 
 type Estado = Arc<EstadoApp>;
@@ -295,6 +303,10 @@ async fn registrar(
     State(e): State<Estado>,
     Json(p): Json<PeticionRegistrar>,
 ) -> Result<Json<RespuestaRegistrar>, ErrorApp> {
+    // Sección crítica: resolver el id (lee el índice) + escribir el registro deben ser atómicos
+    // frente a otros registros concurrentes. Sin el lock hay TOCTOU (dos peers mismo dir → mismo
+    // id). El guard se sostiene hasta el final de la escritura del índice de instancias.
+    let _guard = e.registro_lock.lock().await;
     let id = resolver_id_sin_colision(&e, p.id_preferido.as_deref(), p.pid, &p.hostname).await;
     let ahora = ahora_iso();
     e.almacen
@@ -1398,6 +1410,7 @@ async fn main() -> anyhow::Result<()> {
         github,
         host: args.host.clone(),
         puerto: args.puerto,
+        registro_lock: tokio::sync::Mutex::new(()),
     });
 
     // Umbrales del supervisor (R8): resueltos una vez, copiados al spawn (Copy).

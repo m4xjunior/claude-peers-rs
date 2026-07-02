@@ -1050,6 +1050,24 @@ mod pruebas {
     }
 
     #[tokio::test]
+    async fn dos_instancias_mismo_dir_coexisten_con_sufijo() {
+        // Escenario que Max pidió: varias instancias en el MISMO directorio deben PERMITIRSE y
+        // filtrarse por nombre distinto (ejemplo, ejemplo-2…). Aquí se simula lo que hace el
+        // registro del broker: la 1ª toma el id base; la 2ª (mismo dir, otro pid, ambas vivas)
+        // se registra bajo el sufijo -2. Las dos deben coexistir en el índice, no pisarse.
+        let b = base();
+        b.registrar("ejemplo", 1001, "host", "/proyecto/ejemplo", None, None, None, "primera", "2026-07-02T10:00:00Z").await.unwrap();
+        b.registrar("ejemplo-2", 1002, "host", "/proyecto/ejemplo", None, None, None, "segunda", "2026-07-02T10:00:01Z").await.unwrap();
+        // Ambas existen con identidad propia.
+        let uno = b.instancia_obtener("ejemplo").await.unwrap().expect("ejemplo debe existir");
+        let dos = b.instancia_obtener("ejemplo-2").await.unwrap().expect("ejemplo-2 debe existir");
+        assert_eq!(uno.pid, 1001);
+        assert_eq!(dos.pid, 1002);
+        assert_eq!(uno.directorio, dos.directorio, "comparten dir (misma estación), distinto id");
+        assert_ne!(uno.id, dos.id, "ids DISTINTOS: no colapsan al mismo");
+    }
+
+    #[tokio::test]
     async fn recibir_es_peek_no_destructivo() {
         // R1.1: recibir NO borra. Dos peeks seguidos devuelven el mismo mensaje. Solo sale de
         // la bandeja activa al transicionar a Procesado (R1.5), pero queda en historial (R2.1).

@@ -114,13 +114,18 @@ pub fn hostname() -> String {
 ///
 /// INTENCIÓN: Max quiere lanzar `claude` sin pasar CLAUDE_PEERS_ID ni --id y aun así
 /// tener un id ESTABLE por terminal (para heredar la cola al reiniciar). El nombre de la
-/// carpeta es estable y único por proyecto, así que sirve como rol implícito: dos Claudes
-/// en la misma carpeta comparten rol (lo cual es deseable: misma "estación de trabajo");
-/// dos en carpetas distintas tienen ids distintos sin que él escriba nada.
+/// carpeta es el id BASE (rol implícito por proyecto). VARIAS instancias en el mismo
+/// directorio están PERMITIDAS: comparten el id base, y el broker las diferencia con sufijo
+/// (`ejemplo`, `ejemplo-2`, `ejemplo-3`…) al detectar la colisión en el registro. Así se puede
+/// filtrar por nombre distinto sin que Max escriba nada.
 ///
 /// Sanea el nombre a [a-z0-9-] (el broker y el harness tratan el id como string opaco,
-/// pero un id limpio evita sorpresas en logs/labels de GitHub). Si por algún motivo no
-/// hay nombre de carpeta usable, cae a "instancia".
+/// pero un id limpio evita sorpresas en logs/labels de GitHub).
+///
+/// FALLBACK (sin nombre de carpeta usable, p.ej. cwd `/`): NO se cae a un genérico fijo como
+/// "instancia" — eso hacía que TODAS las sesiones con cwd degradado colapsaran al mismo id y se
+/// pisaran (bug real observado: id="instancia", cwd="/"). En su lugar se usa "peer" como base y
+/// se deja que el broker sufije por colisión, de modo que cada sesión conserve una identidad única.
 pub fn id_desde_directorio(directorio: &str) -> String {
     let crudo = Path::new(directorio)
         .file_name()
@@ -133,7 +138,9 @@ pub fn id_desde_directorio(directorio: &str) -> String {
         .trim_matches('-')
         .to_string();
     if limpio.is_empty() {
-        "instancia".into()
+        // Base neutra; el broker la sufija (-2, -3…) si varias sesiones caen aquí, evitando el
+        // colapso a un id compartido. No es "instancia" a propósito (ese colisionaba en masa).
+        "peer".into()
     } else {
         limpio
     }
@@ -189,8 +196,10 @@ mod pruebas {
 
     #[test]
     fn id_desde_directorio_fallback_si_vacio() {
-        assert_eq!(id_desde_directorio("/"), "instancia");
-        assert_eq!(id_desde_directorio(""), "instancia");
+        // Sin nombre de carpeta usable → base neutra "peer" (NO "instancia": ese colapsaba
+        // en masa todas las sesiones con cwd degradado a un id compartido). El broker la sufija.
+        assert_eq!(id_desde_directorio("/"), "peer");
+        assert_eq!(id_desde_directorio(""), "peer");
     }
 
     #[test]
