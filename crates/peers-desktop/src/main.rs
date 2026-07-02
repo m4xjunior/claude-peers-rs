@@ -8,6 +8,7 @@
 mod app;
 mod cliente;
 mod config;
+mod tema;
 mod vista;
 
 use app::AppDesktop;

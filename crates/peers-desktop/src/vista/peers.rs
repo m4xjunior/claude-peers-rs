@@ -1,4 +1,4 @@
-//! Pantalla Peers — tabla viva de instancias de la red claude-peers.
+//! Pantalla Peers — tabla viva de instancias de la red claude-peers, rediseñada con el tema Ethos.
 //!
 //! INTENCIÓN: porta la pantalla 1 de la TUI (`peers-tui/src/ui/peers.rs`), que pinta una tabla
 //! `(id, directorio, resumen, visto)` desde `POST /listar`. Aquí se AÑADE (feature documentada)
@@ -6,33 +6,84 @@
 //! alertas vigentes del supervisor con cada peer por `sujeto == id`. Es información que la TUI ya
 //! tenía repartida en la pantalla Alertas; aquí se consolida junto al peer para verla de un vistazo.
 //!
-//! DECISIÓN DE DISEÑO (por qué NO uso `Table` ni `Badge` del kit): coherente con el resto de las
-//! vistas (alertas/redis/trazabilidad) y con la Fundación (que evitó `Sidebar`). El `Table` del kit
-//! es STATEFUL (exige `Entity<TableState>` + `TableDelegate` + `Context`), incompatible con la firma
-//! pura `render_peers(&EstadoPantalla) -> impl IntoElement`. Se construye con `div()` en filas flex
-//! (mismos helpers de ancho fijo `w(px)` + `flex_1` que ya compilan en las otras pantallas). El chip
-//! de estado es un `div()` estilizado (píldora con color literal), no `Badge` (que es un decorador
-//! de esquina con color de tema). Migrable a `Table`/`Badge` cuando se promueva el render a método
-//! con `Context`.
+//! REDISEÑO ETHOS (por qué se reescribió): la versión previa usaba literales azules/genéricos
+//! (`0x3a3a3a`, `0x1c1c1c`…) y no era operable (filas no seleccionables, sin acciones). Ahora:
+//!   1) TODO el color sale del `tema` (TINTA/PAPEL/BRASA/LINEA…), sin literales sueltos salvo los
+//!      colores de severidad de estado (que son semántica de dominio, no del tema).
+//!   2) La tabla vive dentro de una `superficie_card`, con `eyebrow` para los labels de columna
+//!      (mono/humo/mayúsculas) y tipografía Inter para los datos.
+//!   3) Cada fila es SELECCIONABLE (`tema::fila_seleccionable`): al clicar se marca el peer y se
+//!      despacha `SeleccionarPeer`. Con un peer marcado aparece una barra de acciones: "Enviar
+//!      mensaje" y "Ver jornada" (trazabilidad), que despachan sus Action.
+//!
+//! DECISIÓN DE DISEÑO (por qué NO uso `Table`/`Badge`/`Button` del kit): coherente con el resto de
+//! las vistas y con la Fundación. El `Table` del kit es STATEFUL (exige `Entity<TableState>` +
+//! `TableDelegate` + `Context`), incompatible con la firma pura `render_peers(&EstadoPantalla)`. La
+//! tabla se construye con filas flex (`tema::fila_seleccionable`, que ya trae `.id()` y hover). Los
+//! botones de acción son los `tema::boton_*` (Stateful<Div>), no el `Button` del kit, para mantener
+//! el look Ethos exacto. La vista es PURA: sólo LEE `EstadoPantalla` y DESPACHA acciones; toda
+//! mutación (marcar peer, disparar fetch, navegar a trazabilidad) vive en `AppDesktop` (Fase 3).
 
-use gpui::{div, px, rgb, IntoElement, ParentElement, SharedString, Styled};
+use gpui::{
+    div, actions, px, rgba, Action, IntoElement, ParentElement, Rgba,
+    SharedString, StatefulInteractiveElement, Styled,
+};
 // `v_flex`/`h_flex` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
 use gpui_component::StyledExt;
 
 use peers_core::{Alerta, Instancia, TipoAlerta};
 
 use crate::app::EstadoPantalla;
+use crate::tema;
 
-// Anchos fijos (px) de las columnas no flexibles, espejo de los Constraint de la TUI. `resumen` es
-// la flexible (`flex_1`); las demás llevan ancho fijo para que los chips de estado queden alineados.
-const COL_ID: f32 = 140.0;
-const COL_DIR: f32 = 260.0;
-const COL_VISTO: f32 = 90.0;
-const COL_ESTADO: f32 = 110.0;
+// -------------------------------------------------------------------------------------------------
+// ACCIONES — la vista es pura (sin `cx`), así que DESPACHA acciones que `AppDesktop` maneja con
+// `.on_action(cx.listener(...))` en su contenedor raíz (mismo patrón que `vista/alertas.rs`). GPUI
+// las hace burbujear por el árbol desde el elemento clicado hasta ese manejador. El payload lleva
+// lo mínimo para que el manejador actúe sin volver a mirar el estado de la vista. Namespace `peers`
+// para no colisionar con las de otras pantallas.
+//
+// `no_json`: estas acciones SÓLO se despachan por código (`window.dispatch_action`), nunca desde un
+// keymap, así que no arrastran `serde::Deserialize` + `schemars::JsonSchema` (basta Clone+PartialEq).
+// -------------------------------------------------------------------------------------------------
 
-/// Estado operativo de un peer, derivado de las alertas vigentes. Es un enum cerrado (no
-/// "stringly typed") para que la etiqueta y el color salgan de un único match y no se
-/// desincronicen. `Trabajando` es el caso por defecto: un peer listado que no tiene alerta viva.
+/// Seleccionar el peer de la fila `indice` (click en la fila). Índice en `datos.instancias`.
+/// `AppDesktop` guarda la selección (campo NUEVO `peers_seleccion`, ver notas de Fase 3) y resalta
+/// la fila. Es la acción base que habilita la barra de acciones del peer marcado.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = peers, no_json)]
+pub struct SeleccionarPeer {
+    pub indice: usize,
+}
+
+/// Enviar un mensaje al peer `id` (tecla `m` de la TUI / botón "Enviar mensaje"). `AppDesktop`
+/// abrirá el flujo de composición y, al confirmar, hará `POST /enviar` vía `ClienteBroker::reenviar`
+/// (o el método de envío directo del cliente). Lleva el `id` completo para no depender del índice
+/// (que puede reordenarse entre recargas). El campo `id` es la identidad estable del peer.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = peers, no_json)]
+pub struct EnviarMensajePeer {
+    pub id: String,
+}
+
+/// Ver la jornada/trazabilidad del peer `id` (botón "Ver jornada"). `AppDesktop` fija
+/// `traza_peer = Some(id)`, dispara `ClienteBroker::historial` para poblar `historial` y navega a
+/// la pantalla Trazabilidad. Lleva el `id` completo por la misma razón que arriba.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = peers, no_json)]
+pub struct VerJornadaPeer {
+    pub id: String,
+}
+
+// Acción sin datos: limpiar la selección de peer (botón "Cerrar" de la barra de acciones).
+actions!(peers, [DeseleccionarPeer]);
+
+// -------------------------------------------------------------------------------------------------
+// ESTADO OPERATIVO DEL PEER — enum cerrado (no "stringly typed") para que etiqueta y color salgan
+// de un único match y no se desincronicen. `Trabajando` es el caso por defecto.
+// -------------------------------------------------------------------------------------------------
+
+/// Estado operativo de un peer, derivado de las alertas vigentes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EstadoPeer {
     /// Peer vivo sin tarea en curso pasado el umbral (alerta `TipoAlerta::Ocioso`).
@@ -53,13 +104,14 @@ impl EstadoPeer {
         }
     }
 
-    /// Color del chip (RGB literal, sin depender de `cx.theme()` — la firma pura no tiene `cx`).
-    /// Mapeo espejo de la TUI: ocioso/amarillo, atascado/naranja, trabajando/verde.
-    fn color(self) -> u32 {
+    /// Color del chip. Es SEMÁNTICA DE DOMINIO (severidad del estado), no un token del tema, por eso
+    /// vive aquí y no en `tema`. Se afinan al fondo cálido del Ethos: ámbar/naranja/verde apagados
+    /// que armonizan con el dorado brasa sin gritar. El texto del chip es SALMO (lo pone `tema`).
+    fn color(self) -> Rgba {
         match self {
-            EstadoPeer::Ocioso => 0xd9a021,     // amarillo ámbar
-            EstadoPeer::Atascado => 0xd9542b,   // naranja-rojo (más severo que ocioso)
-            EstadoPeer::Trabajando => 0x3f9d5c, // verde
+            EstadoPeer::Ocioso => rgba(0xD9A021FF),     // ámbar (atención suave)
+            EstadoPeer::Atascado => rgba(0xD9542BFF),   // naranja-rojo (más severo)
+            EstadoPeer::Trabajando => rgba(0x7FA86AFF), // verde apagado (normal, no compite con brasa)
         }
     }
 }
@@ -81,52 +133,75 @@ fn estado_peer(id: &str, alertas: &[Alerta]) -> EstadoPeer {
     estado
 }
 
-/// Chip de estado: píldora de color con la etiqueta. Un `div()` estilizado (no `Badge`), estable
-/// entre revisiones del kit.
-fn chip_estado(estado: EstadoPeer) -> impl IntoElement {
-    div()
-        .px_2()
-        .py(px(1.0))
-        .rounded_md()
-        .text_xs()
-        .bg(rgb(estado.color()))
-        .text_color(rgb(0xffffff))
-        .child(SharedString::from(estado.etiqueta()))
-}
+// -------------------------------------------------------------------------------------------------
+// LAYOUT — anchos fijos (px) de columnas no flexibles, espejo de los Constraint de la TUI. `resumen`
+// es la flexible (`flex_1`); las demás llevan ancho fijo para que los chips de estado se alineen.
+// -------------------------------------------------------------------------------------------------
 
-/// Celda de texto de ancho fijo. `flex_celda` (abajo) es la flexible para `resumen`.
+const COL_ID: f32 = 150.0;
+const COL_DIR: f32 = 260.0;
+const COL_VISTO: f32 = 96.0;
+const COL_ESTADO: f32 = 120.0;
+
+// -------------------------------------------------------------------------------------------------
+// HELPERS DE CELDA — reparten con el vocabulario del tema. Los datos van en Inter (heredado del
+// fondo); los timestamps en mono (`tema::FUENTE_MONO`) para alineación de dígitos.
+// -------------------------------------------------------------------------------------------------
+
+/// Celda de texto de ancho fijo (id, directorio). Texto PAPEL, tamaño base.
 fn celda(texto: impl Into<SharedString>, ancho: f32) -> impl IntoElement {
-    div().w(px(ancho)).px_1().text_sm().child(texto.into())
+    div()
+        .w(px(ancho))
+        .px_1()
+        .text_color(tema::PAPEL)
+        .child(texto.into())
 }
 
-/// Celda flexible (ocupa el espacio sobrante). Se usa para la columna `resumen`.
+/// Celda flexible (ocupa el espacio sobrante) para `resumen`. Se atenúa a HUMO por ser metadato
+/// secundario, y recorta con `overflow_hidden` para no romper el layout con resúmenes largos.
 fn celda_flex(texto: impl Into<SharedString>) -> impl IntoElement {
-    div().flex_1().overflow_hidden().px_1().text_sm().child(texto.into())
+    div()
+        .flex_1()
+        .overflow_hidden()
+        .px_1()
+        .text_color(tema::HUMO)
+        .child(texto.into())
 }
 
-/// Fila de encabezado de la tabla. Los anchos deben cuadrar con los de `fila`.
+/// Celda de timestamp: mono para que los dígitos alineen, atenuada a HUMO.
+fn celda_hora(texto: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .w(px(COL_VISTO))
+        .px_1()
+        .font_family(tema::FUENTE_MONO)
+        .text_color(tema::HUMO)
+        .text_xs()
+        .child(texto.into())
+}
+
+/// Fila de encabezado: labels de columna como `eyebrow` (mono/humo/mayúsculas), separada por LINEA.
 fn encabezado() -> impl IntoElement {
     div()
         .h_flex()
         .w_full()
-        .py_1()
+        .items_center()
+        .px_3()
+        .py_2()
         .gap_2()
         .border_b_1()
-        .border_color(rgb(0x3a3a3a))
-        .text_color(rgb(0xd9a021))
-        .child(celda("id", COL_ID))
-        .child(celda("directorio", COL_DIR))
-        .child(celda_flex("resumen"))
-        .child(celda("visto", COL_VISTO))
-        // La columna añadida de estado va a la derecha, con ancho fijo para alinear los chips.
-        .child(div().w(px(COL_ESTADO)).px_1().child(SharedString::from("estado")))
+        .border_color(tema::LINEA)
+        .child(div().w(px(COL_ID)).px_1().child(tema::eyebrow("id")))
+        .child(div().w(px(COL_DIR)).px_1().child(tema::eyebrow("directorio")))
+        .child(div().flex_1().px_1().child(tema::eyebrow("resumen")))
+        .child(div().w(px(COL_VISTO)).px_1().child(tema::eyebrow("visto")))
+        .child(div().w(px(COL_ESTADO)).px_1().child(tema::eyebrow("estado")))
 }
 
-/// Una fila de peer: 4 celdas de la TUI + el chip de estado (columna añadida). `alterna` pinta un
-/// fondo tenue en filas impares para legibilidad (zebra), como la selección resaltada de la TUI.
-fn fila(inst: &Instancia, estado: EstadoPeer, alterna: bool) -> impl IntoElement {
+/// Una fila de peer: seleccionable (marca el peer al clicar). Compone `tema::fila_seleccionable`
+/// (que trae `.id()`, hover, borde de selección) + las 4 celdas de la TUI + el chip de estado.
+/// `indice` viaja en la Action para que `AppDesktop` sepa qué peer marcar sin re-buscar por id.
+fn fila(indice: usize, inst: &Instancia, estado: EstadoPeer, activa: bool) -> impl IntoElement {
     // Espejo de `fila_peer` de la TUI: mismos campos y misma extracción de la hora del `visto_en`.
-    // No se recorta el texto aquí: el ancho fijo/flex de cada celda lo acota al pintar.
     let visto = hora_iso(&inst.visto_en);
     let repo = inst.repo_git.as_deref().unwrap_or("");
 
@@ -137,75 +212,163 @@ fn fila(inst: &Instancia, estado: EstadoPeer, alterna: bool) -> impl IntoElement
         format!("{} ({repo})", inst.directorio)
     };
 
-    let base = div()
-        .h_flex()
-        .w_full()
-        .items_center()
-        .py_1()
-        .gap_2();
-    let base = if alterna { base.bg(rgb(0x1c1c1c)) } else { base };
-
-    base.child(celda(inst.id.clone(), COL_ID))
+    tema::fila_seleccionable(SharedString::from(format!("peer-fila-{indice}")), activa)
+        // El id del peer se destaca en dorado brasa: es la identidad, el ancla de la fila.
+        .child(
+            div()
+                .w(px(COL_ID))
+                .px_1()
+                .text_color(tema::BRASA)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(SharedString::from(inst.id.clone())),
+        )
         .child(celda(dir, COL_DIR))
         .child(celda_flex(inst.resumen.clone()))
-        .child(celda(visto, COL_VISTO))
-        .child(div().w(px(COL_ESTADO)).px_1().child(chip_estado(estado)))
+        .child(celda_hora(visto))
+        .child(
+            div()
+                .w(px(COL_ESTADO))
+                .px_1()
+                .child(tema::chip_estado(estado.etiqueta(), estado.color())),
+        )
+        .on_click(move |_evento, window, cx| {
+            // Despacha la selección; `AppDesktop` la maneja y muta el estado. La vista no toca `cx`.
+            window.dispatch_action(Box::new(SeleccionarPeer { indice }), cx);
+        })
 }
 
 /// Banner de error: se pinta cuando la última carga contra el broker falló, para que la tabla
-/// vacía no se confunda con "no hay peers". El texto lo aporta `ErrorBroker::Display`.
+/// vacía no se confunda con "no hay peers". El texto lo aporta `ErrorBroker::Display`. Colores de
+/// severidad (rojo tenue) — semántica de error, no token del tema.
 fn banner_error(err: &crate::cliente::ErrorBroker) -> impl IntoElement {
     div()
         .w_full()
         .px_3()
         .py_2()
-        .rounded_md()
-        .bg(rgb(0x5a1f1f))
-        .text_color(rgb(0xffd7d7))
-        .text_sm()
-        .child(SharedString::from(format!("Broker: {err}")))
+        .rounded(tema::radio(tema::RADIO_CONTROL))
+        .border_1()
+        .border_color(rgba(0x7F1D1DFF))
+        .bg(rgba(0x7F1D1D33))
+        .text_color(rgba(0xFEE2E2FF))
+        .child(SharedString::from(format!("⚠ Broker: {err}")))
 }
 
-/// Render de la pantalla Peers. Consume `instancias` y `alertas` ya cargadas por la app.
+/// Barra de acciones del peer seleccionado: aparece bajo la tabla cuando hay un peer marcado.
+/// Muestra el id del peer en foco y dos botones (Enviar mensaje / Ver jornada) + un "Cerrar" para
+/// soltar la selección. Espejo de las teclas de la TUI (`m` = mensaje) elevadas a botones visibles.
+fn barra_acciones(inst: &Instancia) -> impl IntoElement {
+    let id_msg = inst.id.clone();
+    let id_jornada = inst.id.clone();
+
+    tema::superficie_card()
+        .h_flex()
+        .items_center()
+        .w_full()
+        .px_4()
+        .py_3()
+        .gap_3()
+        .child(tema::eyebrow("peer"))
+        .child(
+            div()
+                .text_color(tema::BRASA)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(SharedString::from(inst.id.clone())),
+        )
+        // Empuja los botones a la derecha.
+        .child(div().flex_1())
+        .child(
+            tema::boton_primario("peer-accion-mensaje", "Enviar mensaje").on_click(
+                move |_e, window, cx| {
+                    window.dispatch_action(Box::new(EnviarMensajePeer { id: id_msg.clone() }), cx);
+                },
+            ),
+        )
+        .child(
+            tema::boton_secundario("peer-accion-jornada", "Ver jornada").on_click(
+                move |_e, window, cx| {
+                    window.dispatch_action(Box::new(VerJornadaPeer { id: id_jornada.clone() }), cx);
+                },
+            ),
+        )
+        .child(
+            tema::boton_secundario("peer-accion-cerrar", "Cerrar").on_click(|_e, window, cx| {
+                window.dispatch_action(Box::new(DeseleccionarPeer), cx);
+            }),
+        )
+}
+
+/// Render de la pantalla Peers. Consume `instancias` y `alertas` ya cargadas por la app, más la
+/// selección (`peers_seleccion`, campo NUEVO que Fase 3 añade a `EstadoPantalla`).
 pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
     let total = datos.instancias.len();
 
-    // Cuerpo: título con el conteo, banner de error (si lo hay), encabezado y filas.
-    let mut columna = div()
+    // Raíz: fondo/tipografía heredados del contenedor raíz de la app; aquí sólo el espaciado y la
+    // cabecera. Se compone dentro del `fondo_app` del `AppDesktop`, así que no repite `.bg(TINTA)`.
+    let mut raiz = div()
         .v_flex()
         .size_full()
-        .gap_2()
-        .p_4()
-        .child(div().text_xl().child(SharedString::from(format!("Peers ({total})"))));
+        .gap_4()
+        .p_6();
+
+    // Cabecera: eyebrow + título Ethos con el conteo (Fraunces fallback, PAPEL, grande).
+    raiz = raiz.child(
+        div()
+            .v_flex()
+            .gap_1()
+            .child(tema::eyebrow("red claude-peers"))
+            .child(tema::titulo(format!("Peers ({total})"))),
+    );
 
     if let Some(err) = &datos.error_peers {
-        columna = columna.child(banner_error(err));
+        raiz = raiz.child(banner_error(err));
     }
 
     if total == 0 && datos.error_peers.is_none() {
         // Sin datos y sin error: aún no llegó la primera respuesta o no hay peers vivos.
-        return columna.child(
-            div()
-                .text_sm()
-                .text_color(rgb(0x888888))
-                .child(SharedString::from("(sin peers vivos)")),
+        return raiz.child(
+            tema::superficie_card()
+                .v_flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .py_8()
+                .child(tema::texto_terciario("Sin peers vivos en esta máquina.")),
         );
     }
 
-    // Filas zebra: se derivan aquí a partir de las alertas cacheadas (cruce por sujeto == id).
+    // Índice seleccionado (si Fase 3 lo dejó dentro del rango). `peers_seleccion` es `Option<usize>`.
+    let seleccion = datos.peers_seleccion;
+
+    // Filas seleccionables: cada una deriva su estado de las alertas cacheadas (cruce sujeto == id).
     let filas = datos
         .instancias
         .iter()
         .enumerate()
         .map(|(idx, inst)| {
             let estado = estado_peer(&inst.id, &datos.alertas);
-            fila(inst, estado, idx % 2 == 1)
+            let activa = seleccion == Some(idx);
+            fila(idx, inst, estado, activa)
         })
         .collect::<Vec<_>>();
 
-    let tabla = div().v_flex().w_full().child(encabezado()).children(filas);
+    // La tabla va dentro de una superficie_card: encabezado (eyebrows) + cuerpo de filas.
+    let tabla = tema::superficie_card()
+        .v_flex()
+        .w_full()
+        .p_2()
+        .child(encabezado())
+        .child(div().v_flex().w_full().py_1().children(filas));
 
-    columna.child(tabla)
+    raiz = raiz.child(tabla);
+
+    // Barra de acciones del peer marcado (si la selección apunta a una fila válida).
+    if let Some(idx) = seleccion {
+        if let Some(inst) = datos.instancias.get(idx) {
+            raiz = raiz.child(barra_acciones(inst));
+        }
+    }
+
+    raiz
 }
 
 /// Extrae `HH:MM:SS` de un ISO 8601 para la columna "visto". Espejo de `hora_iso` de la TUI

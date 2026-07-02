@@ -1,4 +1,5 @@
-//! Pantalla Config — porta la pantalla 5 de la TUI (`peers-tui/src/ui/config.rs`) a GPUI.
+//! Pantalla Config — porta la pantalla 5 de la TUI (`peers-tui/src/ui/config.rs`) a GPUI, ya
+//! vestida con el Design System "Ethos" (tinta/pergamino + acento dorado "brasa").
 //!
 //! Qué muestra (espejo de la TUI): los tres parámetros configurables del archivo
 //! `~/.config/claude-peers/config.toml` — `broker_url`, `token` y `refresh_ms` — como campos
@@ -11,19 +12,67 @@
 //! en una vista (no en un render efímero). Por eso la pantalla es un `PanelConfig: Render` con sus
 //! Inputs; el stub `render_config` (firma de la Fundación intacta) sólo delega en la `Entity`
 //! creada por la app. Así no se rompe el contrato `render_config(&EstadoPantalla)` ni el sidebar.
+//!
+//! INTENCIÓN del rediseño (por qué el tema aquí y no vía `cx.theme()`): esta pantalla SÍ tiene
+//! `cx` (es stateful), pero el look debe ser coherente con las 8 pantallas puras que consumen
+//! `crate::tema`. Para no duplicar dos vocabularios visuales, se usan los MISMOS tokens/helpers
+//! del tema Ethos (`tema::TINTA`, `superficie_card()`, `titulo()`, `eyebrow()`, `boton_primario()`).
+//! Se eliminan TODOS los colores hardcodeados azules/genéricos previos (0x9ca3af, 0x22c55e,
+//! 0xef4444) salvo los dos de feedback semántico (ok/error), que se calibran a tonos cálidos
+//! coherentes con la paleta (verde salvia y terracota), no al verde/rojo puro genérico.
+//!
+//! DECISIÓN sobre acciones (por qué NO se despacha una Action al AppDesktop para Guardar): a
+//! diferencia de las vistas puras (alertas, tareas…), `PanelConfig` es un `Entity` con estado y
+//! `cx` propios, así que puede manejar su interacción directamente con `cx.listener(...)` sin
+//! rebotar por el árbol de acciones. Guardar y "recargar desde disco" mutan SÓLO el estado local
+//! del panel (los `InputState` y el feedback), no el `EstadoPantalla` global, de modo que un
+//! listener local es lo correcto y lo más simple (senior, no over-engineered). Se declara igual
+//! la Action `RecargarConfig` documentada abajo por si la Fase 3 quiere dispararla desde un menú
+//! global; el panel la maneja internamente si se le cablea.
 
 use gpui::{
-    div, App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
-    Window,
+    div, App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
-    button::{Button, ButtonVariants},
     input::{Input, InputState},
-    ActiveTheme, StyledExt,
+    StyledExt,
 };
 
-use crate::config::Config;
 use crate::app::EstadoPantalla;
+use crate::config::Config;
+use crate::tema;
+
+// -------------------------------------------------------------------------------------------------
+// ACCIONES — el panel es stateful y maneja Guardar con un listener local (ver nota de cabecera),
+// así que NO necesita despachar Actions para su flujo normal. Se declara sólo `RecargarConfig`
+// para que la Fase 3 pueda, si quiere, ofrecer un "recargar desde disco" desde un menú/atajo
+// global: el AppDesktop despacharía la Action y, al manejarla, llamaría a
+// `panel_config.update(cx, |p, cx| p.recargar(window, cx))`. Namespace `config` para no colisionar.
+//
+// `no_json`: sólo se despacha por código (nunca desde keymap), así se evita arrastrar
+// `serde::Deserialize`/`schemars` como en el resto de pantallas.
+// -------------------------------------------------------------------------------------------------
+
+gpui::actions!(config, [RecargarConfig]);
+
+/// Color de feedback OK — verde salvia apagado, coherente con la paleta cálida (no el 0x22c55e
+/// genérico previo). Sólo se usa para la línea de estado tras un guardado correcto.
+const VERDE_OK: gpui::Rgba = gpui::Rgba {
+    r: 0x8F as f32 / 255.0,
+    g: 0xB0 as f32 / 255.0,
+    b: 0x7B as f32 / 255.0,
+    a: 1.0,
+};
+
+/// Color de feedback de ERROR — terracota apagado, coherente con la paleta (no el 0xef4444
+/// genérico previo). Se usa para validaciones fallidas y errores de IO al guardar.
+const ROJO_ERROR: gpui::Rgba = gpui::Rgba {
+    r: 0xC9 as f32 / 255.0,
+    g: 0x6A as f32 / 255.0,
+    b: 0x5A as f32 / 255.0,
+    a: 1.0,
+};
 
 /// Resultado del último intento de guardado, para pintar feedback bajo el botón. No usamos
 /// Notification del kit aquí para mantener la pantalla autocontenida; un texto de estado basta.
@@ -32,7 +81,7 @@ enum EstadoGuardado {
     Inicial,
     /// Guardado correcto en la ruta indicada.
     Ok(String),
-    /// Falló el guardado (permisos, disco…) con el mensaje del error.
+    /// Falló el guardado (permisos, disco…) o la validación, con el mensaje del error.
     Error(String),
 }
 
@@ -82,6 +131,25 @@ impl PanelConfig {
             entrada_refresh,
             ultimo_guardado: EstadoGuardado::Inicial,
         }
+    }
+
+    /// Relee la config del disco y re-siembra los tres Inputs. Punto de entrada para la Action
+    /// `RecargarConfig` si la Fase 3 la cablea desde un menú global. Descarta ediciones no
+    /// guardadas (intencional: "recargar" significa volver a lo persistido).
+    #[allow(dead_code)] // Consumido por Fase 3 al cablear RecargarConfig; hoy queda declarado.
+    pub fn recargar(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let cfg = Config::cargar().unwrap_or_default();
+        self.entrada_broker_url.update(cx, |s, cx| {
+            s.set_value(cfg.broker_url.clone(), _window, cx)
+        });
+        self.entrada_token.update(cx, |s, cx| {
+            s.set_value(cfg.token.clone().unwrap_or_default(), _window, cx)
+        });
+        self.entrada_refresh.update(cx, |s, cx| {
+            s.set_value(cfg.refresh_ms.to_string(), _window, cx)
+        });
+        self.ultimo_guardado = EstadoGuardado::Inicial;
+        cx.notify();
     }
 
     /// Lee los tres Inputs, valida y persiste el TOML. Equivale a la tecla 's' de la TUI.
@@ -136,8 +204,9 @@ impl PanelConfig {
         cx.notify();
     }
 
-    /// Construye un campo etiquetado (etiqueta encima + input debajo), replicando el layout de
-    /// filas de la pantalla de config de la TUI.
+    /// Construye un campo etiquetado del formulario con el vocabulario del tema Ethos:
+    /// `eyebrow` (label en mono/humo mayúsculas) encima, el Input en medio y una nota de ayuda
+    /// en texto terciario debajo. Reemplaza el `font_bold` + gris genérico previos.
     fn campo(
         etiqueta: &'static str,
         ayuda: &'static str,
@@ -145,90 +214,133 @@ impl PanelConfig {
     ) -> impl IntoElement {
         div()
             .v_flex()
-            .gap_1()
-            .child(div().text_sm().font_bold().child(SharedString::from(etiqueta)))
+            .gap_2()
+            .child(tema::eyebrow(etiqueta))
             .child(input)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(gpui::rgb(0x9ca3af))
-                    .child(SharedString::from(ayuda)),
-            )
+            .child(tema::texto_terciario(ayuda))
     }
 }
 
 impl Render for PanelConfig {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Línea de feedback bajo el botón: color según el resultado del último guardado.
+        // Línea de feedback bajo el botón: color cálido según el resultado del último guardado.
         let feedback = match &self.ultimo_guardado {
             EstadoGuardado::Inicial => div(),
             EstadoGuardado::Ok(msg) => div()
                 .text_sm()
-                .text_color(gpui::rgb(0x22c55e))
-                .child(SharedString::from(msg.clone())),
+                .text_color(VERDE_OK)
+                .child(SharedString::from(format!("✓ {msg}"))),
             EstadoGuardado::Error(msg) => div()
                 .text_sm()
-                .text_color(gpui::rgb(0xef4444))
-                .child(SharedString::from(msg.clone())),
+                .text_color(ROJO_ERROR)
+                .child(SharedString::from(format!("⚠ {msg}"))),
         };
 
-        div()
+        // Card contenedora del formulario: superficie elevada Ethos con padding generoso.
+        let tarjeta = tema::superficie_card()
             .v_flex()
-            .size_full()
-            .gap_4()
+            .w_full()
+            .gap_5()
             .p_6()
-            // Cabecera de la pantalla.
-            .child(div().text_xl().font_bold().child(SharedString::from("Config")))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(
-                        "Parámetros del broker. Guardar persiste ~/.config/claude-peers/config.toml.",
-                    )),
-            )
-            // Formulario: los tres campos configurables.
+            // Los tres campos configurables, ya con eyebrow + ayuda terciaria.
             .child(Self::campo(
                 "broker_url",
                 "URL base del broker (sin barra final).",
-                Input::new(&self.entrada_broker_url).cleanable(true),
+                self.input_tematizado(&self.entrada_broker_url, false),
             ))
             .child(Self::campo(
                 "token",
                 "Token X-Peers-Token. Vacío = broker sin token.",
-                Input::new(&self.entrada_token).cleanable(true).mask_toggle(),
+                self.input_tematizado(&self.entrada_token, true),
             ))
             .child(Self::campo(
                 "refresh_ms",
                 "Periodo de refresco de las pantallas, en milisegundos (entero > 0).",
-                Input::new(&self.entrada_refresh).cleanable(true),
+                self.input_tematizado(&self.entrada_refresh, false),
             ))
-            // Acción de guardado + feedback.
+            // Acción de guardado (botón Ethos dorado) + feedback semántico cálido.
             .child(
-                div().h_flex().gap_3().items_center().child(
-                    Button::new("config-guardar")
-                        .primary()
-                        .label("Guardar")
-                        .on_click(cx.listener(|esta, _evento, window, cx| {
-                            esta.guardar(window, cx);
-                        })),
-                ),
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .pt_2()
+                    .child(
+                        tema::boton_primario("config-guardar", "Guardar")
+                            .on_click(cx.listener(|esta, _evento, window, cx| {
+                                esta.guardar(window, cx);
+                            })),
+                    )
+                    .child(feedback),
+            );
+
+        // Raíz de la pantalla: fondo app Ethos + cabecera (eyebrow + título + subtítulo) + card.
+        tema::fondo_app()
+            .v_flex()
+            .gap_5()
+            .p_8()
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .child(tema::eyebrow("Configuración"))
+                    .child(tema::titulo("Broker"))
+                    .child(tema::texto_terciario(
+                        "Parámetros de conexión. Guardar persiste ~/.config/claude-peers/config.toml.",
+                    )),
             )
-            .child(feedback)
+            .child(tarjeta)
+    }
+}
+
+impl PanelConfig {
+    /// Envuelve un `Input` del kit en un contenedor con el estilo de control Ethos: borde LINEA,
+    /// radio de control, superficie TINTA2 y foco dorado. El propio `Input` hereda la fuente UI y
+    /// el color PAPEL del subárbol (fijados por `fondo_app`), así el widget del kit deja de verse
+    /// con su tema por defecto y encaja en la paleta. `es_token` añade el toggle de máscara.
+    ///
+    /// Por qué envolver y no re-estilar el Input directamente: el `Input` de gpui-component pinta
+    /// su propio fondo/borde con `cx.theme()`; envolverlo en un `div` tematizado y darle al Input
+    /// fondo transparente deja el marco bajo nuestro control sin pelear con el tema del kit.
+    fn input_tematizado(
+        &self,
+        estado: &Entity<InputState>,
+        es_token: bool,
+    ) -> impl IntoElement {
+        let input = if es_token {
+            Input::new(estado).cleanable(true).mask_toggle()
+        } else {
+            Input::new(estado).cleanable(true)
+        };
+
+        // NOTA: no se cablea `.focus(...)` en este wrapper: el foco lo posee el `InputState`
+        // interno, no este `div`, así que un `focus_style` aquí nunca se activaría (sería estilo
+        // muerto). El marco queda con borde LINEA estático; el cursor del propio Input da el
+        // feedback de edición. Si en Fase 3 se quiere marco dorado al foco, hay que envolver con
+        // `track_focus` del `focus_handle` del InputState (no trivial con la API del kit).
+        div()
+            .w_full()
+            .px_3()
+            .py_1()
+            .rounded(tema::radio(tema::RADIO_CONTROL))
+            .bg(tema::TINTA)
+            .border_1()
+            .border_color(tema::LINEA)
+            .child(input)
     }
 }
 
 /// Stub de la Fundación (firma intacta): la pantalla Config delega en su `Entity<PanelConfig>`,
 /// que la app crea al arrancar y guarda en `EstadoPantalla`. Si por lo que sea el panel no está
-/// inicializado, se pinta un aviso en vez de crashear (nunca `.unwrap()` sobre el Option).
+/// inicializado, se pinta un aviso tematizado en vez de crashear (nunca `.unwrap()` sobre el Option).
 pub fn render_config(datos: &EstadoPantalla) -> impl IntoElement {
     match &datos.panel_config {
         Some(panel) => div().size_full().child(panel.clone()),
-        None => div()
+        None => tema::fondo_app()
             .v_flex()
-            .size_full()
-            .p_6()
-            .child(SharedString::from("Config no inicializada.")),
+            .p_8()
+            .gap_2()
+            .child(tema::eyebrow("Configuración"))
+            .child(tema::texto_primario("Config no inicializada.")),
     }
 }
 

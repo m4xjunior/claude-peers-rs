@@ -275,6 +275,16 @@ impl ClienteBroker {
         self.get_con_query("/admin/historial", &q).await
     }
 
+    /// `POST /jornada {instancia_id}` → vista consolidada (sesiones + tareas con tiempos) de la
+    /// jornada de un peer. Pantalla Jornada. Espejo de `peers_tui::cliente::jornada`: el broker es
+    /// quien timbra los tiempos (la IA nunca los estima), aquí sólo se leen.
+    pub async fn jornada(&self, instancia_id: &str) -> ResultadoBroker<RespuestaJornada> {
+        let p = PeticionJornada {
+            instancia_id: instancia_id.to_string(),
+        };
+        self.post("/jornada", &p).await
+    }
+
     /// `POST /admin/reenviar {msg_id}` → re-encola un mensaje del historial como uno nuevo
     /// (R2.3), con estado `Enviado` y traza `reenviado_de`/`reenvios`. Acción `r` de la pantalla
     /// Trazabilidad. Devuelve la respuesta tipada para distinguir "reenviado" (`ok=true`) de

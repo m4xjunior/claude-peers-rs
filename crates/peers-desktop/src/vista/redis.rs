@@ -4,43 +4,62 @@
 //! INTENCIÓN: replicar 1:1 lo que muestra la TUI — DOS tablas lado a lado: a la izquierda las
 //! colas de mensajes (peer → nº de mensajes), a la derecha el outbox pendiente (peer → nº de
 //! ítems). La TUI es SOLO LECTURA salvo la tecla `p` (purgar la cola seleccionada); aquí esa única
-//! escritura es el botón "Purgar" por fila de la tabla de colas, que hace `POST /admin/purgar` a
-//! través del `ClienteBroker` y borra cola + outbox de ese peer (idempotente).
+//! escritura es el botón "Purgar" del peer seleccionado, que hace `POST /admin/purgar` a través del
+//! `ClienteBroker` y borra cola + outbox de ese peer (idempotente).
 //!
-//! Decisión de diseño (por qué NO uso `Table` del kit): igual que la Fundación evitó el componente
-//! `Sidebar` por inestabilidad de API entre commits del git, y que la pantalla Alertas evitó
-//! `Table`/`Dialog`, aquí las dos tablas se pintan con `div().v_flex()` de filas. Así la firma del
-//! stub sigue siendo la de la Fundación — `render_redis(&EstadoPantalla) -> impl IntoElement`, sin
-//! `cx` ni estado propio — y la vista permanece PURA: sólo LEE `EstadoPantalla` y DESPACHA la acción
-//! de purgar; toda mutación (POST + recarga) vive en `AppDesktop`, que es quien tiene `cx`. Para la
-//! acción uso `Button` de gpui-component (variante `danger`, coherente con "Descartar" en Alertas).
+//! REDISEÑO ETHOS (por qué se reescribió): la versión anterior usaba azules/grises genéricos
+//! (0x1A1A28, 0xEAB308, 0x6B7280…) y no era operable como la TUI (filas no seleccionables). Ahora:
+//!  - Todo el color sale del módulo `tema` (paleta pergamino/tinta + acento brasa). CERO literales
+//!    de color hardcodeados salvo el rojo del banner de error (semántica de fallo, no de marca).
+//!  - La tabla de colas es OPERABLE como la TUI: cada fila es `tema::fila_seleccionable`, clicable,
+//!    y despacha `SeleccionarColaRedis { indice }`. La fila activa se resalta con brasa tenue.
+//!  - La acción `Purgar` cuelga del peer SELECCIONADO (espejo de la tecla `p` sobre la fila
+//!    resaltada), no una por fila: así la escritura sigue el mismo modelo mental que la TUI.
+//!
+//! Decisión de diseño (por qué NO uso `Table` del kit): igual que la Fundación evitó `Sidebar` y
+//! Alertas evitó `Table`/`Dialog` por inestabilidad de API entre commits del git, aquí las dos
+//! tablas se pintan con `div().v_flex()` de filas. La firma del stub sigue siendo la de la Fundación
+//! — `render_redis(&EstadoPantalla) -> impl IntoElement`, sin `cx` ni estado propio — y la vista
+//! permanece PURA: sólo LEE `EstadoPantalla` y DESPACHA acciones; toda mutación (selección, POST +
+//! recarga) vive en `AppDesktop`, que es quien tiene `cx`. Los botones son `tema::boton_*` (no el
+//! `Button` del kit) para mantener el look Ethos exacto y no atarnos a su tema.
 
 use gpui::{
-    div, prelude::FluentBuilder, px, rgb, Action, AnyElement, InteractiveElement, IntoElement,
-    ParentElement, SharedString, Styled,
+    div, prelude::FluentBuilder, px, rgb, Action, AnyElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
-use gpui_component::{
-    button::{Button, ButtonVariants},
-    StyledExt,
-};
+// `v_flex`/`h_flex`/`min_w_0` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
+use gpui_component::StyledExt;
 use peers_core::ColaResumen;
 
 use crate::app::EstadoPantalla;
+use crate::tema;
 
 // -------------------------------------------------------------------------------------------------
-// ACCIÓN — la vista es pura (sin `cx`), así que no cablea callbacks: DESPACHA una acción que
-// `AppDesktop` registra con `.on_action(cx.listener(...))`. El payload lleva sólo el `id` del peer,
-// que es lo único que el POST `/admin/purgar` necesita (borra cola + outbox de ese id). Namespace
-// propio (`redis`) para no colisionar con las acciones de otras pantallas.
+// ACCIONES — la vista es pura (sin `cx`), así que no cablea callbacks: DESPACHA acciones que
+// `AppDesktop` maneja con `.on_action(cx.listener(...))` en su contenedor raíz. GPUI hace burbujear
+// la acción por el árbol desde el elemento clicado hasta ese manejador, sin depender del foco.
+// Namespace propio (`redis`) para no colisionar con las acciones de otras pantallas.
+//
+// `#[action(namespace = redis, no_json)]`: mismo patrón que Alertas. En este rev de gpui el registro
+// se hace con `derive(Action)` (la macro `impl_actions!` ya no existe). `no_json` evita exigir
+// `serde::Deserialize` + `schemars::JsonSchema`: estas acciones sólo se despachan por código
+// (`window.dispatch_action`), nunca desde un keymap JSON.
 // -------------------------------------------------------------------------------------------------
 
-/// Acción de purgar la cola + outbox de un peer concreto. Lleva el `id` del peer, que es la clave
-/// que `POST /admin/purgar` espera. Se despacha desde el botón "Purgar" de cada fila de colas.
-///
-/// `#[action(namespace = redis, no_json)]`: mismo patrón que las acciones de Alertas. En este rev
-/// de gpui el registro de acciones se hace con `derive(Action)` (la macro `impl_actions!` ya no
-/// existe). `no_json` evita exigir `serde::Deserialize` + `schemars::JsonSchema`: esta acción sólo
-/// se despacha por código (`window.dispatch_action`), nunca desde un keymap JSON.
+/// Seleccionar la fila `indice` de la tabla de COLAS (click en la fila). Índice en la lista actual
+/// de colas. `AppDesktop` guardará ese índice en `EstadoPantalla.redis_seleccion_cola` para que la
+/// fila se resalte y el botón "Purgar" sepa sobre qué peer actúa. Espejo del cursor de la TUI.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = redis, no_json)]
+pub struct SeleccionarColaRedis {
+    pub indice: usize,
+}
+
+/// Purgar la cola + outbox del peer seleccionado → `POST /admin/purgar`. Lleva el `id` del peer,
+/// que es la clave que el endpoint espera (borra cola + outbox de ese id, idempotente). Se despacha
+/// desde el botón "Purgar", que sólo aparece cuando hay una cola seleccionada. Espejo de la tecla
+/// `p` de la TUI sobre la fila resaltada.
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = redis, no_json)]
 pub struct PurgarPeer {
@@ -51,9 +70,9 @@ pub struct PurgarPeer {
 // RENDER
 // -------------------------------------------------------------------------------------------------
 
-/// Punto de entrada de la pantalla (firma estable de la Fundación). Compone: banner de error (si
-/// hubo), cabecera con el conteo de peers y las DOS tablas lado a lado (colas | outbox). Espejo del
-/// layout de dos columnas al 50/50 de la TUI.
+/// Punto de entrada de la pantalla (firma estable de la Fundación). Compone: eyebrow + título con el
+/// conteo de peers, banner de error (si hubo) y las DOS tablas lado a lado (colas | outbox), cada
+/// una en su propia `superficie_card`. Espejo del layout de dos columnas al 50/50 de la TUI.
 pub fn render_redis(datos: &EstadoPantalla) -> impl IntoElement {
     // Datos ya cargados por la app; `None` = aún sin primera respuesta u offline (se explica abajo).
     let (total, colas, outbox): (usize, &[ColaResumen], &[ColaResumen]) = match &datos.redis {
@@ -61,20 +80,21 @@ pub fn render_redis(datos: &EstadoPantalla) -> impl IntoElement {
         None => (0, &[], &[]),
     };
 
-    let mut raiz = div().v_flex().size_full().gap_3().p_6();
+    let mut raiz = tema::fondo_app().v_flex().gap_4().p_6();
 
-    // Cabecera: título + nº de peers, espejo del título de la TUI (" Colas de mensajes · N peers ").
+    // Cabecera Ethos: eyebrow discreto + título display + conteo de peers atenuado.
     raiz = raiz.child(
         div()
-            .h_flex()
-            .items_center()
-            .gap_2()
-            .child(div().text_xl().child(SharedString::from("Redis")))
+            .v_flex()
+            .gap_1()
+            .child(tema::eyebrow("almacén · redis"))
             .child(
                 div()
-                    .text_sm()
-                    .opacity(0.6)
-                    .child(SharedString::from(format!("({total} peers)"))),
+                    .h_flex()
+                    .items_end()
+                    .gap_3()
+                    .child(tema::titulo("Colas de mensajes"))
+                    .child(tema::texto_terciario(format!("{total} peers"))),
             ),
     );
 
@@ -86,9 +106,14 @@ pub fn render_redis(datos: &EstadoPantalla) -> impl IntoElement {
 
     // Estado sin datos: mismo espíritu que la TUI cuando el broker aún no ha respondido.
     if datos.redis.is_none() {
-        raiz = raiz.child(estado_vacio());
+        raiz = raiz.child(estado_vacio(
+            "Sin datos del almacén todavía. Esperando la respuesta de /admin/redis…",
+        ));
         return raiz;
     }
+
+    // Índice seleccionado en la tabla de colas (para resaltar la fila y alimentar "Purgar").
+    let seleccion = datos.redis_seleccion_cola;
 
     // Cuerpo: dos tablas al 50/50 (colas seleccionable con acción purgar | outbox solo lectura).
     raiz = raiz.child(
@@ -96,146 +121,163 @@ pub fn render_redis(datos: &EstadoPantalla) -> impl IntoElement {
             .h_flex()
             .size_full()
             .gap_4()
-            .child(div().flex_1().child(tabla_colas(colas)))
-            .child(div().flex_1().child(tabla_outbox(outbox))),
+            .child(div().flex_1().min_w_0().child(tabla_colas(colas, seleccion)))
+            .child(div().flex_1().min_w_0().child(tabla_outbox(outbox))),
     );
 
     raiz
 }
 
-/// Banner rojo tenue con el motivo del fallo del broker. Neutro respecto a la variante concreta:
-/// el `Display` de `ErrorBroker` ya da el texto correcto (offline/401/otro).
+/// Banner de error: rojo semántico tenue con el motivo del fallo del broker. Es el ÚNICO color
+/// hardcodeado de la pantalla (semántica de fallo, no de marca); el resto sale del tema.
 fn banner_error(texto: &str) -> AnyElement {
     div()
         .w_full()
         .px_3()
         .py_2()
-        .rounded_md()
+        .rounded(tema::radio(tema::RADIO_CONTROL))
         .bg(rgb(0x7F1D1D))
         .text_color(rgb(0xFEE2E2))
         .child(SharedString::from(format!("⚠ {texto}")))
         .into_any_element()
 }
 
-/// Estado sin datos: aviso mientras no ha llegado la primera respuesta de `/admin/redis`.
-fn estado_vacio() -> AnyElement {
-    div()
+/// Estado sin datos / vacío: aviso atenuado centrado dentro de una superficie card.
+fn estado_vacio(texto: &str) -> AnyElement {
+    tema::superficie_card()
         .v_flex()
         .items_center()
         .justify_center()
         .size_full()
-        .text_color(rgb(0x6B7280))
-        .child(SharedString::from(
-            "Sin datos del almacén todavía. Esperando la respuesta de /admin/redis…",
-        ))
+        .p_6()
+        .child(tema::texto_terciario(texto.to_string()))
         .into_any_element()
 }
 
-// Anchos fijos (px) de las columnas, espejo de los Constraint de la TUI (peer flexible + contador
-// de 12 chars). El nº va en columna estrecha a la derecha; el peer ocupa el resto.
-const COL_CONTADOR: f32 = 90.0;
-const COL_ACCION: f32 = 90.0;
+// Ancho fijo (px) de la columna de contador, espejo del Constraint de la TUI (contador estrecho a la
+// derecha; el peer ocupa el resto flexible).
+const COL_CONTADOR: f32 = 100.0;
 
-/// Tabla IZQUIERDA: colas de mensajes por peer, con botón "Purgar" por fila. Espejo de la tabla
-/// seleccionable de la TUI (la acción `p` purga la cola). Cabecera "peer / mensajes / ·".
-fn tabla_colas(colas: &[ColaResumen]) -> AnyElement {
+/// Tabla IZQUIERDA: colas de mensajes por peer, con filas SELECCIONABLES y botón "Purgar" del peer
+/// seleccionado. Espejo de la tabla seleccionable de la TUI (cursor + tecla `p`). Va dentro de una
+/// `superficie_card` con su título de sección y la cabecera de columnas en `eyebrow`.
+fn tabla_colas(colas: &[ColaResumen], seleccion: Option<usize>) -> AnyElement {
+    // Cabecera de columnas: labels discretos (eyebrow) en vez de dorado a pantalla completa.
     let encabezado = div()
         .h_flex()
         .w_full()
-        .px_2()
+        .px_3()
         .py_1()
         .gap_2()
-        .text_color(rgb(0xEAB308))
-        .font_semibold()
-        .child(div().flex_1().child(SharedString::from("peer")))
-        .child(celda_num("mensajes", COL_CONTADOR))
-        .child(div().w(px(COL_ACCION)).child(SharedString::from("")));
+        .child(div().flex_1().min_w_0().child(tema::eyebrow("peer")))
+        .child(celda_num_eyebrow("mensajes"));
 
+    // Cuerpo: una fila seleccionable por cola, o aviso atenuado si no hay ninguna.
     let mut cuerpo = div().v_flex().w_full().gap_1();
     if colas.is_empty() {
         cuerpo = cuerpo.child(
             div()
-                .px_2()
-                .py_1()
-                .text_color(rgb(0x6B7280))
-                .child(SharedString::from("(sin colas)")),
+                .px_3()
+                .py_2()
+                .child(tema::texto_terciario("(sin colas)")),
         );
     } else {
         for (idx, c) in colas.iter().enumerate() {
-            cuerpo = cuerpo.child(fila_cola(idx, c));
+            let activa = seleccion == Some(idx);
+            cuerpo = cuerpo.child(fila_cola(idx, c, activa));
         }
     }
 
-    div()
+    // Barra de acción inferior: "Purgar" del peer seleccionado (espejo de la tecla `p`). Sólo se
+    // muestra si hay una cola seleccionada válida; si no, un texto guía atenuado.
+    let barra_accion = barra_purgar(colas, seleccion);
+
+    tema::superficie_card()
         .v_flex()
         .size_full()
-        .gap_1()
-        .child(div().font_semibold().child(SharedString::from("Colas de mensajes")))
+        .gap_2()
+        .p_4()
+        .child(tema::texto_primario("Colas de mensajes"))
         .child(encabezado)
         .child(cuerpo)
+        .child(barra_accion)
         .into_any_element()
 }
 
-/// Una fila de cola: peer, nº de mensajes pendientes y botón "Purgar" que despacha `PurgarPeer`.
-/// Filas alternas con fondo tenue para legibilidad (la TUI resalta la seleccionada; aquí, al no
-/// haber selección de teclado, la acción vive por fila directamente).
-fn fila_cola(idx: usize, c: &ColaResumen) -> impl IntoElement {
-    // El id del peer se captura por valor para el payload de la acción (el closure es `Fn`).
-    let id_peer = c.id.clone();
-    let par = idx % 2 == 0;
+/// Barra inferior de la tabla de colas con el botón "Purgar" del peer seleccionado. Modelo mental
+/// de la TUI: seleccionas una fila y pulsas `p`. Aquí: seleccionas (click) y pulsas "Purgar".
+fn barra_purgar(colas: &[ColaResumen], seleccion: Option<usize>) -> AnyElement {
+    // Peer seleccionado (si el índice sigue siendo válido tras una recarga).
+    let peer_sel = seleccion.and_then(|i| colas.get(i)).map(|c| c.id.clone());
 
-    div()
-        .id(SharedString::from(format!("redis-cola-fila-{idx}")))
-        .h_flex()
-        .w_full()
-        .items_center()
-        .px_2()
-        .py_1()
-        .gap_2()
-        .rounded_md()
-        .when(par, |d| d.bg(rgb(0x1A1A28)))
+    let fila = div().h_flex().items_center().justify_between().w_full().pt_2().gap_2();
+
+    match peer_sel {
+        Some(id) => {
+            let id_payload = id.clone();
+            fila
+                .child(tema::texto_terciario(format!("Seleccionado: {id}")))
+                .child(
+                    tema::boton_secundario("redis-purgar", "Purgar cola + outbox").on_click(
+                        move |_evento, window, cx| {
+                            // Despacha la acción; `AppDesktop` hace el POST y recarga. La vista no toca `cx`.
+                            window.dispatch_action(
+                                Box::new(PurgarPeer {
+                                    id: id_payload.clone(),
+                                }),
+                                cx,
+                            );
+                        },
+                    ),
+                )
+                .into_any_element()
+        }
+        None => fila
+            .child(tema::texto_terciario(
+                "Selecciona una cola para purgarla",
+            ))
+            .into_any_element(),
+    }
+}
+
+/// Una fila de cola SELECCIONABLE: peer + nº de mensajes pendientes. Toda la fila es clicable →
+/// despacha `SeleccionarColaRedis { indice }`. La fila activa se resalta (brasa tenue + borde
+/// izquierdo dorado) vía `tema::fila_seleccionable`.
+fn fila_cola(idx: usize, c: &ColaResumen, activa: bool) -> impl IntoElement {
+    tema::fila_seleccionable(SharedString::from(format!("redis-cola-fila-{idx}")), activa)
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .overflow_hidden()
-                .child(SharedString::from(c.id.clone())),
+                .child(tema::texto_primario(c.id.clone())),
         )
-        .child(celda_num(&c.pendientes.to_string(), COL_CONTADOR))
-        .child(
-            div().w(px(COL_ACCION)).child(
-                Button::new(SharedString::from(format!("redis-purgar-{idx}")))
-                    .danger()
-                    .label("Purgar")
-                    .on_click(move |_evento, window, cx| {
-                        // Despacha la acción; `AppDesktop` hace el POST y recarga. La vista no toca `cx`.
-                        window.dispatch_action(Box::new(PurgarPeer { id: id_peer.clone() }), cx);
-                    }),
-            ),
-        )
+        .child(celda_num(&c.pendientes.to_string()))
+        .on_click(move |_evento, window, cx| {
+            // Despacha la selección; `AppDesktop` guarda el índice y muta el estado. La vista no toca `cx`.
+            window.dispatch_action(Box::new(SeleccionarColaRedis { indice: idx }), cx);
+        })
 }
 
 /// Tabla DERECHA: outbox pendiente por peer (SOLO LECTURA, sin acción). Espejo de la tabla derecha
-/// de la TUI. Cabecera "peer / outbox".
+/// de la TUI. Filas no seleccionables (la TUI tampoco actúa sobre el outbox). Cabecera "peer / outbox".
 fn tabla_outbox(outbox: &[ColaResumen]) -> AnyElement {
     let encabezado = div()
         .h_flex()
         .w_full()
-        .px_2()
+        .px_3()
         .py_1()
         .gap_2()
-        .text_color(rgb(0xEAB308))
-        .font_semibold()
-        .child(div().flex_1().child(SharedString::from("peer")))
-        .child(celda_num("outbox", COL_CONTADOR));
+        .child(div().flex_1().min_w_0().child(tema::eyebrow("peer")))
+        .child(celda_num_eyebrow("outbox"));
 
     let mut cuerpo = div().v_flex().w_full().gap_1();
     if outbox.is_empty() {
         cuerpo = cuerpo.child(
             div()
-                .px_2()
-                .py_1()
-                .text_color(rgb(0x6B7280))
-                .child(SharedString::from("(sin outbox)")),
+                .px_3()
+                .py_2()
+                .child(tema::texto_terciario("(sin outbox)")),
         );
     } else {
         for (idx, c) in outbox.iter().enumerate() {
@@ -245,37 +287,54 @@ fn tabla_outbox(outbox: &[ColaResumen]) -> AnyElement {
                     .h_flex()
                     .w_full()
                     .items_center()
-                    .px_2()
-                    .py_1()
+                    .px_3()
+                    .py_2()
                     .gap_2()
-                    .rounded_md()
-                    .when(par, |d| d.bg(rgb(0x1A1A28)))
+                    .rounded(tema::radio(tema::RADIO_CONTROL))
+                    // Cebra sutil sobre la superficie card: las filas pares se sientan sobre TINTA
+                    // (el fondo base), dando ritmo sin introducir un color nuevo.
+                    .when(par, |d| d.bg(tema::TINTA))
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
-                            .child(SharedString::from(c.id.clone())),
+                            .child(tema::texto_primario(c.id.clone())),
                     )
-                    .child(celda_num(&c.pendientes.to_string(), COL_CONTADOR)),
+                    .child(celda_num(&c.pendientes.to_string())),
             );
         }
     }
 
-    div()
+    tema::superficie_card()
         .v_flex()
         .size_full()
-        .gap_1()
-        .child(div().font_semibold().child(SharedString::from("Outbox pendiente")))
+        .gap_2()
+        .p_4()
+        .child(tema::texto_primario("Outbox pendiente"))
         .child(encabezado)
         .child(cuerpo)
         .into_any_element()
 }
 
-/// Celda numérica de ancho fijo, alineada a la derecha (los contadores se leen mejor así).
-fn celda_num(texto: &str, ancho: f32) -> impl IntoElement {
+/// Celda numérica de datos, ancho fijo, alineada a la derecha y en fuente mono (los contadores se
+/// leen mejor tabulados). Mono cae a monospace del sistema si IBM Plex Mono no está instalada.
+fn celda_num(texto: &str) -> impl IntoElement {
     div()
-        .w(px(ancho))
+        .w(px(COL_CONTADOR))
         .flex()
         .justify_end()
+        .font_family(tema::FUENTE_MONO)
+        .text_color(tema::PAPEL)
         .child(SharedString::from(texto.to_string()))
+}
+
+/// Label de columna numérica: eyebrow (mono/humo/mayúsculas) alineado a la derecha, mismo ancho que
+/// la celda de datos para que columna y dato queden a plomo.
+fn celda_num_eyebrow(texto: &str) -> impl IntoElement {
+    div()
+        .w(px(COL_CONTADOR))
+        .flex()
+        .justify_end()
+        .child(tema::eyebrow(texto.to_string()))
 }

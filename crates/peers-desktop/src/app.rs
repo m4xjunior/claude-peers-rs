@@ -12,13 +12,14 @@
 //! contrato de `EstadoPantalla` quedan idénticos.
 
 use gpui::{
-    div, prelude::FluentBuilder, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, Context, Entity, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 // `v_flex`/`h_flex` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
 use gpui_component::StyledExt;
 
 use crate::cliente::ClienteBroker;
+use crate::tema;
 use crate::vista;
 use crate::vista::config::PanelConfig;
 
@@ -106,6 +107,10 @@ pub struct EstadoPantalla {
     /// Último error al hablar con el broker en la carga de Peers, si lo hubo. La pantalla lo pinta
     /// como banner en vez de dejar la tabla vacía sin explicación (offline vs 401 vs otro).
     pub error_peers: Option<crate::cliente::ErrorBroker>,
+    /// Peer seleccionado en la tabla de Peers (`Some(indice)` sobre `instancias`), o `None` si no
+    /// hay ninguno marcado. Habilita la barra de acciones del peer (enviar/jornada). Espejo del
+    /// cursor de la TUI; se acota/limpia al recargar `instancias` (ver `cargar_peers`).
+    pub peers_seleccion: Option<usize>,
 
     // --- Pantalla Trazabilidad (Fase 2) ---
     /// Peer en foco cuyo historial se muestra (espejo de `traza_peer_actual` de la TUI).
@@ -168,12 +173,20 @@ pub struct EstadoPantalla {
     /// pinta como banner (offline vs 401 vs otro) en vez de dejar las tablas mudas. Separado del
     /// resto de `error_*` a propósito: cada pantalla explica su propio fallo.
     pub error_redis: Option<crate::cliente::ErrorBroker>,
+    /// Cola seleccionada en la tabla de colas de Redis (`Some(indice)` sobre `redis.colas`), o
+    /// `None`. Alimenta el botón "Purgar" (que actúa sobre el peer de esa fila) y resalta la fila.
+    /// Espejo del cursor + tecla `p` de la TUI. Tras purgar se pone a `None` (ese peer desaparece).
+    pub redis_seleccion_cola: Option<usize>,
 
     // --- Pantalla Tareas (Fase 2) ---
     /// TODAS las tareas de TODOS los peers (`GET /admin/tareas`), cada `Tarea` con su `instancia_id`,
     /// ordenadas por el broker (inicio desc). Alimentan la tabla global de la pantalla Tareas con el
     /// estado coloreado, estimado vs real y la columna dueño. Vacío = sin tareas o aún sin cargar.
     pub tareas: Vec<peers_core::Tarea>,
+    /// Índice de la fila seleccionada en la tabla de Tareas. Resalta la fila (acento brasa) y decide
+    /// sobre qué tarea opera la barra de acciones (estado/reasignar/forzar). Se acota a `tareas` al
+    /// recargar. Espejo de `alertas_seleccion`. Lo mueve `SeleccionarTarea{indice}` (Fase 3).
+    pub tareas_seleccion: usize,
     /// Último error al hablar con el broker desde la pantalla Tareas (cargar lista o ejecutar una
     /// acción). Se pinta como banner (offline vs 401 vs otro) en vez de dejar la tabla muda.
     pub error_tareas: Option<crate::cliente::ErrorBroker>,
@@ -185,6 +198,11 @@ pub struct EstadoPantalla {
     pub jornada: Option<peers_core::RespuestaJornada>,
     /// Id del peer cuya jornada está cacheada (para el título "Jornada · <id>"). `None` = sin foco.
     pub jornada_peer: Option<String>,
+    /// Índice de la sesión seleccionada en la tabla de sesiones de Jornada (feedback de cursor,
+    /// espejo de la TUI). Sólo UI; se acota al recargar `jornada`.
+    pub jornada_ses_sel: usize,
+    /// Índice de la tarea seleccionada en la tabla de tareas de Jornada. Sólo UI.
+    pub jornada_tar_sel: usize,
 
     // --- Pantalla Config (Fase 2) ---
     /// Panel de configuración con estado propio (Inputs editables + feedback de guardado). Es una
@@ -197,12 +215,16 @@ pub struct EstadoPantalla {
 /// Estado raíz de la app: cliente del broker, pantalla activa y datos cacheados.
 pub struct AppDesktop {
     /// Cliente HTTP hacia el broker. Se guarda para que la Fase 2 dispare recargas con `cx.spawn`.
-    #[allow(dead_code)]
     cliente: ClienteBroker,
     /// Pantalla actualmente visible en el área de contenido.
     activa: Pantalla,
     /// Datos que consumen las pantallas (vacío en Fundación).
     datos: EstadoPantalla,
+    /// Foco del contenedor raíz. INTENCIÓN: sin un `FocusHandle` rastreado por `track_focus` en el
+    /// div raíz, GPUI NO entrega los `KeyDownEvent` a la app → la navegación por teclado (↑/↓/j/k,
+    /// números, Enter, letras de acción, espejo de la TUI) no funcionaría. Se crea al arrancar y se
+    /// enfoca una vez (`window.focus`) para que la ventana capture las teclas desde el primer frame.
+    foco: gpui::FocusHandle,
 }
 
 impl AppDesktop {
@@ -226,10 +248,15 @@ impl AppDesktop {
         // Arranca la carga inicial + el refresco periódico. El `cx` aquí es `Context<Self>` (viene
         // de `cx.new(|cx| AppDesktop::nueva(...))`), así que `cx.spawn` captura la entidad ya creada.
         Self::arrancar_refresco(cx);
+        // Foco del contenedor raíz + enfoque inicial: habilita la captura de teclado desde el
+        // primer frame (patrón de los ejemplos de gpui, p.ej. `tab_stop`).
+        let foco = cx.focus_handle();
+        window.focus(&foco, cx);
         Self {
             cliente,
             activa: Pantalla::Peers,
             datos,
+            foco,
         }
     }
 
@@ -242,6 +269,16 @@ impl AppDesktop {
             self.cargar_pantalla_activa(cx);
             cx.notify();
         }
+    }
+
+    /// Navega a `pantalla` y FUERZA la recarga de sus datos, aunque ya sea la activa. INTENCIÓN:
+    /// `ir_a` no recarga si la pantalla no cambia (evita refetch en clicks del sidebar), pero cuando
+    /// cambia el FOCO dentro de la misma pantalla (p.ej. elegir otro peer en el selector de
+    /// Trazabilidad, ya estando en Trazabilidad), sí hay que recargar. Este helper cubre ese caso.
+    fn navegar_y_cargar(&mut self, pantalla: Pantalla, cx: &mut Context<Self>) {
+        self.activa = pantalla;
+        self.cargar_pantalla_activa(cx);
+        cx.notify();
     }
 
     // --- Carga de datos del broker (feature desktop-carga-datos) ---
@@ -285,6 +322,13 @@ impl AppDesktop {
                     Ok(lista) => {
                         esta.datos.instancias = lista;
                         esta.datos.error_peers = None;
+                        // Acota la selección de peer a la nueva longitud: si la lista encogió y el
+                        // índice quedó fuera de rango, se limpia (evita barra de acciones huérfana).
+                        if let Some(i) = esta.datos.peers_seleccion {
+                            if i >= esta.datos.instancias.len() {
+                                esta.datos.peers_seleccion = None;
+                            }
+                        }
                     }
                     Err(e) => esta.datos.error_peers = Some(e),
                 }
@@ -432,19 +476,38 @@ impl AppDesktop {
         .detach();
     }
 
-    /// Jornada: por ahora sólo asegura el roster (`POST /listar`) para poder elegir el peer en foco.
-    /// La jornada detallada (`POST /jornada`) requiere un método de cliente que aún no existe; se
-    /// deja la caché como está. Documentado como pendiente en el spec (R3.6).
+    /// Jornada: asegura el roster (`POST /listar`) para poder elegir el peer en foco y, si hay un
+    /// peer enfocado (`jornada_peer`), carga su jornada detallada (`POST /jornada`) con sesiones y
+    /// tareas timbradas por el broker. Sin foco no hay fetch de jornada (la vista pinta el texto
+    /// guía "selecciona un peer"). Al recargar se acotan las selecciones de fila a las nuevas
+    /// longitudes para no apuntar fuera de rango tras un cambio de tamaño.
     fn cargar_jornada(&mut self, cx: &mut Context<Self>) {
         let cliente = self.cliente.clone();
-        let fondo = cx
-            .background_executor()
-            .spawn(async move { cliente.bloquear_en(cliente.listar_instancias()) });
+        let foco = self.datos.jornada_peer.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            let peers = cliente.bloquear_en(cliente.listar_instancias());
+            // Sólo pedimos la jornada si hay un peer enfocado; si no, `None` (nada que cargar).
+            let jornada = foco
+                .as_deref()
+                .map(|id| cliente.bloquear_en(cliente.jornada(id)));
+            (peers, jornada)
+        });
         cx.spawn(async move |esta, cx| {
-            let peers = fondo.await;
+            let (peers, jornada) = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
                 if let Ok(lista) = peers {
                     esta.datos.instancias = lista;
+                }
+                // Un fallo al cargar la jornada deja la caché como estaba (mejor que vaciarla).
+                if let Some(Ok(j)) = jornada {
+                    // Acota las selecciones de fila a las nuevas longitudes (defensivo).
+                    if esta.datos.jornada_ses_sel >= j.sesiones.len() {
+                        esta.datos.jornada_ses_sel = 0;
+                    }
+                    if esta.datos.jornada_tar_sel >= j.tareas.len() {
+                        esta.datos.jornada_tar_sel = 0;
+                    }
+                    esta.datos.jornada = Some(j);
                 }
                 cx.notify();
             });
@@ -552,20 +615,620 @@ impl AppDesktop {
         .detach();
     }
 
-    /// Construye un ítem del sidebar: un botón que resalta si es la pantalla activa y, al
-    /// hacer click, navega. Se usa `on_click` con `cx.listener` para poder mutar `self`.
-    fn item_nav(&self, pantalla: Pantalla, cx: &mut Context<Self>) -> impl IntoElement {
+    // --- Manejadores de la pantalla Peers ---
+    // La barra de acciones del peer marcado despacha estas acciones; aquí se mutan `datos` y, en el
+    // caso de "ver jornada", se dispara un fetch (jornada del peer) + navegación a esa pantalla.
+
+    /// Marca el peer de la fila `indice` (o lo limpia si el índice quedó fuera de rango tras una
+    /// recarga). Sólo muta estado local; habilita la barra de acciones del peer.
+    fn seleccionar_peer(&mut self, indice: usize, cx: &mut Context<Self>) {
+        self.datos.peers_seleccion = if indice < self.datos.instancias.len() {
+            Some(indice)
+        } else {
+            None
+        };
+        cx.notify();
+    }
+
+    /// Suelta la selección de peer (botón "Cerrar" de la barra de acciones).
+    fn deseleccionar_peer(&mut self, cx: &mut Context<Self>) {
+        self.datos.peers_seleccion = None;
+        cx.notify();
+    }
+
+    /// "Ver jornada" del peer `id`: fija el foco de jornada, resetea las selecciones de fila de esa
+    /// pantalla, NAVEGA a Jornada y dispara la carga (que ahora sí pide `POST /jornada`). Reutiliza
+    /// `ir_a`, que ya llama a `cargar_pantalla_activa` (→ `cargar_jornada`) al cambiar de pantalla.
+    fn ver_jornada_peer(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.jornada_peer = Some(id);
+        self.datos.jornada = None; // limpia la jornada previa para no mostrar la de otro peer
+        self.datos.jornada_ses_sel = 0;
+        self.datos.jornada_tar_sel = 0;
+        // `navegar_y_cargar` (no `ir_a`): fuerza el fetch aunque ya estuviéramos en Jornada, para
+        // reflejar el peer recién elegido en vez de dejar la jornada anterior/ vacía.
+        self.navegar_y_cargar(Pantalla::Jornada, cx);
+    }
+
+    /// "Enviar mensaje" al peer `id`. La lista de métodos del cliente no expone un envío directo
+    /// peer→peer desde el supervisor (sólo `reenviar` de un mensaje EXISTENTE del historial), y la
+    /// vista pura no puede abrir un compositor de texto. En vez de dejar el botón muerto, se enfoca
+    /// la TRAZABILIDAD de ese peer (donde SÍ se puede reenviar), que es el flujo de mensajería real
+    /// disponible hoy. Documentado como el comportamiento actual hasta que exista un endpoint de
+    /// envío directo del supervisor + un compositor.
+    fn enviar_mensaje_peer(&mut self, id: String, cx: &mut Context<Self>) {
+        self.enfocar_traza(id, cx);
+    }
+
+    // --- Manejadores de la pantalla Trazabilidad ---
+
+    /// Enfoca un peer en Trazabilidad: fija `traza_peer`, resetea selección/timeline, navega a la
+    /// pantalla y dispara la carga del historial (vía `ir_a` → `cargar_trazabilidad`).
+    fn enfocar_traza(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.traza_peer = Some(id);
+        self.datos.traza_seleccion = 0;
+        self.datos.traza_timeline = false;
+        self.datos.historial.clear(); // evita mostrar el historial del peer anterior mientras carga
+        // `navegar_y_cargar` (no `ir_a`): el selector de peer de Trazabilidad se usa ESTANDO ya en
+        // Trazabilidad; con `ir_a` (que no recarga si la pantalla no cambia) el historial no se
+        // refrescaría al cambiar de peer. Aquí forzamos el fetch del nuevo peer.
+        self.navegar_y_cargar(Pantalla::Trazabilidad, cx);
+    }
+
+    /// Selecciona la fila `indice` del historial y ALTERNA su timeline (paridad con la tecla Enter
+    /// de la TUI: re-pulsar sobre la misma fila cierra el timeline). Sólo muta estado local.
+    fn seleccionar_mensaje(&mut self, indice: usize, cx: &mut Context<Self>) {
+        if indice >= self.datos.historial.len() {
+            return;
+        }
+        if self.datos.traza_seleccion == indice && self.datos.traza_timeline {
+            // Misma fila ya abierta → cierra el timeline (alternancia).
+            self.datos.traza_timeline = false;
+        } else {
+            self.datos.traza_seleccion = indice;
+            self.datos.traza_timeline = true;
+        }
+        cx.notify();
+    }
+
+    /// Reenvía el mensaje `msg_id` (`POST /admin/reenviar`) y recarga el historial del peer en foco.
+    /// Patrón idéntico a `descartar_alerta`: escritura + recarga en `cx.spawn`, sin `.unwrap()`.
+    fn reenviar_mensaje(&mut self, msg_id: i64, cx: &mut Context<Self>) {
+        let Some(peer) = self.datos.traza_peer.clone() else {
+            return; // sin peer en foco no hay historial que refrescar
+        };
+        let cliente = self.cliente.clone();
+        cx.spawn(async move |esta, cx| {
+            let resultado = cliente.reenviar(msg_id).await;
+            // Si el reenvío fue aceptado, re-lee el historial para reflejar el nuevo mensaje.
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.historial(&peer).await),
+                Err(_) => None,
+            };
+            let _ = esta.update(cx, |esta, cx| {
+                if let Some(Ok(lista)) = recarga {
+                    let n = lista.len();
+                    esta.datos.historial = lista;
+                    if esta.datos.traza_seleccion >= n {
+                        esta.datos.traza_seleccion = n.saturating_sub(1);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- Manejadores de la pantalla Tareas ---
+    // Cada acción de escritura sigue el patrón de `descartar_alerta`: POST en `cx.spawn`, y al
+    // volver se recarga `admin_tareas` para reflejar el estado real (el broker valida transiciones).
+
+    /// Marca la fila `indice` de la tabla de tareas (sólo UI; la barra de acciones opera sobre ella).
+    fn seleccionar_tarea(&mut self, indice: usize, cx: &mut Context<Self>) {
+        self.datos.tareas_seleccion = indice;
+        cx.notify();
+    }
+
+    /// Transiciona el estado de una tarea (`POST /tarea/estado`) y recarga la lista. El broker
+    /// valida la transición; si la rechaza, el error se pinta en el banner (`error_tareas`).
+    fn cambiar_estado_tarea(
+        &mut self,
+        tarea_id: String,
+        estado: peers_core::EstadoTarea,
+        cx: &mut Context<Self>,
+    ) {
+        let cliente = self.cliente.clone();
+        cx.spawn(async move |esta, cx| {
+            let resultado = cliente.tarea_estado(&tarea_id, estado, None, None).await;
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.admin_tareas().await),
+                Err(_) => None,
+            };
+            let _ = esta.update(cx, |esta, cx| {
+                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Reasigna una tarea a otro peer (`POST /tarea/reasignar`) y recarga. Si `nuevo_instancia_id`
+    /// llega vacío (la vista no tiene selector de peer todavía), se resuelve una ruta por defecto:
+    /// el SIGUIENTE peer vivo de `instancias` distinto del dueño actual (rota el trabajo, espejo del
+    /// ciclado con la tecla `a` de la TUI). Si no hay otro peer, se ignora (no hay a quién reasignar).
+    fn reasignar_tarea(&mut self, tarea_id: String, nuevo_instancia_id: String, cx: &mut Context<Self>) {
+        let destino = if !nuevo_instancia_id.is_empty() {
+            Some(nuevo_instancia_id)
+        } else {
+            self.siguiente_peer_para_tarea(&tarea_id)
+        };
+        let Some(destino) = destino else {
+            // No hay otro peer vivo al que reasignar: avisa en el banner y no llama al broker.
+            self.datos.error_tareas = Some(crate::cliente::ErrorBroker::Otro(
+                "no hay otro peer vivo al que reasignar la tarea".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let cliente = self.cliente.clone();
+        cx.spawn(async move |esta, cx| {
+            let resultado = cliente.tarea_reasignar(&tarea_id, &destino).await;
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.admin_tareas().await),
+                Err(_) => None,
+            };
+            let _ = esta.update(cx, |esta, cx| {
+                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// "Tócale el hombro": `POST /tarea/forzar`. No cambia el estado; recarga por consistencia.
+    fn forzar_tarea(&mut self, tarea_id: String, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        cx.spawn(async move |esta, cx| {
+            let resultado = cliente.tarea_forzar(&tarea_id).await;
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.admin_tareas().await),
+                Err(_) => None,
+            };
+            let _ = esta.update(cx, |esta, cx| {
+                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Crea una tarea nueva (`POST /tarea/asignar`) y recarga. Si `instancia_id`/`descripcion` van
+    /// vacíos (la vista no tiene formulario de captura todavía), se resuelve una ruta por defecto:
+    /// asignar al PRIMER peer vivo una tarea con descripción marcador, para que el flujo end-to-end
+    /// funcione y quede visible en la tabla. Documentado como comportamiento provisional hasta que
+    /// exista un diálogo de captura (peer + descripción + estimado).
+    fn asignar_tarea(
+        &mut self,
+        instancia_id: String,
+        descripcion: String,
+        estimado_seg: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        // Peer destino: el indicado, o el primer peer vivo como ruta por defecto.
+        let destino = if !instancia_id.is_empty() {
+            Some(instancia_id)
+        } else {
+            self.datos.instancias.first().map(|i| i.id.clone())
+        };
+        let Some(destino) = destino else {
+            self.datos.error_tareas = Some(crate::cliente::ErrorBroker::Otro(
+                "no hay ningún peer vivo al que asignar una tarea".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        // Descripción: la indicada, o un marcador provisional (hasta que haya formulario).
+        let descripcion = if descripcion.is_empty() {
+            "(tarea nueva — editar descripción)".to_string()
+        } else {
+            descripcion
+        };
+        let cliente = self.cliente.clone();
+        cx.spawn(async move |esta, cx| {
+            let resultado = cliente
+                .tarea_asignar(&destino, &descripcion, estimado_seg)
+                .await;
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.admin_tareas().await),
+                Err(_) => None,
+            };
+            let _ = esta.update(cx, |esta, cx| {
+                Self::aplicar_recarga_tareas(esta, resultado.err(), recarga, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Aplica el resultado de una acción sobre tareas: guarda el error (si lo hubo) en el banner, o
+    /// refresca `tareas` con la recarga y acota `tareas_seleccion` a la nueva longitud. Centraliza
+    /// el post-proceso común de las 4 acciones de escritura de tareas para no repetirlo.
+    fn aplicar_recarga_tareas(
+        esta: &mut Self,
+        error: Option<crate::cliente::ErrorBroker>,
+        recarga: Option<crate::cliente::ResultadoBroker<Vec<peers_core::Tarea>>>,
+        cx: &mut Context<Self>,
+    ) {
+        match error {
+            Some(e) => esta.datos.error_tareas = Some(e), // la acción falló: conserva la lista previa
+            None => {
+                esta.datos.error_tareas = None;
+                match recarga {
+                    Some(Ok(lista)) => {
+                        esta.datos.tareas = lista;
+                        let n = esta.datos.tareas.len();
+                        if n == 0 {
+                            esta.datos.tareas_seleccion = 0;
+                        } else if esta.datos.tareas_seleccion >= n {
+                            esta.datos.tareas_seleccion = n - 1;
+                        }
+                    }
+                    // La acción fue OK pero la recarga falló: informa sin romper la lista.
+                    Some(Err(e)) => esta.datos.error_tareas = Some(e),
+                    None => {}
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Devuelve el siguiente peer vivo distinto del dueño actual de la tarea `tarea_id`, para la
+    /// reasignación por defecto (rotación). `None` si la tarea no está o no hay otro peer.
+    fn siguiente_peer_para_tarea(&self, tarea_id: &str) -> Option<String> {
+        let dueño = self
+            .datos
+            .tareas
+            .iter()
+            .find(|t| t.id == tarea_id)
+            .map(|t| t.instancia_id.as_str())?;
+        let n = self.datos.instancias.len();
+        if n == 0 {
+            return None;
+        }
+        // Posición del dueño en el roster (si está); rota al siguiente índice.
+        let pos = self.datos.instancias.iter().position(|i| i.id == dueño);
+        let inicio = pos.map(|p| p + 1).unwrap_or(0);
+        for offset in 0..n {
+            let cand = &self.datos.instancias[(inicio + offset) % n];
+            if cand.id != dueño {
+                return Some(cand.id.clone());
+            }
+        }
+        None
+    }
+
+    // --- Manejadores de la pantalla Redis ---
+
+    /// Marca la cola de la fila `indice` (o la limpia si quedó fuera de rango). Alimenta "Purgar".
+    fn seleccionar_cola_redis(&mut self, indice: usize, cx: &mut Context<Self>) {
+        let total = self
+            .datos
+            .redis
+            .as_ref()
+            .map(|r| r.colas.len())
+            .unwrap_or(0);
+        self.datos.redis_seleccion_cola = if indice < total { Some(indice) } else { None };
+        cx.notify();
+    }
+
+    /// Purga cola + outbox del peer `id` (`POST /admin/purgar`) y recarga `admin_redis`. Como ese
+    /// peer desaparece de la lista, tras la recarga se limpia la selección (evita índice colgado).
+    fn purgar_peer(&mut self, id: String, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        cx.spawn(async move |esta, cx| {
+            let resultado = cliente.purgar(&id).await;
+            let recarga = match &resultado {
+                Ok(_) => Some(cliente.admin_redis().await),
+                Err(_) => None,
+            };
+            let _ = esta.update(cx, |esta, cx| {
+                match resultado {
+                    Ok(_) => {
+                        esta.datos.error_redis = None;
+                        if let Some(Ok(v)) = recarga {
+                            esta.datos.redis = Some(v);
+                        } else if let Some(Err(e)) = recarga {
+                            esta.datos.error_redis = Some(e);
+                        }
+                        // El peer purgado ya no está: soltar la selección (clave era el id, no el índice).
+                        esta.datos.redis_seleccion_cola = None;
+                    }
+                    Err(e) => esta.datos.error_redis = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- Manejadores de Jornada (sólo UI) ---
+
+    /// Marca la fila `indice` de la tabla de SESIONES de Jornada (sólo feedback visual).
+    fn seleccionar_sesion_jornada(&mut self, indice: usize, cx: &mut Context<Self>) {
+        self.datos.jornada_ses_sel = indice;
+        cx.notify();
+    }
+
+    /// Marca la fila `indice` de la tabla de TAREAS de Jornada (sólo feedback visual).
+    fn seleccionar_tarea_jornada(&mut self, indice: usize, cx: &mut Context<Self>) {
+        self.datos.jornada_tar_sel = indice;
+        cx.notify();
+    }
+
+    // --- Navegación por teclado (espejo de la TUI) ---
+    // Se maneja en el `on_key_down` del contenedor raíz (que rastrea el foco). Documentación del
+    // mapa completo en el comentario de `manejar_tecla`.
+
+    /// Mueve la selección de fila de la PANTALLA ACTIVA en `delta` (+1 abajo, -1 arriba), acotando a
+    /// los límites (sin envolver). Cada pantalla tiene su propio cursor; esta función enruta al que
+    /// corresponde. Las pantallas sin tabla (Broker/Config/Acceso) no hacen nada.
+    fn mover_seleccion(&mut self, delta: i32, cx: &mut Context<Self>) {
+        // Helper local: aplica delta a un `usize` dentro de `[0, len)`, saturando en los extremos.
+        fn mover(actual: usize, delta: i32, len: usize) -> usize {
+            if len == 0 {
+                return 0;
+            }
+            let nuevo = actual as i64 + delta as i64;
+            nuevo.clamp(0, len as i64 - 1) as usize
+        }
+        match self.activa {
+            Pantalla::Peers => {
+                let len = self.datos.instancias.len();
+                if len == 0 {
+                    return;
+                }
+                let actual = self.datos.peers_seleccion.unwrap_or(0);
+                self.datos.peers_seleccion = Some(mover(actual, delta, len));
+            }
+            Pantalla::Alertas => {
+                self.datos.alertas_seleccion =
+                    mover(self.datos.alertas_seleccion, delta, self.datos.alertas.len());
+            }
+            Pantalla::Tareas => {
+                self.datos.tareas_seleccion =
+                    mover(self.datos.tareas_seleccion, delta, self.datos.tareas.len());
+            }
+            Pantalla::Trazabilidad => {
+                self.datos.traza_seleccion =
+                    mover(self.datos.traza_seleccion, delta, self.datos.historial.len());
+            }
+            Pantalla::Redis => {
+                let len = self
+                    .datos
+                    .redis
+                    .as_ref()
+                    .map(|r| r.colas.len())
+                    .unwrap_or(0);
+                if len == 0 {
+                    return;
+                }
+                let actual = self.datos.redis_seleccion_cola.unwrap_or(0);
+                self.datos.redis_seleccion_cola = Some(mover(actual, delta, len));
+            }
+            Pantalla::Jornada => {
+                // La jornada tiene dos tablas; con teclado movemos la de sesiones (la primera).
+                if let Some(j) = &self.datos.jornada {
+                    self.datos.jornada_ses_sel =
+                        mover(self.datos.jornada_ses_sel, delta, j.sesiones.len());
+                }
+            }
+            Pantalla::Broker | Pantalla::Config | Pantalla::Acceso => {}
+        }
+        cx.notify();
+    }
+
+    /// Abre el detalle/timeline de la fila seleccionada en la pantalla activa (tecla Enter, espejo
+    /// del modal `Enter` de la TUI). En Alertas abre el panel de detalle; en Trazabilidad abre el
+    /// timeline; en el resto no aplica.
+    fn abrir_seleccion(&mut self, cx: &mut Context<Self>) {
+        match self.activa {
+            Pantalla::Alertas => {
+                let idx = self.datos.alertas_seleccion;
+                self.abrir_detalle_alerta(idx, cx);
+            }
+            Pantalla::Trazabilidad => {
+                let idx = self.datos.traza_seleccion;
+                self.seleccionar_mensaje(idx, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Ejecuta la letra de acción del TUI sobre la fila seleccionada de la pantalla activa. Mapa:
+    ///   - Tareas:  c=en curso, b=bloquear, h=hecha, x=cancelar, a=reasignar, f=forzar
+    ///   - Alertas: d=descartar (la seleccionada)
+    ///   - Redis:   p=purgar (la cola seleccionada)
+    ///   - Trazab.: r=reenviar (el mensaje seleccionado)
+    /// Devuelve `true` si la tecla correspondía a una acción de la pantalla activa (para consumirla).
+    fn ejecutar_letra_accion(&mut self, tecla: &str, cx: &mut Context<Self>) -> bool {
+        use peers_core::EstadoTarea;
+        match self.activa {
+            Pantalla::Tareas => {
+                let Some(t) = self.datos.tareas.get(self.datos.tareas_seleccion) else {
+                    return false;
+                };
+                let tarea_id = t.id.clone();
+                match tecla {
+                    "c" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::EnCurso, cx),
+                    "b" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::Bloqueada, cx),
+                    "h" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::Hecha, cx),
+                    "x" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::Cancelada, cx),
+                    "a" => self.reasignar_tarea(tarea_id, String::new(), cx),
+                    "f" => self.forzar_tarea(tarea_id, cx),
+                    _ => return false,
+                }
+                true
+            }
+            Pantalla::Alertas => {
+                if tecla != "d" {
+                    return false;
+                }
+                let Some(a) = self.datos.alertas.get(self.datos.alertas_seleccion) else {
+                    return false;
+                };
+                let tipo = crate::vista::alertas::tipo_serializado(a.tipo).to_string();
+                let sujeto = a.sujeto.clone();
+                self.descartar_alerta(tipo, sujeto, cx);
+                true
+            }
+            Pantalla::Redis => {
+                if tecla != "p" {
+                    return false;
+                }
+                let id = self
+                    .datos
+                    .redis_seleccion_cola
+                    .and_then(|i| self.datos.redis.as_ref().and_then(|r| r.colas.get(i)))
+                    .map(|c| c.id.clone());
+                if let Some(id) = id {
+                    self.purgar_peer(id, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            Pantalla::Trazabilidad => {
+                if tecla != "r" {
+                    return false;
+                }
+                let msg_id = self
+                    .datos
+                    .historial
+                    .get(self.datos.traza_seleccion)
+                    .map(|m| m.id);
+                if let Some(msg_id) = msg_id {
+                    self.reenviar_mensaje(msg_id, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Punto único de la navegación por teclado, espejo de la TUI. Se llama desde el `on_key_down`
+    /// del contenedor raíz. MAPA DE TECLAS:
+    ///   - `1`..`9`            → cambia a la pantalla N (orden del sidebar `Pantalla::TODAS`).
+    ///   - `tab`               → siguiente pantalla; `shift-tab` → anterior (cíclico).
+    ///   - `down` / `j`        → baja la selección de fila; `up` / `k` → sube (pantalla activa).
+    ///   - `enter`             → abre detalle (Alertas) / timeline (Trazabilidad) de la fila.
+    ///   - `escape`            → cierra detalle/timeline o suelta selección de peer, según pantalla.
+    ///   - letras de acción    → c/b/h/x/a/f (Tareas), d (Alertas), p (Redis), r (Trazabilidad).
+    /// Se ignoran las pulsaciones con Cmd/Ctrl/Alt (reservadas al SO / atajos globales del kit) para
+    /// no pisar copiar/pegar ni cerrar ventana.
+    fn manejar_tecla(&mut self, ev: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        // No interceptamos combinaciones con modificadores de sistema (salvo shift, que usamos para
+        // shift-tab): dejar pasar Cmd+C, Ctrl+…, etc.
+        if m.platform || m.control || m.alt || m.function {
+            return;
+        }
+        let tecla = ks.key.as_str();
+        match tecla {
+            // Números 1..9 → pantalla por posición en el sidebar.
+            d @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+                if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10)) {
+                    let idx = (n as usize).saturating_sub(1);
+                    if let Some(p) = Pantalla::TODAS.get(idx) {
+                        self.ir_a(*p, cx);
+                    }
+                }
+            }
+            "tab" => {
+                let siguiente = if m.shift {
+                    self.pantalla_relativa(-1)
+                } else {
+                    self.pantalla_relativa(1)
+                };
+                self.ir_a(siguiente, cx);
+            }
+            "down" | "j" => self.mover_seleccion(1, cx),
+            "up" | "k" => self.mover_seleccion(-1, cx),
+            "enter" => self.abrir_seleccion(cx),
+            "escape" => self.manejar_escape(cx),
+            // Letras de acción del TUI (dependen de la pantalla activa).
+            otra => {
+                self.ejecutar_letra_accion(otra, cx);
+            }
+        }
+    }
+
+    /// Cierra el panel/timeline abierto o suelta la selección de peer, según la pantalla activa
+    /// (tecla Escape). Es el "volver atrás" contextual, espejo del Esc de la TUI.
+    fn manejar_escape(&mut self, cx: &mut Context<Self>) {
+        match self.activa {
+            Pantalla::Alertas => self.cerrar_detalle_alerta(cx),
+            Pantalla::Trazabilidad => {
+                if self.datos.traza_timeline {
+                    self.datos.traza_timeline = false;
+                    cx.notify();
+                }
+            }
+            Pantalla::Peers => self.deseleccionar_peer(cx),
+            _ => {}
+        }
+    }
+
+    /// Pantalla situada `delta` posiciones respecto a la activa en `Pantalla::TODAS`, de forma
+    /// cíclica (para Tab / Shift-Tab). `delta` puede ser negativo.
+    fn pantalla_relativa(&self, delta: i32) -> Pantalla {
+        let todas = Pantalla::TODAS;
+        let n = todas.len() as i32;
+        let pos = todas.iter().position(|p| *p == self.activa).unwrap_or(0) as i32;
+        let idx = (((pos + delta) % n) + n) % n; // módulo positivo
+        todas[idx as usize]
+    }
+
+    /// Construye un ítem del sidebar con el tema Ethos: la pantalla activa se marca con acento brasa
+    /// (fondo dorado tenue + borde izquierdo dorado + texto papel), las inactivas van en humo con
+    /// hover a TINTA2. Un número de atajo (1..9) a la izquierda, espejo de la navegación por teclado.
+    /// Click → navega (`cx.listener` para poder mutar `self`).
+    fn item_nav(&self, pantalla: Pantalla, indice: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let activa = self.activa == pantalla;
-        div()
+        // Número de atajo (1-based) alineado a la izquierda, en mono/humo (o brasa si activa).
+        let numero = div()
+            .w(gpui::px(18.0))
+            .font_family(tema::FUENTE_MONO)
+            .text_xs()
+            .text_color(if activa { tema::BRASA } else { tema::HUMO })
+            .child(SharedString::from((indice + 1).to_string()));
+
+        let etiqueta = div()
+            .flex_1()
+            .text_color(if activa { tema::PAPEL } else { tema::HUMO })
+            .when(activa, |d| d.font_weight(FontWeight::MEDIUM))
+            .child(SharedString::from(pantalla.titulo()));
+
+        let base = div()
             .id(pantalla.id())
+            .h_flex()
+            .items_center()
             .w_full()
+            .gap_2()
             .px_3()
             .py_2()
-            .rounded_md()
-            .cursor_pointer()
-            // Resalte simple para la activa; el tema del kit lo refinará en Fase 2.
-            .when(activa, |d| d.bg(gpui::rgba(0x3b82f680)))
-            .child(SharedString::from(pantalla.titulo()))
+            .rounded(tema::radio(tema::RADIO_CONTROL))
+            // Borde izquierdo SIEMPRE presente (transparente en reposo) para que el ítem no salte
+            // 2px al activarse; sólo cambia el color — mismo criterio que `tema::fila_seleccionable`.
+            .border_l_2()
+            .cursor_pointer();
+
+        let base = if activa {
+            base.bg(tema::BRASA_TENUE).border_color(tema::BRASA)
+        } else {
+            base.border_color(gpui::rgba(0x00000000))
+                .hover(|s| s.bg(tema::TINTA2))
+        };
+
+        base.child(numero)
+            .child(etiqueta)
             .on_click(cx.listener(move |esta, _evento, _window, cx| {
                 esta.ir_a(pantalla, cx);
             }))
@@ -591,39 +1254,109 @@ impl AppDesktop {
 
 impl Render for AppDesktop {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Sidebar navegable: cabecera + un ítem por pantalla, en el orden canónico.
+        // Sidebar navegable (tema Ethos): cabecera con marca + un ítem por pantalla, en orden
+        // canónico. Cada ítem lleva su número de atajo (1..9) espejo de la navegación por teclado.
         let items = Pantalla::TODAS
             .iter()
-            .map(|p| self.item_nav(*p, cx))
+            .enumerate()
+            .map(|(i, p)| self.item_nav(*p, i, cx))
             .collect::<Vec<_>>();
+
+        // Cabecera del sidebar: eyebrow discreto + título de marca en la fuente display (Fraunces
+        // fallback). Reemplaza el `text_lg` plano previo.
+        let cabecera_sidebar = div()
+            .v_flex()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .pb_4()
+            .child(tema::eyebrow("red"))
+            .child(tema::titulo("claude-peers").text_size(gpui::px(20.0)));
 
         let sidebar = div()
             .v_flex()
             .h_full()
-            .w(gpui::px(220.0))
+            .w(gpui::px(232.0))
+            .flex_shrink_0()
             .gap_1()
-            .p_2()
-            .bg(gpui::rgba(0x00000020))
+            .p_3()
+            // Fondo del sidebar un paso por encima de la tinta base (superficie tenue) + borde
+            // derecho de separación con el área de contenido.
+            .bg(tema::TINTA2)
+            .border_r_1()
+            .border_color(tema::LINEA)
+            .child(cabecera_sidebar)
+            .children(items)
+            // Empuja el pie de marca al fondo del sidebar (spacer flexible).
+            .child(div().flex_1())
+            // Pie de marca Lexusfx: crédito del autor con el tema Ethos (eyebrow en mono/humo,
+            // marca en dorado brasa, email en mono tenue). Identidad del producto, discreta.
             .child(
                 div()
+                    .v_flex()
+                    .gap_1()
                     .px_3()
                     .py_2()
-                    .text_lg()
-                    .child(SharedString::from("claude-peers")),
-            )
-            .children(items);
+                    .border_t_1()
+                    .border_color(tema::LINEA)
+                    .child(
+                        div()
+                            .font_family("IBM Plex Mono")
+                            .text_size(gpui::px(10.0))
+                            .text_color(tema::HUMO)
+                            .child(SharedString::from("LEXUSFX")),
+                    )
+                    .child(
+                        div()
+                            .text_size(gpui::px(12.0))
+                            .text_color(tema::BRASA)
+                            .child(SharedString::from("Max")),
+                    )
+                    .child(
+                        div()
+                            .font_family("IBM Plex Mono")
+                            .text_size(gpui::px(10.0))
+                            .text_color(tema::HUMO)
+                            .child(SharedString::from("Max@lexusfx.com")),
+                    ),
+            );
 
-        // Área de contenido: título de la pantalla activa (Fundación) vía su stub.
-        let contenido = div().v_flex().size_full().child(self.contenido());
+        // Área de contenido: la pantalla activa. Ocupa el resto del ancho y hace scroll si su
+        // contenido excede el alto de la ventana (las pantallas largas —jornada, broker— no se
+        // cortan). `min_w_0` deja que el flex encoja el hijo en vez de desbordar el sidebar.
+        let contenido = div()
+            .id("contenido-scroll")
+            .v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_y_scroll()
+            .child(self.contenido());
 
-        // Layout raíz de dos columnas que ocupa toda la ventana. Aquí se registran los
-        // manejadores de acciones de la pantalla Alertas: sus filas/botones DESPACHAN acciones
-        // (`window.dispatch_action`) que burbujean hasta este contenedor, donde `cx.listener`
-        // permite mutar el estado. Es el puente entre la vista pura y el estado de la app.
+        // Acciones de las 9 pantallas. Cada vista pura DESPACHA su Action (`window.dispatch_action`);
+        // GPUI la burbujea hasta este contenedor raíz, donde `cx.listener` permite mutar el estado y
+        // (si aplica) disparar el fetch + recarga. Es el puente único vista-pura → estado de la app.
+        use crate::vista::acceso::RecargarAcceso;
         use crate::vista::alertas::{AbrirDetalle, CerrarDetalleAlerta, Descartar};
-        div()
+        use crate::vista::broker::RecargarBroker;
+        use crate::vista::config::RecargarConfig;
+        use crate::vista::jornada::{SeleccionarSesion, SeleccionarTareaJornada};
+        use crate::vista::peers::{DeseleccionarPeer, EnviarMensajePeer, SeleccionarPeer, VerJornadaPeer};
+        use crate::vista::redis::{PurgarPeer, SeleccionarColaRedis};
+        use crate::vista::tareas::{
+            AsignarTarea, CambiarEstadoTarea, ForzarTarea, ReasignarTarea, SeleccionarTarea,
+        };
+        use crate::vista::trazabilidad::{EnfocarPeer, ReenviarMensaje, SeleccionarMensaje};
+
+        // Layout raíz de dos columnas sobre el fondo Ethos. `track_focus` + el enfoque inicial de
+        // `nueva` habilitan la captura de teclado (`on_key_down`); sin él, GPUI no entrega teclas.
+        tema::fondo_app()
             .h_flex()
-            .size_full()
+            .track_focus(&self.foco)
+            .on_key_down(cx.listener(|esta, ev: &gpui::KeyDownEvent, _window, cx| {
+                esta.manejar_tecla(ev, cx);
+            }))
+            // --- Alertas (ya existían) ---
             .on_action(cx.listener(|esta, accion: &AbrirDetalle, _window, cx| {
                 esta.abrir_detalle_alerta(accion.indice, cx);
             }))
@@ -632,6 +1365,72 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, accion: &Descartar, _window, cx| {
                 esta.descartar_alerta(accion.tipo.clone(), accion.sujeto.clone(), cx);
+            }))
+            // --- Peers ---
+            .on_action(cx.listener(|esta, a: &SeleccionarPeer, _window, cx| {
+                esta.seleccionar_peer(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &DeseleccionarPeer, _window, cx| {
+                esta.deseleccionar_peer(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &VerJornadaPeer, _window, cx| {
+                esta.ver_jornada_peer(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, a: &EnviarMensajePeer, _window, cx| {
+                esta.enviar_mensaje_peer(a.id.clone(), cx);
+            }))
+            // --- Trazabilidad ---
+            .on_action(cx.listener(|esta, a: &EnfocarPeer, _window, cx| {
+                esta.enfocar_traza(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, a: &SeleccionarMensaje, _window, cx| {
+                esta.seleccionar_mensaje(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ReenviarMensaje, _window, cx| {
+                esta.reenviar_mensaje(a.msg_id, cx);
+            }))
+            // --- Tareas ---
+            .on_action(cx.listener(|esta, a: &SeleccionarTarea, _window, cx| {
+                esta.seleccionar_tarea(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &CambiarEstadoTarea, _window, cx| {
+                esta.cambiar_estado_tarea(a.tarea_id.clone(), a.estado, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ReasignarTarea, _window, cx| {
+                esta.reasignar_tarea(a.tarea_id.clone(), a.nuevo_instancia_id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ForzarTarea, _window, cx| {
+                esta.forzar_tarea(a.tarea_id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AsignarTarea, _window, cx| {
+                esta.asignar_tarea(a.instancia_id.clone(), a.descripcion.clone(), a.estimado_seg, cx);
+            }))
+            // --- Redis ---
+            .on_action(cx.listener(|esta, a: &SeleccionarColaRedis, _window, cx| {
+                esta.seleccionar_cola_redis(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &PurgarPeer, _window, cx| {
+                esta.purgar_peer(a.id.clone(), cx);
+            }))
+            // --- Jornada (sólo UI) ---
+            .on_action(cx.listener(|esta, a: &SeleccionarSesion, _window, cx| {
+                esta.seleccionar_sesion_jornada(a.indice, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &SeleccionarTareaJornada, _window, cx| {
+                esta.seleccionar_tarea_jornada(a.indice, cx);
+            }))
+            // --- Broker / Acceso (recarga manual) ---
+            .on_action(cx.listener(|esta, _a: &RecargarBroker, _window, cx| {
+                esta.cargar_broker(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &RecargarAcceso, _window, cx| {
+                esta.cargar_broker(cx);
+            }))
+            // --- Config (recargar desde disco; delega en el panel stateful) ---
+            .on_action(cx.listener(|esta, _a: &RecargarConfig, window, cx| {
+                if let Some(panel) = &esta.datos.panel_config {
+                    panel.update(cx, |p, cx| p.recargar(window, cx));
+                }
             }))
             .child(sidebar)
             .child(contenido)

@@ -1,154 +1,179 @@
-//! Pantalla Broker — salud e info de arranque del broker.
+//! Pantalla Broker — salud e info de arranque del broker, con el tema Ethos aplicado.
 //!
-//! Espejo de `peers-tui/src/ui/broker.rs`: muestra tres bloques de key-values obtenidos de
+//! Espejo de `peers-tui/src/ui/broker.rs`: tres bloques de key-values obtenidos de
 //! `GET /admin/info` (host, puerto, versión, instancias), `GET /salud` (estado + instancias
 //! vivas) y `GET /factor-estimacion` (factor aprendido + nº de muestras). La app rellena
 //! `EstadoPantalla::{info,salud,factor}` con `cx.spawn`; aquí sólo se pinta lo que haya.
 //!
-//! INTENCIÓN de diseño: la firma del stub es `(&EstadoPantalla) -> impl IntoElement`, sin `cx`,
-//! por el contrato estable de la Fundación. Por eso los colores semánticos (verde "ok",
-//! amarillo "degradado", gris "sin datos") van como literales `rgb`, igual que la TUI usa
-//! `Color::Green`/`Yellow` — no dependen del tema. Cuando se fije la revisión del kit y la
-//! firma pueda recibir `cx`, migrar a `cx.theme()`.
+//! INTENCIÓN de diseño (por qué): esta pantalla es SOLO LECTURA (la TUI no permite mutar nada
+//! aquí). Por eso la vista permanece PURA —`render_broker(&EstadoPantalla) -> impl IntoElement`,
+//! sin `cx` ni estado propio— y no cablea callbacks. La única interacción posible es RECARGAR los
+//! tres endpoints; se ofrece como botón que DESPACHA `RecargarBroker`, que `AppDesktop` maneja en
+//! Fase 3 con `.on_action(cx.listener(...))` (mismo patrón que `vista/alertas.rs`). Sin esa acción
+//! la pantalla sigue siendo válida (se refresca con el ciclo de carga general de la app).
+//!
+//! TEMA: todo el color viene de `crate::tema` (tinta/papel/brasa/humo/línea). Los estados
+//! semánticos (salud ok/degradada, dato destacado) se pintan con `chip_estado` del tema, no con
+//! azules/verdes hardcodeados: "ok" en brasa (acento de marca), degradado en humo. Los valores de
+//! datos usan la fuente mono (`FUENTE_MONO`); las etiquetas de columna, `eyebrow` (mayúsculas,
+//! humo). Los paneles son `superficie_card`.
 
-use gpui::{div, IntoElement, ParentElement, SharedString, Styled};
-use gpui_component::group_box::{GroupBox, GroupBoxVariants as _};
+use gpui::{
+    div, px, Action, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement as _, Styled,
+};
 
 use crate::app::EstadoPantalla;
+use crate::tema;
 
-/// Verde para estado saludable ("ok"), espejo de `Color::Green` de la TUI.
-const COLOR_OK: u32 = 0x22c55e;
-/// Amarillo para estado degradado o desconocido, espejo de `Color::Yellow` de la TUI.
-const COLOR_AVISO: u32 = 0xeab308;
-/// Cian para el factor de estimación (dato destacado), espejo de `Color::Cyan`.
-const COLOR_FACTOR: u32 = 0x06b6d4;
-/// Gris tenue para etiquetas y avisos de "sin datos", espejo de `Color::DarkGray`.
-const COLOR_TENUE: u32 = 0x71717a;
+// -------------------------------------------------------------------------------------------------
+// ACCIONES — la vista es pura (sin `cx`): DESPACHA acciones que `AppDesktop` maneja con
+// `.on_action(cx.listener(...))` en su contenedor raíz (mismo patrón documentado en
+// `vista/alertas.rs`). Namespace `broker` para no colisionar con otras pantallas. `no_json` evita
+// exigir `serde::Deserialize`/`schemars::JsonSchema`: sólo se despachan por código, nunca desde un
+// keymap, así que basta `Clone + PartialEq`.
+// -------------------------------------------------------------------------------------------------
 
-/// Fila key-value: etiqueta tenue de ancho fijo a la izquierda + valor a la derecha.
-/// Es el ladrillo de los tres bloques; centraliza el layout para no repetirlo por campo.
+/// Recargar los tres bloques del broker (`GET /admin/info` + `GET /salud` + `GET /factor-estimacion`).
+/// Sin payload: `AppDesktop` sabe qué endpoints refrescar. Botón "Recargar" de la cabecera.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = broker, no_json)]
+pub struct RecargarBroker;
+
+// -------------------------------------------------------------------------------------------------
+// HELPERS DE FILA — key-value con la etiqueta como `eyebrow` (mayúsculas/humo/mono, ancho fijo) y
+// el valor en mono/papel. Centraliza el layout para no repetirlo por campo.
+// -------------------------------------------------------------------------------------------------
+
+/// Ancho fijo de la columna de etiqueta (px). Alinea los valores de los tres bloques.
+const ANCHO_ETIQUETA: f32 = 160.0;
+
+/// Fila `etiqueta → valor`: etiqueta como eyebrow (ancho fijo) + valor en mono/papel.
 fn campo(etiqueta: impl Into<SharedString>, valor: impl Into<SharedString>) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
-        .gap_3()
+        .items_center()
+        .gap_4()
+        .py_1()
+        .child(tema::eyebrow(etiqueta).w(px(ANCHO_ETIQUETA)))
         .child(
             div()
-                .w(gpui::px(160.0))
-                .text_color(gpui::rgb(COLOR_TENUE))
-                .child(etiqueta.into()),
+                .font_family(tema::FUENTE_MONO)
+                .text_color(tema::PAPEL)
+                .child(valor.into()),
         )
-        .child(div().child(valor.into()))
 }
 
-/// Fila key-value con valor coloreado (para el estado de salud y el factor destacado).
-fn campo_color(
-    etiqueta: impl Into<SharedString>,
-    valor: impl Into<SharedString>,
-    color: u32,
-) -> impl IntoElement {
+/// Fila `etiqueta → chip`: para el estado de salud (chip coloreado en vez de texto plano).
+fn campo_chip(etiqueta: impl Into<SharedString>, chip: impl IntoElement) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
-        .gap_3()
-        .child(
-            div()
-                .w(gpui::px(160.0))
-                .text_color(gpui::rgb(COLOR_TENUE))
-                .child(etiqueta.into()),
-        )
-        .child(div().text_color(gpui::rgb(color)).child(valor.into()))
+        .items_center()
+        .gap_4()
+        .py_1()
+        .child(tema::eyebrow(etiqueta).w(px(ANCHO_ETIQUETA)))
+        .child(chip)
 }
 
-/// Aviso de "sin datos todavía" para un bloque cuyo endpoint aún no respondió.
+/// Aviso "sin datos todavía" para un bloque cuyo endpoint aún no respondió: texto terciario (humo).
 fn sin_datos(texto: impl Into<SharedString>) -> impl IntoElement {
-    div().text_color(gpui::rgb(COLOR_TENUE)).child(texto.into())
+    tema::texto_terciario(texto).py_1()
 }
+
+/// Un panel: `superficie_card` con un `eyebrow` de título arriba y el contenido debajo.
+fn panel(titulo: impl Into<SharedString>, contenido: impl IntoElement) -> impl IntoElement {
+    tema::superficie_card()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_5()
+        .child(tema::eyebrow(titulo))
+        .child(contenido)
+}
+
+// -------------------------------------------------------------------------------------------------
+// RENDER
+// -------------------------------------------------------------------------------------------------
 
 pub fn render_broker(datos: &EstadoPantalla) -> impl IntoElement {
-    // Bloque 1 — arranque del broker (GET /admin/info). Si no hay datos, un aviso tenue.
+    // Bloque 1 — arranque del broker (GET /admin/info). Si no hay datos, aviso terciario.
     let bloque_info = match &datos.info {
         Some(info) => div()
             .flex()
             .flex_col()
-            .gap_2()
             .child(campo("host", info.host.clone()))
             .child(campo("puerto", info.puerto.to_string()))
             .child(campo("version", info.version.clone()))
-            .child(campo("instancias", info.instancias.to_string())),
-        None => div()
-            .flex()
-            .flex_col()
-            .child(sin_datos("(sin datos de /admin/info todavía)")),
+            .child(campo("instancias", info.instancias.to_string()))
+            .into_any_element(),
+        None => sin_datos("Sin datos de /admin/info todavía").into_any_element(),
     };
 
-    // Bloque 2 — salud (GET /salud). El estado se colorea: verde si "ok", amarillo si no.
+    // Bloque 2 — salud (GET /salud). El estado se pinta como chip: brasa si "ok", humo si no.
     let bloque_salud = match &datos.salud {
         Some(s) => {
-            let color = if s.estado == "ok" { COLOR_OK } else { COLOR_AVISO };
+            let color = if s.estado == "ok" { tema::BRASA } else { tema::HUMO };
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .child(campo_color("estado", s.estado.clone(), color))
+                .child(campo_chip("estado", tema::chip_estado(s.estado.clone(), color)))
                 .child(campo("instancias vivas", s.instancias.to_string()))
+                .into_any_element()
         }
-        None => div()
-            .flex()
-            .flex_col()
-            .child(sin_datos("(sin datos de /salud todavía)")),
+        None => sin_datos("Sin datos de /salud todavía").into_any_element(),
     };
 
-    // Bloque 3 — factor de estimación (GET /factor-estimacion). El broker lo aprende del
-    // tiempo real; aquí sólo se muestra: "6.2x" destacado + "· N muestras" tenue.
+    // Bloque 3 — factor de estimación (GET /factor-estimacion). El broker lo aprende del tiempo
+    // real; aquí sólo se muestra: "6.2x" destacado en brasa + "· N muestras" tenue (humo).
     let bloque_factor = match &datos.factor {
-        Some(fe) => div().flex().flex_row().gap_3().child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(
-                    div()
-                        .text_color(gpui::rgb(COLOR_FACTOR))
-                        .child(SharedString::from(format!("{:.1}x", fe.factor))),
-                )
-                .child(
-                    div()
-                        .text_color(gpui::rgb(COLOR_TENUE))
-                        .child(SharedString::from(format!("· {} muestras", fe.muestras))),
-                ),
-        ),
-        None => div()
+        Some(fe) => div()
             .flex()
-            .flex_col()
-            .child(sin_datos("(sin datos de /factor-estimacion todavía)")),
+            .flex_row()
+            .items_baseline()
+            .gap_2()
+            .child(
+                div()
+                    .font_family(tema::FUENTE_MONO)
+                    .text_size(px(28.0))
+                    .text_color(tema::BRASA)
+                    .child(SharedString::from(format!("{:.1}x", fe.factor))),
+            )
+            .child(
+                div()
+                    .font_family(tema::FUENTE_MONO)
+                    .text_color(tema::HUMO)
+                    .child(SharedString::from(format!("· {} muestras", fe.muestras))),
+            )
+            .into_any_element(),
+        None => sin_datos("Sin datos de /factor-estimacion todavía").into_any_element(),
     };
 
-    // Layout: título de pantalla + tres GroupBox apilados en columna, con scroll implícito
-    // del contenedor padre. Cada bloque agrupa sus key-values bajo un título descriptivo.
-    div()
+    // Cabecera: título display + botón secundario "Recargar" (despacha `RecargarBroker`).
+    let cabecera = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(tema::titulo("Broker"))
+        .child(
+            tema::boton_secundario("broker-recargar", "Recargar").on_click(
+                move |_evento, window, cx| {
+                    // Despacha; `AppDesktop` refresca los tres endpoints. La vista no toca `cx`.
+                    window.dispatch_action(Box::new(RecargarBroker), cx);
+                },
+            ),
+        );
+
+    // Layout: fondo Ethos (tinta/papel/Inter) + cabecera + tres paneles apilados en columna.
+    tema::fondo_app()
         .flex()
         .flex_col()
-        .size_full()
-        .gap_4()
+        .gap_5()
         .p_6()
-        .child(div().text_xl().child(SharedString::from("Broker")))
-        .child(
-            GroupBox::new()
-                .outline()
-                .title("Arranque")
-                .child(bloque_info),
-        )
-        .child(
-            GroupBox::new()
-                .outline()
-                .title("Salud")
-                .child(bloque_salud),
-        )
-        .child(
-            GroupBox::new()
-                .outline()
-                .title("Estimación")
-                .child(bloque_factor),
-        )
+        .child(cabecera)
+        .child(panel("Arranque", bloque_info))
+        .child(panel("Salud", bloque_salud))
+        .child(panel("Estimación", bloque_factor))
 }
