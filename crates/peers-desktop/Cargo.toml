@@ -24,6 +24,17 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac10
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+# `release_channel` del MISMO rev de zed que `gpui` (evita el choque de resolución que documenta
+# la nota de arriba). Sólo lo necesitamos por el global `AppVersion::global(cx)` que exige
+# `alacritty_terminal`/nuestro builder del PTY (RFC Lanzador Fase 2, R7). Ligero: depende sólo de
+# gpui (ya lo tenemos) + semver — verificado con el spike de deps, NO arrastra el resto de Zed.
+release_channel = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+# Backend PTY + parser de rejilla de celdas (vía B de la RFC Lanzador Fase 2, R7): NO se usa el
+# crate `terminal` de Zed (arrastra settings/theme/task, pesado) — se consume `alacritty_terminal`
+# directo y el render de rejilla se implementa aquí en GPUI. Fork de Zed (mismo que usa `terminal`
+# en el rev fijado), sin releases en crates.io. Coste medido en el spike: 4 deps nuevas, ~0.3 MB,
+# Rust puro, cero C/cmake/bindgen (ver .specs/desktop/lanzador/SPIKE-terminal-deps-resultados.md).
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 
 # Tipos del protocolo compartidos con broker/TUI. NUNCA redefinir DTOs aquí.
 peers-core = { path = "../peers-core" }
@@ -34,6 +45,11 @@ tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Canal `unbounded` que conecta el hilo del event loop de `alacritty_terminal` (SO, no tokio) con el
+# `cx.spawn` de GPUI (RFC Lanzador Fase 2, R7). Ya es dep transitiva de gpui/alacritty_terminal —
+# aquí sólo se declara directa para poder importarla en `pty.rs`. Sin features: sólo se usa el canal.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tracing = { workspace = true }
 # `time` para calcular la antigüedad relativa de las alertas ("hace 12m", alertas-07): parsea el
 # `creada_en` (RFC 3339) que timbra el broker y lo resta de `now_utc()`. Mismo crate/versión que
 # el resto del workspace (feature `parsing` para `Rfc3339`).

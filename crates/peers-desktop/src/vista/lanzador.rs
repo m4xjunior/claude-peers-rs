@@ -30,9 +30,11 @@
 //! ANTI-SIGABRT: el file picker devuelve un `oneshot::Receiver` (NO reqwest), así que su `.await`
 //! sí puede correr en `cx.spawn` sin entrar al runtime tokio. No hay red en esta pantalla en Fase 1.
 
+use futures::StreamExt;
 use gpui::{
-    div, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     input::{Input, InputState},
@@ -42,6 +44,8 @@ use std::path::PathBuf;
 
 use crate::app::EstadoPantalla;
 use crate::config::{Config, PlantillaPrompt};
+use crate::pty::{ColorPty, ComandoPty, DimensionesCeldas, EventoPty, SesionPty};
+use crate::teclado;
 use crate::tema;
 
 /// Constante del proyecto: el flag que hace que el `<channel>` de claude-peers se renderice. La
@@ -173,16 +177,13 @@ pub fn materializar_prompt(base: &str, tareas: &[TareaInicial]) -> String {
     out
 }
 
-/// COMPONE el comando exacto a previsualizar (R6) según los parámetros. Es la única fuente de
-/// verdad del preview y de "Copiar". SIEMPRE incluye el flag de canal (R5). No ejecuta nada.
-///
-/// Formas por destino (verificadas contra §11.4 de la RFC):
-/// - Local: `cd <dir> && claude <flags>`
-/// - SSH:   `ssh -t <host> "cd <dir> && claude <flags>"`
-/// - tmux:  `tmux new-session -d -s <nombre> -c <dir> "claude <flags>" && tmux attach -t <nombre>`
-pub fn componer_comando(p: &ParamsComando) -> String {
-    // Flags de `claude` comunes a los tres destinos, en orden estable.
-    let mut flags: Vec<String> = Vec::new();
+/// Flags de `claude` comunes a los tres destinos (R2/R5), YA ESCAPADOS para incrustar en una
+/// cadena de shell (`componer_comando`, R6). En orden estable. Única fuente de verdad de qué flags
+/// lleva el comando — `argv_claude` (variante estructurada, R7) reusa la MISMA lógica de decisión
+/// (qué flag va y cuándo) pero sin escapar, porque ahí el argumento va directo a `execve`, no a
+/// través de una subshell.
+fn flags_claude_shell(p: &ParamsComando) -> Vec<String> {
+    let mut flags = Vec::new();
     let prompt = p.system_prompt.trim();
     if !prompt.is_empty() {
         flags.push(format!("--append-system-prompt {}", escapar_shell(prompt)));
@@ -193,6 +194,18 @@ pub fn componer_comando(p: &ParamsComando) -> String {
     if p.skip_permisos {
         flags.push("--dangerously-skip-permissions".to_string());
     }
+    flags
+}
+
+/// COMPONE el comando exacto a previsualizar (R6) según los parámetros. Es la única fuente de
+/// verdad del preview y de "Copiar". SIEMPRE incluye el flag de canal (R5). No ejecuta nada.
+///
+/// Formas por destino (verificadas contra §11.4 de la RFC):
+/// - Local: `cd <dir> && claude <flags>`
+/// - SSH:   `ssh -t <host> "cd <dir> && claude <flags>"`
+/// - tmux:  `tmux new-session -d -s <nombre> -c <dir> "claude <flags>" && tmux attach -t <nombre>`
+pub fn componer_comando(p: &ParamsComando) -> String {
+    let flags = flags_claude_shell(p);
     let claude = if flags.is_empty() {
         "claude".to_string()
     } else {
@@ -231,6 +244,103 @@ pub fn componer_comando(p: &ParamsComando) -> String {
             format!("{new} && tmux attach -t {nombre}")
         }
     }
+}
+
+/// Variante ESTRUCTURADA de `componer_comando` para el PTY real (R7, Zona B): en vez de una cadena
+/// de shell, devuelve `(programa, args, dir)` listos para `execve` directo — sin pasar por `sh -c`,
+/// así que NO hace falta `escapar_shell` (los args van tal cual a `argv`, el kernel no reinterpreta
+/// `$`/`` ` ``/comillas). Nota de diseño §1.2 del RFC Fase 2: el preview (R6) y lo que realmente
+/// corre (R7) salen del MISMO origen — `flags_claude_shell` decide QUÉ flags van, esta función sólo
+/// cambia CÓMO se entregan (escapados en una cadena vs. como lista de argv).
+///
+/// v1 SÓLO cubre `Destino::Local` (alcance de esta Fase: camino feliz). SSH/tmux devuelven `None`
+/// — la UI (R7.2) cae al fallback "preparar + copiar" en vez de intentar un PTY que aún no cablea
+/// esos destinos (evita reportar un R7 a medias como si fuera completo).
+pub fn argv_claude(p: &ParamsComando) -> Option<(String, Vec<String>, Option<PathBuf>)> {
+    if p.destino != Destino::Local {
+        return None;
+    }
+    let mut args = Vec::new();
+    let prompt = p.system_prompt.trim();
+    if !prompt.is_empty() {
+        args.push("--append-system-prompt".to_string());
+        args.push(prompt.to_string());
+    }
+    // `FLAG_CANAL` es una cadena de 2 tokens de shell (`--flag valor`), NO un solo argumento de
+    // argv: en `componer_comando` una subshell la retokeniza; aquí no hay subshell (execve directo),
+    // así que hay que partirla a mano o el flag llegaría intacto y `claude` no lo reconocería.
+    args.extend(FLAG_CANAL.split_whitespace().map(str::to_string));
+    if p.skip_permisos {
+        args.push("--dangerously-skip-permissions".to_string());
+    }
+    let dir = p.dir.trim();
+    let dir = if dir.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(dir))
+    };
+    Some(("claude".to_string(), args, dir))
+}
+
+/// R7 iteración 2 — extrae del contexto GPUI las medidas que `calcular_dimensiones` necesita: el
+/// ancho real de una celda monoespaciada de `tema::FUENTE_MONO` (vía `text_system().advance('m')`,
+/// mismo truco que usa `terminal_element.rs` de Zed para medir su rejilla) y el tamaño del
+/// viewport actual. `tema::fondo_app()` fija el tamaño base de texto de la app en `px(14.0)` — se
+/// usa ese mismo valor aquí para que la medición sea coherente con lo que `render_rejilla_pty`
+/// realmente pinta (leer `window.text_style()` en este punto, un callback de click FUERA del árbol
+/// de render, no reflejaría con fiabilidad el estilo de la card del terminal).
+fn medir_dimensiones_ventana(window: &mut Window, cx: &mut App) -> DimensionesCeldas {
+    const TAMANO_BASE: gpui::Pixels = gpui::px(14.0);
+    // Resta el padding/chrome conocido del área del terminal (p_2 = 8px por lado, ver `card_terminal`
+    // en el render) para no sobreestimar el espacio disponible y desbordar el borde de la card.
+    const PADDING_AREA: gpui::Pixels = gpui::px(16.0);
+
+    let font_id = cx.text_system().resolve_font(&gpui::font(tema::FUENTE_MONO));
+    let ancho_celda = cx
+        .text_system()
+        .advance(font_id, TAMANO_BASE, 'm')
+        .map(|s| s.width)
+        // Fallback si la fuente no tiene glifo para 'm' (no debería pasar con IBM Plex Mono, pero
+        // `advance` devuelve `Result` y R10 exige degradar, no `.unwrap()`): ~0.6× el tamaño de
+        // fuente es la proporción típica de un monoespaciado, mejor que dividir por 0 o panicar.
+        .unwrap_or(TAMANO_BASE * 0.6);
+    // `line_height` del texto base de la app: mismo criterio, componentes de gpui-component suelen
+    // rondar 1.2-1.4× el tamaño de fuente para line-height; usamos el `window.line_height()` real
+    // si está disponible en este punto del ciclo, que ya incorpora el factor del tema activo.
+    let alto_linea = window.line_height();
+
+    let viewport = window.viewport_size();
+    let ancho_disponible = (viewport.width - PADDING_AREA).max(ancho_celda);
+    // Reserva vertical para el resto del panel (header fijo + otras 6 cards antes del terminal en
+    // el scroll): una fracción del viewport, no todo el alto de la ventana, o el terminal pediría
+    // más filas de las que realmente van a verse sin scrollear la card en sí.
+    let alto_disponible = (viewport.height * 0.35 - PADDING_AREA).max(alto_linea);
+
+    calcular_dimensiones(ancho_disponible, alto_disponible, ancho_celda, alto_linea)
+}
+
+/// R7 iteración 2 — deriva filas/columnas REALES a partir de medidas de la ventana/fuente, en vez
+/// de `DimensionesCeldas::POR_DEFECTO` fijo (80x24). Función PURA (sólo aritmética con `Pixels`,
+/// sin `Window`/`cx`) para poder testearla sin un contexto GPUI real — el caller (`lanzar_pty`)
+/// extrae `ancho_celda`/`alto_linea` de `cx.text_system()` y `alto_disponible`/`ancho_disponible`
+/// del viewport, y aquí sólo se hace la división + el `max(1)` de guardrail.
+///
+/// Alcance de ESTA iteración: cálculo ÚNICO al abrir la sesión (no reacciona en vivo a que Max
+/// redimensione la ventana después — eso exigiría implementar `Element::prepaint` a mano, el
+/// mismo trabajo pesado que el DISENO-FASE2 §1.1 descartaba para la vía B). `SesionPty::redimensionar`
+/// ya existe y queda listo para cablearse a un resize en vivo en una iteración siguiente.
+fn calcular_dimensiones(
+    ancho_disponible: gpui::Pixels,
+    alto_disponible: gpui::Pixels,
+    ancho_celda: gpui::Pixels,
+    alto_linea: gpui::Pixels,
+) -> DimensionesCeldas {
+    // `max(1)`: si la ventana es minúscula o la medida de fuente falla y devuelve 0, un terminal
+    // de 0 filas/columnas haría que `Term::new`/`tty::new` (que usan esto como `Dimensions`)
+    // entren en división por cero al calcular el wrap de línea — nunca dimensiones en 0 (R10).
+    let columnas = ((f32::from(ancho_disponible) / f32::from(ancho_celda)).floor() as u16).max(1);
+    let filas = ((f32::from(alto_disponible) / f32::from(alto_linea)).floor() as u16).max(1);
+    DimensionesCeldas { filas, columnas }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -280,6 +390,24 @@ pub struct PanelLanzador {
     dropdown_destino: bool,
     /// Desplegable de plantillas abierto (R2.1).
     dropdown_plantillas: bool,
+    /// R7 — sesión de terminal embebido activa (Zona B, Fase 2). `None` hasta pulsar "Lanzar
+    /// aquí"; sólo Local en v1 (SSH/tmux reusan `SesionPty::abrir` pero faltan por cablear la UI).
+    sesion_pty: Option<SesionPty>,
+    /// Último snapshot de la rejilla leído del PTY. Se cachea aquí (en vez de leer el `FairMutex`
+    /// en cada `render`) porque `Render::render` puede llamarse más veces de las que hay eventos
+    /// `Refrescar` reales; sólo se releen celdas cuando el event loop avisa.
+    pantalla_pty: Option<crate::pty::ContenidoPty>,
+    /// R7 iteración 2 — dimensión REAL con la que se abrió `sesion_pty` (medida al lanzar, ver
+    /// `calcular_dimensiones`). `render_rejilla_pty` y el alto del área del terminal la usan en vez
+    /// de `DimensionesCeldas::POR_DEFECTO` para que la rejilla pintada coincida con lo que el PTY
+    /// realmente cree que mide (si divergieran, el wrap de línea del programa dentro del PTY no
+    /// coincidiría con las columnas que GPUI pinta).
+    dim_pty: DimensionesCeldas,
+    /// R7.1/R7.2 — mensaje de degradación si `SesionPty::abrir` falló (banner Ethos, nunca panic).
+    error_pty: Option<String>,
+    /// Foco del área de la rejilla: sin esto GPUI no entrega `KeyDownEvent` a esta vista (el resto
+    /// del panel usa `Input`s del kit, que gestionan su propio foco; la rejilla no es un `Input`).
+    foco_pty: FocusHandle,
     /// Feedback efímero de la última acción.
     feedback: Feedback,
 }
@@ -323,6 +451,11 @@ impl PanelLanzador {
             dropdown_recientes: false,
             dropdown_destino: false,
             dropdown_plantillas: false,
+            sesion_pty: None,
+            pantalla_pty: None,
+            dim_pty: DimensionesCeldas::POR_DEFECTO,
+            error_pty: None,
+            foco_pty: cx.focus_handle(),
             feedback: Feedback::default(),
         }
     }
@@ -486,6 +619,116 @@ impl PanelLanzador {
         cx.notify();
     }
 
+    /// R7 — abre el PTY con el comando derivado de `params()` (MISMO origen que el preview R6) y
+    /// arranca el loop que drena sus eventos hacia esta vista. `SesionPty::abrir` es SÍNCRONO y
+    /// LOCAL (abre un fd, no hace red): no necesita `cx.spawn` para la apertura en sí — sólo el
+    /// drenaje de eventos posteriores corre en background (canal `futures`, no reqwest — seguro
+    /// dentro de `cx.spawn` según la trampa anti-SIGABRT documentada del proyecto).
+    ///
+    /// R7.2: si `argv_claude` devuelve `None` (destino no-Local, fuera de alcance v1) o si
+    /// `SesionPty::abrir` falla (permisos, plataforma sin PTY), banner de error — NUNCA panic.
+    ///
+    /// R7 iteración 2: `dim` ya NO es `POR_DEFECTO` fijo — se mide con `medir_dimensiones_ventana`
+    /// (ancho de celda real de `tema::FUENTE_MONO` al tamaño base de la app + viewport actual).
+    /// Cálculo ÚNICO al lanzar (no reacciona a un resize posterior de la ventana, ver nota de
+    /// `calcular_dimensiones`).
+    fn lanzar_pty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((programa, args, dir)) = argv_claude(&self.params(cx)) else {
+            self.error_pty = Some(
+                "El terminal embebido sólo soporta destino Local por ahora. Usa \"Copiar comando\" \
+                 para SSH/tmux."
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+
+        let dim = medir_dimensiones_ventana(window, cx);
+        let comando = ComandoPty { programa, args, dir };
+        match SesionPty::abrir(comando, dim) {
+            Ok(mut sesion) => {
+                self.dim_pty = dim;
+                let Some(mut eventos) = sesion.tomar_eventos() else {
+                    // No debería pasar (recién abierta): `tomar_eventos` sólo devuelve `None` si ya
+                    // se llamó antes. Degradar sin panic de todas formas.
+                    self.error_pty = Some("La sesión PTY no expuso su canal de eventos.".into());
+                    cx.notify();
+                    return;
+                };
+                self.pantalla_pty = Some(sesion.contenido());
+                self.sesion_pty = Some(sesion);
+                self.error_pty = None;
+                cx.notify();
+
+                cx.spawn(async move |esta, cx| {
+                    while let Some(evento) = eventos.next().await {
+                        let seguir = esta
+                            .update(cx, |esta, cx| {
+                                match evento {
+                                    EventoPty::Refrescar => {
+                                        if let Some(s) = &esta.sesion_pty {
+                                            esta.pantalla_pty = Some(s.contenido());
+                                        }
+                                    }
+                                    EventoPty::Terminado => {
+                                        if let Some(s) = &esta.sesion_pty {
+                                            esta.pantalla_pty = Some(s.contenido());
+                                        }
+                                        esta.sesion_pty = None;
+                                    }
+                                    // Campana/Título: informativos, sin acción en v1 (R7 core).
+                                    EventoPty::Campana | EventoPty::Titulo(_) => {}
+                                }
+                                cx.notify();
+                                // Deja de drenar una vez que la sesión murió y ya no queda estado
+                                // que actualizar — evita un loop infinito sobre un canal huérfano.
+                                esta.sesion_pty.is_some()
+                            })
+                            .unwrap_or(false);
+                        if !seguir {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(e) => {
+                self.error_pty = Some(format!("No se pudo abrir el terminal: {e}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// R7.1 — cierra la sesión activa (botón "Cerrar terminal" o antes de relanzar). Idempotente.
+    fn cerrar_pty(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.sesion_pty.take() {
+            s.cerrar();
+        }
+        self.pantalla_pty = None;
+        cx.notify();
+    }
+
+    /// R7 — traduce un `KeyDownEvent` a bytes ANSI (`teclado::a_secuencia_esc`) y los envía al PTY.
+    /// Si la tecla no tiene secuencia especial pero trae `key_char` (texto imprimible normal), ese
+    /// texto se envía tal cual — es el camino de "escribir letras normales" en la sesión.
+    fn enviar_tecla(&mut self, evento: &KeyDownEvent, _cx: &mut Context<Self>) {
+        let Some(sesion) = &self.sesion_pty else {
+            return;
+        };
+        let modo = self
+            .pantalla_pty
+            .as_ref()
+            .map(|c| c.modo)
+            .unwrap_or_default();
+        if let Some(esc) = teclado::a_secuencia_esc(&evento.keystroke, modo, false) {
+            sesion.escribir(esc.into_owned().into_bytes());
+        } else if let Some(texto) = &evento.keystroke.key_char {
+            if !texto.is_empty() {
+                sesion.escribir(texto.clone().into_bytes());
+            }
+        }
+    }
+
     /// Envuelve un `Input` del kit en el marco de control Ethos (mismo criterio que `PanelConfig`:
     /// el Input pinta su fondo con `cx.theme()`, así que lo metemos en un `div` tematizado con
     /// fondo TINTA para que encaje en la paleta en vez de verse con el tema por defecto del kit).
@@ -523,7 +766,7 @@ const ROJO_ERROR: gpui::Rgba = gpui::Rgba {
 };
 
 impl Render for PanelLanzador {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // --- R1/R1.1: fila del directorio (ruta en mono BRASA + Elegir/Revelar/recientes) ---
         let dir_texto = self
             .dir
@@ -854,6 +1097,23 @@ impl Render for PanelLanzador {
             .text_color(tema::PAPEL)
             .child(SharedString::from(comando));
 
+        // R7: "Lanzar aquí" sólo tiene sentido con destino Local (v1 del terminal embebido); en
+        // SSH/tmux el botón queda pero `lanzar_pty` degrada a banner (R7.2) explicando por qué.
+        let hay_sesion = self.sesion_pty.is_some();
+        let boton_pty = if hay_sesion {
+            tema::boton_secundario("lanzador-cerrar-pty", "Cerrar terminal").on_click(cx.listener(
+                |esta, _e, _w, cx| {
+                    esta.cerrar_pty(cx);
+                },
+            ))
+        } else {
+            tema::boton_primario("lanzador-lanzar-pty", "Lanzar aquí").on_click(cx.listener(
+                |esta, _e, window, cx| {
+                    esta.lanzar_pty(window, cx);
+                },
+            ))
+        };
+
         let botonera = div()
             .h_flex()
             .items_center()
@@ -865,8 +1125,9 @@ impl Render for PanelLanzador {
                     },
                 )),
             )
+            .child(boton_pty)
             .child(tema::texto_terciario(
-                "En Fase 1 el Lanzador previsualiza y copia; no ejecuta nada (R6).",
+                "Copia el comando o lánzalo en un terminal embebido (R7, sólo Local por ahora).",
             ));
 
         let feedback: gpui::AnyElement = match &self.feedback {
@@ -889,27 +1150,95 @@ impl Render for PanelLanzador {
             div().v_flex().gap_3().child(preview).child(botonera).child(feedback),
         );
 
-        // Raíz de la pantalla: fondo Ethos + cabecera + tarjetas apiladas.
-        tema::fondo_app()
-            .v_flex()
-            .gap_5()
-            .p_8()
-            .child(
+        // --- R7: card del terminal embebido — banner de error (R7.2), rejilla activa, o ausente.
+        // `AnyElement` porque las 3 ramas devuelven tipos concretos distintos (banner vs `seccion`
+        // con la rejilla vs `div()` vacío) y `seccion()` exige `impl IntoElement` homogéneo.
+        let card_terminal: gpui::AnyElement = if let Some(msg) = &self.error_pty {
+            self.seccion(
+                "terminal",
+                "R7.2 — el terminal embebido no pudo abrirse; usa \"Copiar comando\" como alternativa.",
                 div()
-                    .v_flex()
-                    .gap_1()
-                    .child(tema::eyebrow("Lanzador"))
-                    .child(tema::titulo("Configurar sesión"))
-                    .child(tema::texto_terciario(
-                        "Elige directorio, prompt, tareas y destino; copia el comando de arranque.",
-                    )),
+                    .text_sm()
+                    .text_color(ROJO_ERROR)
+                    .child(SharedString::from(format!("⚠ {msg}"))),
             )
+            .into_any_element()
+        } else if let Some(contenido) = &self.pantalla_pty {
+            // R7 iteración 2: `self.dim_pty` es la dimensión REAL medida al lanzar (ver
+            // `medir_dimensiones_ventana`), no `POR_DEFECTO` — la rejilla pintada y el alto del área
+            // usan la MISMA dimensión con la que se abrió el PTY, o divergirían del wrap real.
+            let dim = self.dim_pty;
+            let rejilla = render_rejilla_pty(contenido, dim);
+            // Alto real = filas × line-height medido de la ventana (no el `20.0` arbitrario de v1) +
+            // el padding del área (`p_2` = 8px por lado, ver más abajo).
+            let alto_area = window.line_height() * dim.filas as f32 + gpui::px(16.0);
+            self.seccion(
+                "terminal",
+                "R7 — sesión activa. Click dentro para escribir; \"Cerrar terminal\" arriba para salir.",
+                div()
+                    .id("lanzador-pty-area")
+                    .track_focus(&self.foco_pty)
+                    .key_context("LanzadorPty")
+                    .on_key_down(cx.listener(|esta, evento: &KeyDownEvent, _w, cx| {
+                        esta.enviar_tecla(evento, cx);
+                    }))
+                    .on_click(cx.listener(|esta, _e, window, cx| {
+                        window.focus(&esta.foco_pty, cx);
+                    }))
+                    .w_full()
+                    .h(alto_area)
+                    .overflow_hidden()
+                    .p_2()
+                    .rounded(tema::radio(tema::RADIO_CONTROL))
+                    .bg(tema::TINTA)
+                    .border_1()
+                    .border_color(tema::LINEA)
+                    .child(rejilla),
+            )
+            .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        // Cuerpo SCROLLABLE de las 6+1 cards: con el editor de prompt (auto_grow hasta 14 líneas) +
+        // tareas + terminal embebido (R7), la pantalla desborda fácilmente la altura de la ventana
+        // y las últimas cards (flags/comando) quedaban inalcanzables (bug QA 03/07). Mismo patrón
+        // que `alertas.rs::tabla`/`tareas.rs`: `flex_1()` + `min_h_0()` + `overflow_y_scroll()` en
+        // el cuerpo, encabezado FIJO fuera de él.
+        let cuerpo = div()
+            .id("lanzador-cuerpo-scroll")
+            .v_flex()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .gap_5()
+            .px_8()
+            .pb_8()
             .child(card_dir)
             .child(card_destino)
             .child(card_prompt)
             .child(card_tareas)
             .child(card_flags)
             .child(card_comando)
+            .child(card_terminal);
+
+        // Raíz de la pantalla: fondo Ethos + cabecera FIJA + cuerpo scrollable.
+        tema::fondo_app()
+            .v_flex()
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .p_8()
+                    .pb_5()
+                    .child(tema::eyebrow("Lanzador"))
+                    .child(tema::titulo("Configurar sesión"))
+                    .child(tema::texto_terciario(
+                        "Elige directorio, prompt, tareas y destino; copia el comando de arranque.",
+                    )),
+            )
+            .child(cuerpo)
     }
 }
 
@@ -951,6 +1280,135 @@ impl PanelLanzador {
 // -------------------------------------------------------------------------------------------------
 // STUB DE LA FUNDACIÓN + CONSTRUCTOR (firma intacta: `render_lanzador(&EstadoPantalla)`)
 // -------------------------------------------------------------------------------------------------
+
+/// R7 — resuelve un `ColorPty` al `Rgba` del tema Ethos más cercano. v1 (R7 core, ver `pty.rs`):
+/// los 16 colores ANSI con nombre se colapsan a un subconjunto de tokens Ethos (no hay 16 tonos
+/// propios en la paleta del tema — inventar 16 colores nuevos sólo para el terminal rompería la
+/// coherencia visual del resto de la app); RGB truecolor se pasa literal (ahí sí hay un valor
+/// exacto que respetar, típicamente lo pide el propio programa dentro del PTY, p.ej. colores de
+/// sintaxis). Degradación aceptada, documentada — no es un theming completo de terminal.
+fn color_pty_a_rgba(c: ColorPty, es_fondo: bool) -> gpui::Rgba {
+    match c {
+        ColorPty::PorDefecto => {
+            if es_fondo {
+                tema::TINTA
+            } else {
+                tema::PAPEL
+            }
+        }
+        // Subconjunto de los 16 ANSI: rojo/verde/amarillo/azul/magenta/cian mapean a los tonos
+        // cálidos más cercanos de la paleta (reusa `VERDE_OK`/`ROJO_ERROR`, ya definidos en este
+        // archivo para el feedback de la card de comando — mismo criterio, no inventa tokens
+        // nuevos); el resto (negro/blanco/gris/brights) cae a PAPEL/HUMO.
+        ColorPty::Ansi(1) | ColorPty::Ansi(9) => ROJO_ERROR,
+        ColorPty::Ansi(2) | ColorPty::Ansi(10) => VERDE_OK,
+        ColorPty::Ansi(3) | ColorPty::Ansi(11) => tema::BRASA,
+        ColorPty::Ansi(4) | ColorPty::Ansi(12) => tema::SALMO,
+        ColorPty::Ansi(5) | ColorPty::Ansi(13) => tema::SALMO,
+        ColorPty::Ansi(6) | ColorPty::Ansi(14) => tema::BRASA,
+        ColorPty::Ansi(0) | ColorPty::Ansi(8) => tema::HUMO,
+        ColorPty::Ansi(_) => tema::PAPEL,
+        ColorPty::Rgb(r, g, b) => gpui::rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
+    }
+}
+
+/// R7 — pinta el `ContenidoPty` como filas de texto monoespaciado. NO es un elemento GPUI de bajo
+/// nivel celda-por-celda (eso exigiría implementar `Element` a mano: medición/layout propios,
+/// fuera de alcance de R7 core) — reusa el mismo patrón de texto plano que YA usa el preview del
+/// comando (R6, `font_family(tema::FUENTE_MONO)` sobre un `div` scrolleable), agrupando celdas
+/// consecutivas de igual color en un solo span por corrida en vez de un `div` por celda (80
+/// columnas × 24 filas = 1920 celdas/frame sería una explosión de elementos innecesaria).
+///
+/// Degradación v1 (documentada, no oculta): sin selección de texto, sin hyperlinks, sin negrita/
+/// subrayado real todavía (se leen del backend pero no se pintan aún — `CeldaPty::negrita`/
+/// `subrayado` quedan para una iteración siguiente), sin scrollback (sólo la pantalla visible).
+fn render_rejilla_pty(contenido: &crate::pty::ContenidoPty, dim: DimensionesCeldas) -> impl IntoElement {
+    use std::collections::BTreeMap;
+
+    // Agrupa celdas por fila (BTreeMap para iterar en orden de línea) y dentro de cada fila arma
+    // corridas contiguas de igual (fg,bg) — el span mínimo que evita un div por celda.
+    let mut filas: BTreeMap<i32, Vec<&crate::pty::CeldaPty>> = BTreeMap::new();
+    for celda in &contenido.celdas {
+        filas.entry(celda.fila).or_default().push(celda);
+    }
+
+    let mut cuerpo = div()
+        .v_flex()
+        .size_full()
+        .font_family(tema::FUENTE_MONO)
+        .text_sm();
+
+    // Columna del cursor en ESTA fila, si el cursor visible cae aquí — `None` en cualquier otra
+    // fila. Se calcula una vez por fila (no por celda) para no repetir la comparación en el loop.
+    let col_cursor_en = |fila_idx: i32| -> Option<usize> {
+        (contenido.cursor_visible && contenido.cursor_fila == fila_idx)
+            .then_some(contenido.cursor_columna)
+    };
+
+    for fila_idx in 0..dim.filas as i32 {
+        let celdas_fila = filas.get(&fila_idx);
+        let cursor_col = col_cursor_en(fila_idx);
+        let mut linea = div().h_flex();
+
+        if let Some(celdas) = celdas_fila {
+            let mut ordenadas: Vec<&&crate::pty::CeldaPty> = celdas.iter().collect();
+            ordenadas.sort_by_key(|c| c.columna);
+
+            let mut i = 0;
+            while i < ordenadas.len() {
+                // R7 iteración 2 — cursor visual: si la celda actual ES la columna del cursor,
+                // la corta como span de 1 celda con colores invertidos (bloque sólido) en vez de
+                // agruparla con sus vecinas — necesita destacarse aunque comparta fg/bg con ellas.
+                if cursor_col == Some(ordenadas[i].columna) {
+                    let c = ordenadas[i];
+                    linea = linea.child(
+                        div()
+                            // Invertido: el bg de la celda pasa a ser el texto, y PAPEL de fondo —
+                            // mismo criterio visual que un cursor de bloque de terminal clásico.
+                            .text_color(color_pty_a_rgba(c.bg, true))
+                            .bg(color_pty_a_rgba(c.fg, false))
+                            .child(SharedString::from(c.caracter.to_string())),
+                    );
+                    i += 1;
+                    continue;
+                }
+
+                let fg = ordenadas[i].fg;
+                let bg = ordenadas[i].bg;
+                let mut texto = String::new();
+                while i < ordenadas.len()
+                    && ordenadas[i].fg == fg
+                    && ordenadas[i].bg == bg
+                    && cursor_col != Some(ordenadas[i].columna)
+                {
+                    texto.push(ordenadas[i].caracter);
+                    i += 1;
+                }
+                let mut span = div().text_color(color_pty_a_rgba(fg, false));
+                if bg != ColorPty::PorDefecto {
+                    span = span.bg(color_pty_a_rgba(bg, true));
+                }
+                linea = linea.child(span.child(SharedString::from(texto)));
+            }
+        } else if cursor_col == Some(0) {
+            // Fila vacía pero el cursor está en ella (columna 0, línea recién abierta): pintar el
+            // bloque igual que si hubiera una celda — si no, el cursor "desaparece" en líneas nuevas.
+            linea = linea.child(
+                div()
+                    .text_color(tema::TINTA)
+                    .bg(tema::PAPEL)
+                    .child(SharedString::from(" ")),
+            );
+        } else {
+            // Fila vacía (sin salida aún, sin cursor): un espacio para que la altura no colapse.
+            linea = linea.child(SharedString::from(" "));
+        }
+
+        cuerpo = cuerpo.child(linea);
+    }
+
+    cuerpo
+}
 
 /// Stub de la Fundación: la pantalla Lanzador delega en su `Entity<PanelLanzador>`, creada por la
 /// app al arrancar y guardada en `EstadoPantalla`. Si no está inicializada, pinta un aviso
@@ -1086,5 +1544,94 @@ mod tests {
             cmd,
             "claude --dangerously-load-development-channels server:claude-peers"
         );
+    }
+
+    #[test]
+    fn argv_claude_local_parte_flag_canal_en_dos_tokens() {
+        // Regresión: FLAG_CANAL es "--flag valor" (2 tokens de shell). `componer_comando` lo deja
+        // intacto porque una subshell lo retokeniza; `argv_claude` va directo a execve (sin
+        // subshell), así que DEBE partirlo o el flag llega pegado y `claude` no lo reconoce.
+        let p = params_base();
+        let (programa, args, dir) = argv_claude(&p).expect("Local siempre produce Some");
+        assert_eq!(programa, "claude");
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-load-development-channels".to_string(),
+                "server:claude-peers".to_string(),
+            ]
+        );
+        assert_eq!(dir, Some(PathBuf::from("/Users/max/proy")));
+    }
+
+    #[test]
+    fn argv_claude_local_con_prompt_y_skip_no_escapa() {
+        // A diferencia de `componer_comando` (R6, va a una subshell y escapa comillas/$/backtick),
+        // `argv_claude` entrega el prompt TAL CUAL como un único elemento de argv — el kernel no
+        // reinterpreta metacaracteres dentro de un argumento de `execve`, así que escaparlo aquí
+        // sería incorrecto (duplicaría comillas que `claude` vería literales).
+        let mut p = params_base();
+        p.system_prompt = "eres $peer \"citado\"".into();
+        p.skip_permisos = true;
+        let (_, args, _) = argv_claude(&p).expect("Local siempre produce Some");
+        assert_eq!(args[0], "--append-system-prompt");
+        assert_eq!(args[1], "eres $peer \"citado\"");
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn argv_claude_sin_dir_devuelve_none_path() {
+        let mut p = params_base();
+        p.dir = String::new();
+        let (_, _, dir) = argv_claude(&p).expect("Local siempre produce Some");
+        assert_eq!(dir, None);
+    }
+
+    #[test]
+    fn argv_claude_ssh_y_tmux_fuera_de_alcance_v1() {
+        // R7 v1 sólo cubre Local (nota de diseño del RFC Fase 2, §3 paso 3 vs 4). SSH/tmux
+        // devuelven `None` explícito — la UI cae al fallback de "copiar comando" (R7.2) en vez de
+        // intentar abrir un PTY a medio cablear.
+        let mut ssh = params_base();
+        ssh.destino = Destino::Ssh;
+        assert_eq!(argv_claude(&ssh), None);
+
+        let mut tmux = params_base();
+        tmux.destino = Destino::Tmux;
+        assert_eq!(argv_claude(&tmux), None);
+    }
+
+    #[test]
+    fn calcular_dimensiones_divide_viewport_entre_celda() {
+        // 800px de ancho / 8px por celda = 100 columnas; 480px de alto / 20px de línea = 24 filas.
+        let dim = calcular_dimensiones(
+            gpui::px(800.0),
+            gpui::px(480.0),
+            gpui::px(8.0),
+            gpui::px(20.0),
+        );
+        assert_eq!(dim.columnas, 100);
+        assert_eq!(dim.filas, 24);
+    }
+
+    #[test]
+    fn calcular_dimensiones_trunca_hacia_abajo_no_redondea() {
+        // 85px / 8px = 10.625 → 10 columnas, NUNCA 11 (una columna de más desbordaría el ancho
+        // real disponible y el wrap de línea del PTY no coincidiría con lo que GPUI pinta).
+        let dim = calcular_dimensiones(gpui::px(85.0), gpui::px(100.0), gpui::px(8.0), gpui::px(20.0));
+        assert_eq!(dim.columnas, 10);
+    }
+
+    #[test]
+    fn calcular_dimensiones_nunca_da_cero_ni_con_viewport_minusculo() {
+        // R10: 0 filas/columnas haría que `Term::new`/`tty::new` (que las usan como `Dimensions`)
+        // entren en división por cero al calcular el wrap de línea — guardrail `max(1)`.
+        let dim = calcular_dimensiones(gpui::px(1.0), gpui::px(1.0), gpui::px(8.0), gpui::px(20.0));
+        assert_eq!(dim.columnas, 1);
+        assert_eq!(dim.filas, 1);
+
+        let dim_cero = calcular_dimensiones(gpui::px(0.0), gpui::px(0.0), gpui::px(8.0), gpui::px(20.0));
+        assert_eq!(dim_cero.columnas, 1);
+        assert_eq!(dim_cero.filas, 1);
     }
 }
