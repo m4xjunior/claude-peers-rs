@@ -32,6 +32,13 @@
 | E-18 | Arranque del broker best-effort (H9) | DECIDIDO |
 | E-19 | Multi-broker = multi-empresa | DECIDIDO |
 | E-20 | Choque cadena-de-mando ↔ "tócale el hombro" | DECIDIDO |
+| **E-21** | **MCP vía `rmcp` (NO escrito a mano)** | **DECIDIDO (Max, 2026-07-03)** |
+| **E-22** | **Dependencias externas PERMITIDAS (robustez > minimalismo)** | **DECIDIDO (Max, 2026-07-03)** |
+| **E-23** | **Loop engineering + supervisión jerárquica (modelo del loop)** | **DECIDIDO (arquitecto; validar con Max)** |
+
+> **⚠ Las decisiones E-21/E-22 REVIERTEN constraints previas** repetidas en muchos docs ("MCP a mano",
+> "cero dependencias nuevas", principio #1 de la VISÃO). Donde un doc anterior diga eso, **prevalece
+> E-21/E-22**. No hace falta reescribir cada mención: esta sección es la autoridad.
 
 ---
 
@@ -222,6 +229,58 @@
 - **Consecuencias:** no se sacrifica la autonomía; la jerarquía se añade donde Max la quiere.
 - **Reversibilidad:** alta.
 
+## E-21 — MCP vía `rmcp` (NO escrito a mano)
+- **Contexto:** hoy el MCP del `peers-client` es JSON-RPC **escrito a mano** (`mcp.rs`), con las tools como
+  array JSON literal. Max (2026-07-03): *"el MCP no puede ser escrito a mano."* `rmcp` (SDK oficial de
+  Anthropic) ya está declarado en `Cargo.toml:37` pero NO se usa.
+- **Opciones:** (a) migrar a `rmcp` (macros `#[tool]`/`#[tool_router]`, `ServerHandler`, `serve(stdio())`);
+  (b) seguir a mano (rechazado por Max).
+- **Decisión (Max):** **(a) migrar a `rmcp`.** Las tools pasan a ser funciones Rust con `#[tool]`; el
+  handshake, `tools/list`, `tools/call` y el schema los genera el SDK; las `instructions`/capabilities van
+  por `get_info()`/`ServerInfo`.
+- **Consecuencias:** menos boilerplate, schemas correctos, robustez. **RIESGO #1 (verificado en la fuente
+  oficial):** el push actual usa una **notificación custom** `notifications/claude/channel` + capability
+  `experimental["claude/channel"]`; `rmcp` documenta `context.peer.notify_*()` solo para las
+  notificaciones **estándar** del spec (progress, tool_list_changed…). **Falta confirmar que `rmcp` puede
+  emitir una notificación con método arbitrario y declarar capabilities experimentales.** Si no puede, el
+  `<channel>` se rompería. → **spike obligatorio** (ver PENDIENTE E-21). Impacto: reescribe la "receta de
+  tool a mano" de [[04-conocimiento-agente]] §3 (ahora es `#[tool]`, no editar un array JSON).
+- **Reversibilidad:** media — es una reescritura del `peers-client`; el contrato de wire con el harness
+  debe preservarse exactamente (nombre `claude-peers`, la notificación del canal, las 4 claves `meta`).
+
+## E-22 — Dependencias externas PERMITIDAS (robustez > minimalismo)
+- **Contexto:** el principio #1 de la VISÃO era "ZERO dependencias externas" (por eso Rust/binario). Max
+  (2026-07-03): *"no estoy bloqueado a dependencias externas; cuanto más robusto, mejor para mí y para los
+  agentes… gasto menos tokens porque trabajan ya direccionados."* La robustez que hace a los agentes más
+  certeros vale más que el minimalismo.
+- **Decisión (Max):** **dependencias externas permitidas** cuando aporten robustez. Habilita `rmcp`
+  (E-21), `sqlx` (ya aceptado en ADR-001), frameworks de validación/serialización, etc.
+- **Consecuencias:** **REVIERTE** la constraint "cero dependencias nuevas" repetida en casi todos los docs
+  del vault (`.specs/empresa/*`, `.specs/desktop/*`). Donde un doc diga "cero deps nuevas", prevalece esta
+  decisión. Se mantiene el criterio de **binario portable** (deps compiladas al binario, no servicios
+  externos aparte: sigue sin RabbitMQ/servicios que haya que instalar y mantener) — la distinción de la
+  RFC política §0 sigue válida: una **lib** compilada ≠ un **servicio** externo. Robustez sí; infra
+  operativa extra, no.
+- **Reversibilidad:** alta (es una política, no un artefacto); pero el coste hundido de adoptar libs es real.
+
+## E-23 — Loop engineering + supervisión jerárquica (el modelo del loop)
+- **Contexto:** Max (2026-07-03): *"la app debe hacer loop engineering en las tareas con cada peer,
+  supervisado por el supervisor de cada dpto, y yo superviso [el todo], donde veo todo y todos y lo que se
+  hace iterativamente."* Falta definir **quién conduce la iteración**.
+- **Opciones:** (a) agente auto-itera + supervisor de dpto revisa/corrige + Max ve todo en vivo;
+  (b) app/broker conduce (re-prompt por iteración); (c) supervisor conduce el loop de su equipo.
+- **Decisión (arquitecto; validar con Max):** **(a) híbrida** — el agente auto-itera (trabaja→reporta→
+  continúa, guiado por su system prompt + skill MCP; el broker mide cada iteración), el **supervisor de
+  dpto (un cargo/agente)** revisa cada reporte, desbloquea y escala, y **Max supervisa el todo en vivo**.
+  Es la más coherente con la autonomía de la VISÃO y con "gastar menos tokens" (agentes direccionados). El
+  detalle está en [[10-loop-engineering-supervision]].
+- **Consecuencias:** reusa tareas (`crear/reportar/cerrar`), supervisor (alertas), delegación (escalado),
+  jornada (mide iteraciones) y organigrama (jerarquía); añade la **noción de iteración** y una **consola de
+  supervisión en vivo**. No exige que la app re-prompte (eso sería (b), más tokens).
+- **Reversibilidad:** alta — el "driver" del loop es una política; se puede endurecer a (b)/(c) por dpto.
+- **PENDIENTE:** validar con Max el driver (a) vs (b)/(c) — la pregunta quedó sin responder por un fallo de
+  la herramienta; se documenta (a) como base y se puede ajustar.
+
 ---
 
 ## Decisiones que quedan PENDIENTES de validar con Max (marcadas arriba)
@@ -230,8 +289,13 @@
 - **E-10** — el diseño fino del anti-spoofing `de_id`↔conexión (interactúa con el HTTP stateless actual;
   puede requerir un handle/token por peer). **Es el prerequisito técnico más delicado de la regla dura
   (E-03); conviene un spike antes de comprometer la validación server-side.**
+- **E-21** — **spike de `rmcp`:** confirmar que el `Peer<RoleServer>`/sink de `rmcp` puede emitir una
+  notificación con **método arbitrario** (`notifications/claude/channel`) y declarar la capability
+  `experimental["claude/channel"]`. Si NO, definir el fallback (mantener un sink de notificación custom
+  junto a `rmcp`, o contribuir la extensión). **Bloquea la migración del push del canal.**
+- **E-23** — validar con Max el driver del loop (a auto-itera / b app-driven / c supervisor-driven).
 
-Todo lo demás está decidido y es coherente con las 4 elecciones de producto de Max.
+Todo lo demás está decidido y es coherente con las decisiones de producto de Max.
 
 ---
 #empresa #decisiones #adr #regla-dura #identidad #conocimiento

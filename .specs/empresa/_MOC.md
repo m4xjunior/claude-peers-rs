@@ -35,6 +35,27 @@
 | [[06-decisiones]] | **TODAS las decisiones resueltas** (ADR-es): las 4 de Max + los 9 huecos + store organizativo + anti-spoofing | *"detalhar a decisão #TODAS"* |
 | [[07-workflow-trazable-164-features]] | El **workflow con cadena + trazabilidad** sobre las 164 features (7 eslabones, máquinas de estado reales) | *"ataque las 164 features con un workflow con cadena y trazabilidad"* |
 | [[08-capa-ui]] | La **capa de UI** que expone las features: pantallas, wizard de contratación+lanzamiento, mapa feature→UI | *"no pensamos en las funcionalidades de UI que exponen estas features"* |
+| [[10-loop-engineering-supervision]] | El **modo de operación iterativo**: loop por peer + supervisión jerárquica (supervisor de dpto + Max ve todo en vivo) + consola de supervisión | *"loop engineering nas tarefas… supervisionado por cada dpto… eu vejo tudo e todos iterativamente"* |
+
+## 🔌 Cableado ejecutable (para los agentes implementadores de Max)
+
+> Formato de la casa spec→design→tasks ("masticado para que el workflow SOLO EJECUTE"), verificado contra
+> `archivo:línea`, para que **los agentes que Max ya usa** construyan bien el backend. **NO es código
+> escrito por mí; es la spec que ellos ejecutan.**
+
+| Feature | Qué cabla | Estado |
+|---------|-----------|--------|
+| [[../features/empresa-broker-mcp-e2e/spec\|empresa-broker-mcp-e2e]] | broker↔MCP end-to-end: **store organizativo** en el broker (Cargo/Proyecto/Agente, Redis+SQLite) + **tools MCP** que lo operan, con el **MCP migrado a `rmcp`** (E-21). La empresa vive en el broker; los agentes la operan por MCP | spec+design+tasks |
+
+## 🆕 Decisiones nuevas (2026-07-03) que REVIERTEN constraints previas
+
+- **[[06-decisiones#E-21|E-21]] — MCP vía `rmcp`** (no escrito a mano). Riesgo #1: la notificación custom
+  del `<channel>` → **spike obligatorio** antes de reescribir el client.
+- **[[06-decisiones#E-22|E-22]] — dependencias externas PERMITIDAS** (robustez > minimalismo). **Revierte**
+  el "cero deps nuevas"/"principio #1 de la VISÃO" repetido en el vault; se mantiene el binario portable
+  (libs compiladas, no servicios externos).
+- **[[06-decisiones#E-23|E-23]] — loop engineering** con driver = agente auto-itera + supervisor de dpto
+  revisa + Max ve todo (a validar con Max).
 
 ## 🧩 Las RFCs nuevas (la ingeniería de las features de empresa)
 
