@@ -20,6 +20,22 @@
 3. [[02-modelo-dominio]] — los **tipos** (`Cargo`, `Agente`, `Proyecto`, `Ubicacion`), el wire, la
    persistencia, y cómo se mapean a lo que YA existe en `peers-core`. El contrato de datos.
 
+## 🔧 Ingeniería profunda (03–08) — "los varios pasos que el código tiene que tener"
+
+> Segunda iteración (2026-07-03): tras la crítica de Max *("eso no fue una arquitectura; profundiza")*,
+> estos 6 documentos bajan del concepto a la **ingeniería real**, verificados contra el código
+> (`archivo:línea`). Decisiones de producto de Max que los fundan: conocimiento **rico** en el boot ·
+> fuente **híbrida** (broker + repo) · **regla dura** (el broker valida) · entrega completa.
+
+| Doc | Qué ingenieriza | Crítica de Max que resuelve |
+|-----|-----------------|-----------------------------|
+| [[03-pipeline-provision]] | El pipeline "de cero a agente operativo" como **máquina de estados** (precondición·acción·traza·fallo·idempotencia), cerrando los 9 huecos H1-H9 | *"hasta llegar al agente son varios pasos que el código tiene que tener"* |
+| [[04-conocimiento-agente]] | La **base de conocimiento del agente** (2 canales A/B, modelo híbrido) + la **skill** para operar la empresa (tools MCP nuevas) | *"tienen que tener la base y conocimiento del negocio, de todos los proyectos… skill para operar el sistema"* |
+| [[05-organigrama-visual-ethos]] | El **organigrama en detalle visual Ethos**: nodos, 3 aristas, estados vivos, interacción, impl GPUI | *"desenhar o organograma em detalhe visual Ethos"* |
+| [[06-decisiones]] | **TODAS las decisiones resueltas** (ADR-es): las 4 de Max + los 9 huecos + store organizativo + anti-spoofing | *"detalhar a decisão #TODAS"* |
+| [[07-workflow-trazable-164-features]] | El **workflow con cadena + trazabilidad** sobre las 164 features (7 eslabones, máquinas de estado reales) | *"ataque las 164 features con un workflow con cadena y trazabilidad"* |
+| [[08-capa-ui]] | La **capa de UI** que expone las features: pantallas, wizard de contratación+lanzamiento, mapa feature→UI | *"no pensamos en las funcionalidades de UI que exponen estas features"* |
+
 ## 🧩 Las RFCs nuevas (la ingeniería de las features de empresa)
 
 | RFC | Qué ingenieriza | Encargo de Max que resuelve |
@@ -79,9 +95,15 @@ Radios card 14 · control 10 · pill 999.
 
 ## 🧭 Estado
 
-- **Todo aquí es PROPUESTA para decidir con Max** (salvo lo marcado como ya implementado en las RFCs
-  reusadas). No se ha tocado código: solo `.specs`.
-- **Decisión #1 (cimiento):** binding de id `rol@proyecto` en `peers-client`. Desbloquea el resto.
-- **Decisiones abiertas** (con recomendación) en [[01-modelo-corporativo]] §8 y en cada RFC (§Riesgos).
+- **Arquitectura, no código:** solo `.specs`. Las 4 decisiones de producto están **tomadas** por Max
+  (conocimiento rico · fuente híbrida · regla dura · entrega completa); ver [[06-decisiones]].
+- **Decisión #1 (cimiento):** provisión del id `rol@proyecto` (`CLAUDE_PEERS_ID`, el client ya lo respeta —
+  `main.rs:85-88`; falta que la app lo provea). Cierra H1/H3/H7 y desbloquea el resto ([[03-pipeline-provision]]).
+- **Prerequisito técnico más delicado (spike):** anti-spoofing del `de_id`↔conexión ([[06-decisiones]] E-10),
+  necesario antes de la regla dura server-side.
+- **Correcciones verificadas** propagadas a los docs: el MCP es JSON-RPC **a mano** (no rmcp);
+  `--append-system-prompt` **no existe hoy** en el runtime (solo specs); la derivación de id saneala `@`→`-`.
+
+#moc #empresa #arquitectura-corporativa #agentes #proyectos #peers-desktop
 
 #moc #empresa #arquitectura-corporativa #agentes #proyectos #peers-desktop
