@@ -268,11 +268,13 @@ impl PanelConfig {
             Some(token_bruto)
         };
 
-        let cfg = Config {
-            broker_url,
-            token,
-            refresh_ms,
-        };
+        // Preservar las secciones que esta pantalla NO edita (p.ej. `[lanzador]` con sus recientes
+        // y plantillas): se relee la config del disco y sólo se sobreescriben los 3 campos del
+        // broker. Así guardar aquí no borra el estado del Lanzador. Config ausente → defaults.
+        let mut cfg = Config::cargar().unwrap_or_default();
+        cfg.broker_url = broker_url;
+        cfg.token = token;
+        cfg.refresh_ms = refresh_ms;
 
         match cfg.guardar() {
             Ok(()) => {
