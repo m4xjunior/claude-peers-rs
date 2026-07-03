@@ -8,7 +8,9 @@
 mod app;
 mod cliente;
 mod config;
+mod pty;
 mod tema;
+mod teclado;
 mod vista;
 
 use app::AppDesktop;

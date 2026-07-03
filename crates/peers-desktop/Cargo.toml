@@ -45,6 +45,11 @@ tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Canal `unbounded` que conecta el hilo del event loop de `alacritty_terminal` (SO, no tokio) con el
+# `cx.spawn` de GPUI (RFC Lanzador Fase 2, R7). Ya es dep transitiva de gpui/alacritty_terminal —
+# aquí sólo se declara directa para poder importarla en `pty.rs`. Sin features: sólo se usa el canal.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tracing = { workspace = true }
 # `time` para calcular la antigüedad relativa de las alertas ("hace 12m", alertas-07): parsea el
 # `creada_en` (RFC 3339) que timbra el broker y lo resta de `now_utc()`. Mismo crate/versión que
 # el resto del workspace (feature `parsing` para `Rfc3339`).
