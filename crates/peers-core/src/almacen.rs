@@ -21,7 +21,12 @@ pub use crate::Alcance as AlcanceListado;
 pub trait Almacen: Send + Sync {
     // --- Instancias (fase 1) ---
 
-    /// Registra o re-registra (UPDATE sin perder fila) una instancia con id estable.
+    /// Registra o re-registra (UPDATE sin perder fila) una instancia con id estable. Devuelve
+    /// `true` si fue un ALTA nueva (el id no existía) o `false` si fue un RE-REGISTRO (el id ya
+    /// existía, sólo se actualizó presencia). El caller (`main.rs::registrar`) usa este booleano
+    /// para decidir si abre una sesión de jornada nueva o cierra+reabre una huérfana — evitar que
+    /// cada reconexión de un peer inestable (SSH/VPN) acumule sesiones "fantasma" que nunca
+    /// cierran (`fin=None` para siempre, arruinando el total de tiempo trabajado).
     async fn registrar(
         &self,
         id: &str,
@@ -33,7 +38,7 @@ pub trait Almacen: Send + Sync {
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 
     async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()>;
     async fn definir_resumen(&self, id: &str, resumen: &str) -> anyhow::Result<()>;

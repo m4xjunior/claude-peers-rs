@@ -129,7 +129,7 @@ impl Almacen for AlmacenRedis {
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let mut conn = self.conn().await?;
         let clave = k_instancia(id);
         // ¿Existe? Si sí, re-registro: UPDATE sin tocar registrada_en ni resumen (FIX #1).
@@ -169,7 +169,7 @@ impl Almacen for AlmacenRedis {
         // vencidos a mitad), el re-registro repoblaba el HASH pero dejaba el id FUERA del SET
         // → instancia fantasma: con datos pero invisible en listar() (nadie la ve ni le envía).
         let _: () = conn.sadd(format!("{NS}instancias"), id).await?;
-        Ok(())
+        Ok(!existe)
     }
 
     async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()> {

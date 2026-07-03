@@ -220,6 +220,20 @@ pub fn definiciones_tools() -> Value {
             "name": "revisar_tareas",
             "description": "Resumen rápido de tus tareas abiertas (sin cerrar). Recordatorio de qué te falta cerrar para que el broker cierre el bucle de aprendizaje.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "avisar_equipo",
+            "description": "Envía el mismo mensaje a TODAS las demás instancias vivas en la máquina, en una sola llamada (broadcast). Útil para avisos que afectan a todo el equipo (ej. 'voy a reiniciar el broker', 'terminé mi bloque, disponible'). Cada destino lo recibe como un mensaje directo normal (se empuja como <channel> a su sesión, igual que enviar_mensaje).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mensaje": {
+                        "type": "string",
+                        "description": "El texto a enviar a todo el equipo."
+                    }
+                },
+                "required": ["mensaje"]
+            }
         }
     ])
 }
@@ -273,6 +287,7 @@ enviar_mensaje con su from_id.\n\n\
 Tools disponibles:\n\
 - listar_instancias: descubre otras instancias (alcance: maquina/directorio/repo)\n\
 - enviar_mensaje: envía un mensaje a otra instancia por su id\n\
+- avisar_equipo: envía el MISMO mensaje a TODAS las demás instancias vivas (broadcast)\n\
 - definir_resumen: fija un resumen de lo que haces (visible a las demás)\n\
 - revisar_mensajes: revisa manualmente mensajes nuevos\n\
 - crear_tarea: crea una tarea con tu estimado de duración\n\

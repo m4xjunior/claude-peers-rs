@@ -255,7 +255,7 @@ impl Almacen for AlmacenSqlite {
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let conexion = self.bloquear();
         let existe: bool = conexion
             .query_row("SELECT 1 FROM instancias WHERE id = ?1", params![id], |_| Ok(true))
@@ -273,7 +273,7 @@ impl Almacen for AlmacenSqlite {
                 params![id, pid, hostname, directorio, repo_git, repo_github, tty, resumen, ahora],
             )?;
         }
-        Ok(())
+        Ok(!existe)
     }
 
     async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()> {

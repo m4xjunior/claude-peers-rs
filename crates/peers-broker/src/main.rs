@@ -328,7 +328,8 @@ async fn registrar(
     let _guard = e.registro_lock.lock().await;
     let id = resolver_id_sin_colision(&e, p.id_preferido.as_deref(), p.pid, &p.hostname).await;
     let ahora = ahora_iso();
-    e.almacen
+    let es_alta = e
+        .almacen
         .registrar(
             &id,
             p.pid,
@@ -341,8 +342,27 @@ async fn registrar(
             &ahora,
         )
         .await?;
+    // FIX sesiones fantasma: en un RE-registro (peer reconectando — SSH/VPN inestable, el mismo
+    // proceso perdió el latido y volvió), `abrir_sesion` se llamaba SIEMPRE sin cerrar la sesión
+    // anterior, que quedaba huérfana para siempre (`fin=None`, `duracion_seg=None`) — inflaba el
+    // contador de "sesiones" y dejaba el "total trabajado" en 0s (ninguna sesión cerrada aporta
+    // duración). `cerrar_sesion` es idempotente/no-op si no hay ninguna sesión abierta de este id
+    // (busca la última con `fin.is_none()`, no falla si no encuentra), así que es seguro llamarla
+    // SIEMPRE antes de abrir la nueva — cierra la huérfana con el momento del re-registro como su
+    // fin real (mejor aproximación disponible: no sabemos cuándo se cayó la conexión, pero "ahora"
+    // acota el error a como mucho la ventana entre latidos perdidos).
+    if !es_alta {
+        jornada::cerrar_sesion(&e.almacen, &id, &ahora).await?;
+    }
     // Abre una sesión de jornada para esta instancia (timbrada por el broker).
     jornada::abrir_sesion(&e.almacen, &format!("ses-{id}-{ahora}"), &id, &ahora).await?;
+    // Bitácora (#2/#8): el alta de una instancia NUEVA deja rastro — antes, ni local ni remoto
+    // generaban este evento (no existía `TipoAccion::Registrar`). El re-registro NO se registra
+    // aquí a propósito (sería ruido: un peer con latido inestable re-registraría cada pocos
+    // segundos, inundando su propia bitácora con "altas" que en realidad son la MISMA presencia).
+    if es_alta {
+        registrar_accion(&e, &id, TipoAccion::Registrar, None, Some(p.hostname.clone()), None, None).await;
+    }
     info!("instancia registrada: {id}");
     Ok(Json(RespuestaRegistrar { id }))
 }
@@ -368,6 +388,7 @@ async fn definir_resumen(
         TipoAccion::DefinirResumen,
         None,
         Some(recortar_detalle(&p.resumen, 120)),
+        None,
         None,
     )
     .await;
@@ -416,6 +437,7 @@ async fn registrar_accion(
     sujeto: Option<String>,
     detalle: Option<String>,
     tarea: Option<&Tarea>,
+    evidencia: Option<String>,
 ) {
     let Some(b) = &e.bitacora else { return };
     let a = AccionRegistrada {
@@ -424,6 +446,7 @@ async fn registrar_accion(
         sujeto,
         detalle,
         cuando: ahora_iso(),
+        evidencia,
     };
     if let Err(err) = b.registrar(&a, tarea).await {
         warn!("no se pudo registrar la acción {accion:?} de '{quien}' (la mutación ya ocurrió): {err:#}");
@@ -512,6 +535,7 @@ async fn enviar(
         Some(p.para_id.clone()),
         None,
         None,
+        None,
     )
     .await;
     Ok(Json(RespuestaEnviar { ok: true, error: None }))
@@ -534,7 +558,7 @@ async fn salir(
     e.almacen.salir(&p.id).await?;
     // Bitácora (R4): la baja queda en el histórico DURABLE aunque la instancia desaparezca
     // del registro efímero (ese es justo el punto del ADR-001).
-    registrar_accion(&e, &p.id, TipoAccion::Kick, None, None, None).await;
+    registrar_accion(&e, &p.id, TipoAccion::Kick, None, None, None, None).await;
     Ok(Json(RespuestaOk { ok: true }))
 }
 
@@ -651,6 +675,7 @@ async fn tarea_abrir(
         Some(tarea.id.clone()),
         None,
         Some(&tarea),
+        None,
     )
     .await;
 
@@ -683,6 +708,7 @@ async fn tarea_reportar(
             Some(t.id.clone()),
             Some(recortar_detalle(&p.texto, 120)),
             Some(&t),
+            None,
         )
         .await;
     }
@@ -844,7 +870,9 @@ async fn tarea_cerrar(
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     let tarea = cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
-    // Bitácora (R4/R5): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
+    // Bitácora (R4/R5/#11): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
+    // La evidencia YA llegaba en el payload (`p.evidencia`, persistida en `Tarea.evidencia` desde
+    // #7) pero se descartaba aquí — #11 es justamente conectar ese último tramo a la bitácora.
     registrar_accion(
         &e,
         &tarea.instancia_id,
@@ -852,6 +880,7 @@ async fn tarea_cerrar(
         Some(tarea.id.clone()),
         None,
         Some(&tarea),
+        p.evidencia.clone(),
     )
     .await;
     Ok(Json(RespuestaOk { ok: true }))
@@ -882,6 +911,7 @@ async fn crear_tarea(
         Some(tarea.id.clone()),
         None,
         Some(&tarea),
+        None,
     )
     .await;
 
@@ -915,7 +945,9 @@ async fn cerrar_tarea(
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     let tarea = cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
-    // Bitácora (R4/R5): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
+    // Bitácora (R4/R5/#11): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
+    // La evidencia YA llegaba en el payload (`p.evidencia`, persistida en `Tarea.evidencia` desde
+    // #7) pero se descartaba aquí — #11 es justamente conectar ese último tramo a la bitácora.
     registrar_accion(
         &e,
         &tarea.instancia_id,
@@ -923,6 +955,7 @@ async fn cerrar_tarea(
         Some(tarea.id.clone()),
         None,
         Some(&tarea),
+        p.evidencia.clone(),
     )
     .await;
     Ok(Json(RespuestaOk { ok: true }))
@@ -982,6 +1015,7 @@ async fn tarea_editar(
                 Some(tarea.id.clone()),
                 None,
                 Some(&tarea),
+                None,
             )
             .await;
             Ok(Json(tarea))
@@ -1055,6 +1089,7 @@ async fn tarea_estado(
         Some(tarea.id.clone()),
         Some(estado_tarea_texto(p.estado)),
         Some(&tarea),
+        None,
     )
     .await;
 
@@ -1108,6 +1143,7 @@ async fn tarea_asignar(
         Some(tarea.id.clone()),
         Some(format!("asignada a {}", p.instancia_id)),
         Some(&tarea),
+        None,
     )
     .await;
 
@@ -1170,6 +1206,7 @@ async fn tarea_reasignar(
         Some(tarea.id.clone()),
         Some(format!("de '{dueno_anterior}' a '{}'", p.nuevo_instancia_id)),
         Some(&tarea),
+        None,
     )
     .await;
 
@@ -1207,6 +1244,7 @@ async fn tarea_forzar(
             Some(tarea.id.clone()),
             None,
             Some(&tarea),
+            None,
         )
         .await;
         info!("tarea {} forzada al peer '{}'", tarea.id, tarea.instancia_id);
@@ -1328,7 +1366,7 @@ async fn admin_purgar(
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     e.almacen.purgar(&p.id).await?;
     // Bitácora (R4/R5): purga = acción del operador; el peer purgado es el sujeto.
-    registrar_accion(&e, ID_OPERADOR, TipoAccion::Purgar, Some(p.id.clone()), None, None).await;
+    registrar_accion(&e, ID_OPERADOR, TipoAccion::Purgar, Some(p.id.clone()), None, None, None).await;
     info!("admin: purgada la cola y outbox de '{}'", p.id);
     Ok(Json(RespuestaOk { ok: true }))
 }
@@ -1408,6 +1446,7 @@ async fn admin_alerta_resolver(
         ID_OPERADOR,
         TipoAccion::ResolverAlerta,
         Some(format!("{}:{}", p.tipo, p.sujeto)),
+        None,
         None,
         None,
     )

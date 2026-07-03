@@ -5461,6 +5461,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "dirs",
+ "futures",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -5473,6 +5474,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

@@ -247,6 +247,7 @@ async fn ejecutar_tool(estado: &Arc<EstadoCliente>, params: Option<&Value>) -> V
     let texto = match nombre {
         "listar_instancias" => tool_listar(estado, &args).await,
         "enviar_mensaje" => tool_enviar(estado, &args).await,
+        "avisar_equipo" => tool_avisar_equipo(estado, &args).await,
         "definir_resumen" => tool_definir_resumen(estado, &args).await,
         "revisar_mensajes" => tool_revisar(estado).await,
         "crear_tarea" => tool_crear_tarea(estado, &args).await,
@@ -348,6 +349,75 @@ async fn tool_enviar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String
         ));
     }
     Ok(format!("Mensaje enviado a la instancia {para_id}"))
+}
+
+/// Broadcast (bug #6, acotado): envía `mensaje` a TODAS las demás instancias vivas en la máquina,
+/// en una sola llamada. NO hay endpoint de broadcast en el broker (`/enviar` sigue siendo 1:1) —
+/// esta tool hace fan-out en el cliente: lista instancias (mismo alcance/exclusión que
+/// `listar_instancias`) y llama `enviar()` una vez por destino. Aditivo: no toca el protocolo
+/// existente, sólo lo reusa. Degradación: un fallo individual NO aborta el resto (un peer caído a
+/// mitad del broadcast no debe silenciar el aviso a los demás); el resumen final distingue
+/// éxitos de fallos para que el agente sepa si algún destino no lo recibió.
+async fn tool_avisar_equipo(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+    let mensaje = args
+        .get("mensaje")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'mensaje'")?;
+
+    let mi_id = estado
+        .id
+        .read()
+        .await
+        .clone()
+        .ok_or("Aún no registrado en el broker")?;
+
+    let instancias = estado
+        .broker
+        .listar(&PeticionListar {
+            alcance: Alcance::Maquina,
+            directorio: estado.directorio.clone(),
+            repo_git: estado.repo_git.clone(),
+            excluir_id: Some(mi_id.clone()),
+        })
+        .await
+        .map_err(|e| format!("Error al listar instancias para el broadcast: {e}"))?;
+
+    if instancias.is_empty() {
+        return Ok("No hay otras instancias vivas — nadie a quien avisar.".to_string());
+    }
+
+    let mut enviados: Vec<String> = Vec::new();
+    let mut fallidos: Vec<String> = Vec::new();
+    for inst in &instancias {
+        let resultado = estado
+            .broker
+            .enviar(&PeticionEnviar {
+                de_id: mi_id.clone(),
+                para_id: inst.id.clone(),
+                texto: mensaje.to_string(),
+            })
+            .await;
+        match resultado {
+            Ok(resp) if resp.ok => enviados.push(inst.id.clone()),
+            Ok(resp) => fallidos.push(format!(
+                "{} ({})",
+                inst.id,
+                resp.error.unwrap_or_else(|| "rechazado".to_string())
+            )),
+            Err(e) => fallidos.push(format!("{} (error de red: {e})", inst.id)),
+        }
+    }
+
+    let mut resumen = format!(
+        "Avisado a {}/{} instancia(s): {}",
+        enviados.len(),
+        instancias.len(),
+        enviados.join(", ")
+    );
+    if !fallidos.is_empty() {
+        resumen.push_str(&format!("\nNo recibieron el aviso: {}", fallidos.join(", ")));
+    }
+    Ok(resumen)
 }
 
 async fn tool_definir_resumen(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {

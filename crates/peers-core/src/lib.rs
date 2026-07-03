@@ -1032,6 +1032,10 @@ pub enum TipoAccion {
     Purgar,
     /// Descarte manual de una alerta (`/admin/alerta-resolver`).
     ResolverAlerta,
+    /// Alta de una instancia NUEVA (`/registrar`, sólo la primera vez — el re-registro de un
+    /// peer ya conocido no genera este evento, ver `main.rs::registrar`). Antes de esta variante,
+    /// el alta no dejaba rastro en la bitácora (ni local ni remoto: agnóstico de origen).
+    Registrar,
 }
 
 /// Un evento de la bitácora de acciones (R1): QUIÉN hizo QUÉ, sobre QUÉ sujeto, CUÁNDO.
@@ -1050,6 +1054,11 @@ pub struct AccionRegistrada {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detalle: Option<String>,
     pub cuando: String, // ISO 8601, timbrado por el broker
+    /// #11 — evidencia de que la acción se procesó (link a commit, captura, resumen del
+    /// resultado…), texto libre adjuntado por quien la cerró. `None` = sin evidencia (la mayoría
+    /// de las acciones de hoy, y toda la bitácora anterior a este campo — compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidencia: Option<String>,
 }
 
 /// Cuántas acciones retiene la bitácora por peer (R7, las más recientes). Espejo de

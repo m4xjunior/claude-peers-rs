@@ -78,8 +78,8 @@ impl Bitacora {
             tarea_id = Some(t.id.as_str());
         }
         sqlx::query(
-            "INSERT INTO acciones (instancia_id, accion, sujeto, tarea_id, detalle, cuando)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO acciones (instancia_id, accion, sujeto, tarea_id, detalle, cuando, evidencia)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(&a.quien)
         .bind(accion_texto(a.accion))
@@ -87,6 +87,7 @@ impl Bitacora {
         .bind(tarea_id)
         .bind(&a.detalle)
         .bind(&a.cuando)
+        .bind(&a.evidencia)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -107,7 +108,7 @@ impl Bitacora {
         let filas: Vec<SqliteRow> = match desde {
             Some(d) => {
                 sqlx::query(
-                    "SELECT instancia_id, accion, sujeto, detalle, cuando FROM acciones
+                    "SELECT instancia_id, accion, sujeto, detalle, cuando, evidencia FROM acciones
                      WHERE instancia_id = ?1 AND cuando < ?2
                      ORDER BY cuando DESC, id DESC LIMIT ?3",
                 )
@@ -119,7 +120,7 @@ impl Bitacora {
             }
             None => {
                 sqlx::query(
-                    "SELECT instancia_id, accion, sujeto, detalle, cuando FROM acciones
+                    "SELECT instancia_id, accion, sujeto, detalle, cuando, evidencia FROM acciones
                      WHERE instancia_id = ?1
                      ORDER BY cuando DESC, id DESC LIMIT ?2",
                 )
@@ -194,6 +195,7 @@ fn fila_a_accion(f: &SqliteRow) -> Option<AccionRegistrada> {
         sujeto: f.try_get::<Option<String>, _>("sujeto").ok().flatten(),
         detalle: f.try_get::<Option<String>, _>("detalle").ok().flatten(),
         cuando: f.try_get("cuando").ok()?,
+        evidencia: f.try_get::<Option<String>, _>("evidencia").ok().flatten(),
     })
 }
 
@@ -224,6 +226,7 @@ mod pruebas {
             sujeto: Some("destino".into()),
             detalle: None,
             cuando: cuando.to_string(),
+            evidencia: None,
         }
     }
 
@@ -238,6 +241,27 @@ mod pruebas {
         assert_eq!(acciones.len(), 2, "solo las del peer pedido (AC2)");
         assert_eq!(acciones[0].cuando, "2026-01-01T00:00:02Z", "más reciente primero");
         assert_eq!(acciones[0].sujeto.as_deref(), Some("destino"));
+    }
+
+    /// #11: registrar una acción CON evidencia la persiste y `listar` la devuelve intacta;
+    /// una acción SIN evidencia (la mayoría, y toda la bitácora previa a este campo) sigue
+    /// deserializando con `evidencia: None` — la columna `ADD COLUMN` es nullable, sin romper
+    /// filas existentes ni el resto del roundtrip.
+    #[tokio::test]
+    async fn evidencia_se_persiste_y_se_lee_de_vuelta() {
+        let b = bitacora_en_memoria().await;
+        let mut con_evidencia = accion("pa", "2026-01-01T00:00:01Z");
+        con_evidencia.evidencia = Some("commit abc123, ver PR #42".to_string());
+        b.registrar(&con_evidencia, None).await.expect("registrar con evidencia");
+        b.registrar(&accion("pa", "2026-01-01T00:00:02Z"), None)
+            .await
+            .expect("registrar sin evidencia");
+
+        let acciones = b.listar("pa", None, 100).await.expect("listar");
+        assert_eq!(acciones.len(), 2);
+        // Más reciente primero (sin evidencia) → la de evidencia queda en [1].
+        assert_eq!(acciones[1].evidencia.as_deref(), Some("commit abc123, ver PR #42"));
+        assert!(acciones[0].evidencia.is_none(), "sin evidencia sigue siendo None, no vacío");
     }
 
     /// ADR-001: la acción sobre una tarea siembra el ancla (tareas_conocidas) y la FK resuelve;
