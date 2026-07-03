@@ -37,12 +37,13 @@ use gpui::{
     ParentElement, Render, Rgba, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     StyledExt,
 };
 
 use crate::app::EstadoPantalla;
 use crate::tema;
+use crate::validacion::{validar_url, ValidacionUrl};
 
 // -------------------------------------------------------------------------------------------------
 // ACCIONES — el panel es stateful pero necesita el `ClienteBroker` (que vive en `AppDesktop`) para
@@ -174,6 +175,11 @@ pub struct ResultadoPrueba {
     pub resumen: String,
     /// `true` mientras el check está EN CURSO (spinner/estado "probando…").
     pub en_curso: bool,
+    /// RTT del `GET /salud` en milisegundos (acceso-12). `None` si no se llegó a medir (broker
+    /// caído antes de responder, o aún no probado). El broker NO expone latencia server-side
+    /// (`RespuestaSalud` no trae timestamp) — se cronometra en el cliente, alrededor de la
+    /// llamada bloqueante real (`ClienteBroker::bloquear_en`), no del scheduling de GPUI.
+    pub latencia_ms: Option<u64>,
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -206,6 +212,19 @@ pub struct PanelAcceso {
     diagnostico: Option<crate::cliente::ErrorBroker>,
     /// Feedback del último "Aplicar".
     ultimo_aplicar: EstadoAplicar,
+    /// Validación EN VIVO de `entrada_url` (acceso-16): se recalcula en cada edición vía
+    /// `cx.subscribe` (mismo patrón que `PanelConfig::validar_url`, config-04). Pinta el borde
+    /// del campo y, si aplica, ofrece la sugerencia de autocorrección (variante C del RFC).
+    validacion_url: ValidacionUrl,
+    /// Feedback efímero de "Copiar token" (acceso-03): `Some(generación)` mientras se muestra
+    /// "✓ Copiado"; se limpia solo tras 2s SI la generación no cambió (evita que un timer viejo
+    /// borre el feedback de una copia más reciente si el jefe pulsa varias veces seguidas).
+    feedback_copiado: Option<u64>,
+    /// Contador que se incrementa en cada copia; es la "generación" que arbitra qué timer manda.
+    generacion_copiado: u64,
+    /// Historial local de conexiones (acceso-13), más reciente primero. `AppDesktop` lo inyecta
+    /// tras cada "Aplicar"/"Probar" vía `set_historial` (leído de `config.toml`, nunca del broker).
+    historial: Vec<crate::config::EventoConexion>,
 }
 
 impl PanelAcceso {
@@ -229,13 +248,37 @@ impl PanelAcceso {
             }
         });
 
+        // acceso-16: validación EN VIVO de la URL — cada edición del Input notifica al panel para
+        // repintar el borde/nota sin esperar a "Aplicar" (mismo patrón que config-04).
+        cx.subscribe(&entrada_url, |esta, input, _ev: &InputEvent, cx| {
+            esta.validacion_url = validar_url(&input.read(cx).value());
+            cx.notify();
+        })
+        .detach();
+
+        let validacion_url = validar_url(&cfg.broker_url);
+
         Self {
             entrada_url,
             entrada_token,
             prueba: ResultadoPrueba::default(),
             diagnostico: None,
             ultimo_aplicar: EstadoAplicar::Inicial,
+            validacion_url,
+            feedback_copiado: None,
+            generacion_copiado: 0,
+            // acceso-13: el historial YA persistido se muestra desde el primer render (no hace
+            // falta esperar a la primera acción de esta sesión para verlo).
+            historial: cfg.acceso.historial,
         }
+    }
+
+    /// `AppDesktop` inyecta aquí el historial de conexiones tras registrar un evento (acceso-13).
+    /// Espejo del contrato de `set_resultado_prueba`/`set_diagnostico`: el panel no habla con el
+    /// disco directamente, refleja lo que la app le pasa.
+    pub fn set_historial(&mut self, historial: Vec<crate::config::EventoConexion>, cx: &mut Context<Self>) {
+        self.historial = historial;
+        cx.notify();
     }
 
     /// `AppDesktop` inyecta aquí el resultado de "Probar conexión" (acceso-05). Se llama vía
@@ -272,18 +315,70 @@ impl PanelAcceso {
         self.entrada_token.update(cx, |s, cx| {
             s.set_value(cfg.token.clone().unwrap_or_default(), window, cx)
         });
+        // El `set_value` de arriba dispara la suscripción de acceso-16 (recalcula
+        // `validacion_url`), pero se fija explícito por si el valor no cambió (la suscripción de
+        // `InputEvent` no siempre notifica en un no-op) — nunca dejar el borde con un estado viejo.
+        self.validacion_url = validar_url(&cfg.broker_url);
         cx.notify();
     }
 
-    /// Lee los Inputs, valida la frontera (URL no vacía) y DESPACHA `AplicarConexion` al `AppDesktop`
-    /// (acceso-01 + acceso-02). No toca el broker ni el disco directamente: eso lo hace `AppDesktop`,
-    /// que tiene el cliente. Si la URL va vacía, muestra el error local sin despachar.
+    /// Copia el token REAL (en claro, tal como está en `entrada_token`) al portapapeles (acceso-03).
+    /// Mismo patrón que `PanelLanzador::copiar_comando`: `cx.write_to_clipboard` sin deps nuevas.
+    /// El feedback "✓ Copiado" se auto-oculta a los 2s (variante A del RFC); se lee de
+    /// `entrada_token` (no de `EstadoPantalla::acceso_token`, que sólo cachea el valor ENMASCARADO
+    /// — el token en claro únicamente vive en este Input editable).
+    fn copiar_token(&mut self, cx: &mut Context<Self>) {
+        let token = self.entrada_token.read(cx).value().to_string();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(token));
+
+        self.generacion_copiado += 1;
+        let mi_generacion = self.generacion_copiado;
+        self.feedback_copiado = Some(mi_generacion);
+        cx.notify();
+
+        cx.spawn(async move |esta, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            let _ = esta.update(cx, |esta, cx| {
+                // Sólo se limpia si NADIE volvió a copiar mientras esperábamos (si el jefe pulsó
+                // otra vez, esa copia tiene su propio timer y su propia generación más alta).
+                if esta.feedback_copiado == Some(mi_generacion) {
+                    esta.feedback_copiado = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Reemplaza el contenido del Input de URL por la autocorrección sugerida (acceso-16, variante
+    /// C) y revalida. No aplica ni persiste por sí solo: el jefe sigue pulsando «Guardar y
+    /// reconectar» para confirmar, igual que si hubiera tecleado la URL corregida a mano.
+    fn usar_sugerencia(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sugerencia) = self.validacion_url.sugerencia.clone() {
+            self.entrada_url
+                .update(cx, |s, cx| s.set_value(sugerencia.clone(), window, cx));
+            self.validacion_url = validar_url(&sugerencia);
+            cx.notify();
+        }
+    }
+
+    /// Lee los Inputs, valida la frontera (acceso-16: esquema/host/barra final/puerto) y DESPACHA
+    /// `AplicarConexion` al `AppDesktop` (acceso-01 + acceso-02). No toca el broker ni el disco
+    /// directamente: eso lo hace `AppDesktop`, que tiene el cliente. Si la URL es inválida, muestra
+    /// el error local (con la sugerencia, si aplica) sin despachar.
     fn aplicar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let broker_url = self.entrada_url.read(cx).value().trim().to_string();
         let token = self.entrada_token.read(cx).value().trim().to_string();
 
-        if broker_url.is_empty() {
-            self.ultimo_aplicar = EstadoAplicar::Error("La URL del broker no puede estar vacía".to_string());
+        // acceso-16: no se despacha con una URL mal formada. La validación EN VIVO ya pinta el
+        // borde/nota mientras el jefe teclea; aquí se repite en frontera (defensa en
+        // profundidad: el campo pudo mutar por `set_value` sin pasar por el listener de tecleo).
+        let validacion = validar_url(&broker_url);
+        if let Some(motivo) = validacion.motivo.clone() {
+            self.validacion_url = validacion;
+            self.ultimo_aplicar = EstadoAplicar::Error(format!("broker_url inválida: {motivo}"));
             cx.notify();
             return;
         }
@@ -295,11 +390,13 @@ impl PanelAcceso {
         window.dispatch_action(Box::new(AplicarConexion { broker_url, token }), cx);
     }
 
-    /// Envuelve un `Input` del kit en el marco de control Ethos (borde LINEA, radio, superficie
-    /// TINTA). Idéntico criterio que `PanelConfig::input_tematizado`: el Input hereda fuente/color
-    /// del subárbol; el `div` tematizado le da el marco sin pelear con el tema del kit. `es_token`
-    /// añade el toggle de máscara (ojo) para el secreto.
-    fn input_tematizado(estado: &Entity<InputState>, es_token: bool) -> impl IntoElement {
+    /// Envuelve un `Input` del kit en el marco de control Ethos (radio, superficie TINTA).
+    /// Idéntico criterio que `PanelConfig::input_tematizado`: el Input hereda fuente/color del
+    /// subárbol; el `div` tematizado le da el marco sin pelear con el tema del kit. `es_token`
+    /// añade el toggle de máscara (ojo) para el secreto. `borde` (acceso-16) permite pisar el
+    /// color por defecto (LINEA) con el de validación EN VIVO — `None` = LINEA neutro (token, que
+    /// no se valida aquí).
+    fn input_tematizado(estado: &Entity<InputState>, es_token: bool, borde: Option<Rgba>) -> impl IntoElement {
         let input = if es_token {
             Input::new(estado).cleanable(true).mask_toggle()
         } else {
@@ -312,7 +409,7 @@ impl PanelAcceso {
             .rounded(tema::radio(tema::RADIO_CONTROL))
             .bg(tema::TINTA)
             .border_1()
-            .border_color(tema::LINEA)
+            .border_color(borde.unwrap_or(tema::LINEA))
             .child(input)
     }
 }
@@ -323,18 +420,52 @@ impl Render for PanelAcceso {
         // feedback + resultado de prueba + diagnóstico. Es la parte OPERABLE de la pantalla.
         let mut card = tema::superficie_card().v_flex().w_full().gap_4().p_5();
 
-        // Campo URL (acceso-01).
-        card = card.child(campo_form(
+        // Campo URL (acceso-01) + validación EN VIVO (acceso-16): borde verde salvia/terracota
+        // según `validacion_url`, nota con el motivo si es inválida, y botón de autocorrección si
+        // hay una sugerencia mecánica (variante C del RFC — p.ej. faltaba el esquema http://).
+        let borde_url = if self.validacion_url.es_valida() { Some(OK) } else { Some(MAL) };
+        let mut campo_url = campo_form(
             "broker_url",
             "URL base del broker (sin barra final). Enter no aplica: usa «Aplicar».",
-            Self::input_tematizado(&self.entrada_url, false),
-        ));
+            Self::input_tematizado(&self.entrada_url, false, borde_url),
+        );
+        if let Some(motivo) = &self.validacion_url.motivo {
+            campo_url = campo_url.child(
+                div().text_sm().text_color(MAL).child(SharedString::from(format!("⚠ {motivo}"))),
+            );
+        }
+        if let Some(sugerencia) = self.validacion_url.sugerencia.clone() {
+            campo_url = campo_url.child(
+                div().h_flex().gap_2().items_center()
+                    .child(tema::texto_terciario(format!("¿Quisiste decir «{sugerencia}»?")))
+                    .child(
+                        tema::boton_secundario("acceso-usar-sugerencia", "Usar sugerencia")
+                            .on_click(cx.listener(|esta, _e, window, cx| esta.usar_sugerencia(window, cx))),
+                    ),
+            );
+        }
+        card = card.child(campo_url);
 
-        // Campo token (acceso-02).
+        // Campo token (acceso-02) + botón "Copiar" (acceso-03): fila horizontal Input+botón para
+        // que el Input siga ocupando el ancho disponible. El botón alterna su label a "✓ Copiado"
+        // 2s tras copiar (variante A del RFC — confirmación efímera, sin exponer el valor extra).
+        let label_copiar: SharedString = if self.feedback_copiado.is_some() {
+            "✓ Copiado".into()
+        } else {
+            "Copiar".into()
+        };
         card = card.child(campo_form(
             "token",
             "X-Peers-Token. Vacío = broker sin token. Usa el ojo para revelar/ocultar.",
-            Self::input_tematizado(&self.entrada_token, true),
+            div()
+                .h_flex()
+                .gap_2()
+                .w_full()
+                .child(div().flex_1().child(Self::input_tematizado(&self.entrada_token, true, None)))
+                .child(
+                    tema::boton_secundario("acceso-copiar-token", label_copiar)
+                        .on_click(cx.listener(|esta, _e, _window, cx| esta.copiar_token(cx))),
+                ),
         ));
 
         // Botonera: aplicar (primario, reconfigura+reconecta) + probar (secundario, check ligero).
@@ -376,6 +507,13 @@ impl Render for PanelAcceso {
         // Diagnóstico diferenciado del último error (acceso-06): banner tipado con remedio + CTA.
         if let Some(err) = &self.diagnostico {
             card = card.child(banner_diagnostico(err));
+        }
+
+        // Historial local de conexiones (acceso-13): mini-feed con las últimas entradas (variante C
+        // del RFC — más simple que un Popover/Dialog dedicado; el historial completo cabe en pocas
+        // líneas porque está acotado a `MAX_HISTORIAL_ACCESO` en disco).
+        if !self.historial.is_empty() {
+            card = card.child(bloque_historial(&self.historial));
         }
 
         card
@@ -500,7 +638,9 @@ pub fn render_acceso(datos: &EstadoPantalla) -> impl IntoElement {
 
 /// Campo de formulario del panel: eyebrow (label) + Input + ayuda terciaria. Espejo de
 /// `PanelConfig::campo`, replicado aquí para no acoplar las dos pantallas por un helper trivial.
-fn campo_form(etiqueta: &'static str, ayuda: &'static str, input: impl IntoElement) -> impl IntoElement {
+/// Devuelve `Div` (no `impl IntoElement`) para que el caller pueda seguir encadenando `.child(...)`
+/// — lo necesita acceso-16 para añadir la nota de error/sugerencia SÓLO al campo de URL.
+fn campo_form(etiqueta: &'static str, ayuda: &'static str, input: impl IntoElement) -> gpui::Div {
     div()
         .v_flex()
         .gap_2()
@@ -532,7 +672,7 @@ fn bloque_prueba(p: &ResultadoPrueba) -> impl IntoElement {
             )
     };
 
-    div()
+    let mut bloque = div()
         .v_flex()
         .gap_2()
         .p_3()
@@ -542,10 +682,106 @@ fn bloque_prueba(p: &ResultadoPrueba) -> impl IntoElement {
         .border_color(tema::LINEA)
         .child(tema::eyebrow("prueba de conexión"))
         .child(paso("broker alcanzable · /salud", p.salud_ok, if p.en_curso { "probando…" } else { "sin probar" }))
-        .child(paso("token válido · ruta protegida", p.token_ok, if p.en_curso { "probando…" } else { "sin probar" }))
-        .when(!p.resumen.is_empty(), |d| {
-            d.child(tema::texto_terciario(p.resumen.clone()))
-        })
+        .child(paso("token válido · ruta protegida", p.token_ok, if p.en_curso { "probando…" } else { "sin probar" }));
+
+    // acceso-12: RTT de /salud, chip de color por umbral (verde <50ms / ámbar <200ms / rojo ≥200ms).
+    // Sólo se pinta si hubo medición (broker vivo cuando se probó); offline no tiene RTT que mostrar.
+    if let Some(ms) = p.latencia_ms {
+        let color = if ms < 50 {
+            OK
+        } else if ms < 200 {
+            AVISO
+        } else {
+            MAL
+        };
+        bloque = bloque.child(
+            div()
+                .h_flex()
+                .gap_2()
+                .items_center()
+                .child(tema::texto_terciario("latencia"))
+                .child(tema::chip_estado(format!("{ms} ms"), color)),
+        );
+    }
+
+    bloque.when(!p.resumen.is_empty(), |d| {
+        d.child(tema::texto_terciario(p.resumen.clone()))
+    })
+}
+
+/// Mini-feed del historial local de conexiones (acceso-13, variante C del RFC): las últimas
+/// entradas con dot verde/rojo + hora + tipo + detalle, mono para hora/detalle (son datos
+/// técnicos). Muestra como mucho las 5 más recientes en la card — el historial COMPLETO vive
+/// acotado en disco (`MAX_HISTORIAL_ACCESO`), pero la card no necesita listarlo todo para ser útil.
+fn bloque_historial(historial: &[crate::config::EventoConexion]) -> impl IntoElement {
+    const MAX_VISIBLES: usize = 5;
+
+    let mut bloque = div()
+        .v_flex()
+        .gap_2()
+        .p_3()
+        .rounded(tema::radio(tema::RADIO_CONTROL))
+        .bg(tema::TINTA)
+        .border_1()
+        .border_color(tema::LINEA)
+        .child(tema::eyebrow("historial de conexión"));
+
+    for ev in historial.iter().take(MAX_VISIBLES) {
+        let color = if ev.ok { OK } else { MAL };
+        let tipo_txt = match ev.tipo {
+            crate::config::TipoEventoConexion::Aplicar => "Aplicar",
+            crate::config::TipoEventoConexion::Probar => "Probar",
+        };
+        bloque = bloque.child(
+            div()
+                .h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().text_color(color).child(SharedString::from("●")))
+                .child(
+                    div()
+                        .font_family(tema::FUENTE_MONO)
+                        .text_size(px(11.0))
+                        .text_color(tema::HUMO)
+                        .child(SharedString::from(hora_de_iso(&ev.cuando))),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(tema::PAPEL)
+                        .child(SharedString::from(tipo_txt)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .font_family(tema::FUENTE_MONO)
+                        .text_size(px(11.0))
+                        .text_color(tema::HUMO)
+                        .child(SharedString::from(ev.detalle.clone())),
+                ),
+        );
+    }
+
+    if historial.len() > MAX_VISIBLES {
+        bloque = bloque.child(tema::texto_terciario(format!(
+            "… y {} más (persistidas en config.toml)",
+            historial.len() - MAX_VISIBLES
+        )));
+    }
+
+    bloque
+}
+
+/// Extrae `HH:MM:SS` de una marca RFC 3339 (p.ej. `2026-07-03T09:05:00Z` → `09:05:00`). Réplica
+/// deliberada de `vista::jornada::hora_iso` (privada allí): duplicar una función trivial de 6
+/// líneas es más barato que acoplar dos módulos de pantalla por un helper de formato.
+fn hora_de_iso(iso: &str) -> String {
+    if let Some(pos) = iso.find('T') {
+        let resto = &iso[pos + 1..];
+        let fin = resto.find(['.', 'Z', '+']).unwrap_or(resto.len());
+        return resto[..fin].to_string();
+    }
+    iso.to_string()
 }
 
 /// Banner de diagnóstico diferenciado (acceso-06): icono + título por categoría + remedio + pista de

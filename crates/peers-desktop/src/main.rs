@@ -11,6 +11,7 @@ mod config;
 mod pty;
 mod tema;
 mod teclado;
+mod validacion;
 mod vista;
 
 use app::AppDesktop;

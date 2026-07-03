@@ -21,6 +21,10 @@ const REFRESH_MS_DEFECTO: u64 = 1000;
 /// Cuántos directorios recientes se recuerdan como máximo (R1.2 de la RFC Lanzador).
 pub const MAX_RECIENTES: usize = 8;
 
+/// Cuántos eventos de conexión se recuerdan como máximo (acceso-13 de la RFC Acceso). Igual
+/// criterio que `MAX_RECIENTES`: acotar para no ensuciar el `config.toml` indefinidamente.
+pub const MAX_HISTORIAL_ACCESO: usize = 20;
+
 /// Config persistida. `token` es opcional: si el broker corre sin token, se omite del archivo.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -37,6 +41,10 @@ pub struct Config {
     /// garantiza que un `config.toml` viejo SIN esta sección deserialice sin error (AC10).
     #[serde(default)]
     pub lanzador: ConfigLanzador,
+    /// Historial local de conexiones (acceso-13, RFC Acceso). Mismo criterio retrocompatible que
+    /// `lanzador`: `#[serde(default)]` para que un `config.toml` viejo sin `[acceso]` cargue igual.
+    #[serde(default)]
+    pub acceso: ConfigAcceso,
 }
 
 fn refresh_ms_defecto() -> u64 {
@@ -114,7 +122,60 @@ impl Default for Config {
             token: None,
             refresh_ms: REFRESH_MS_DEFECTO,
             lanzador: ConfigLanzador::default(),
+            acceso: ConfigAcceso::default(),
         }
+    }
+}
+
+/// Estado persistido de la pantalla Acceso: hoy sólo el historial local de conexiones
+/// (acceso-13). Se guarda en la sub-tabla `[acceso]` del mismo `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ConfigAcceso {
+    /// Eventos de conexión (Aplicar/Probar) más recientes primero, acotados a
+    /// `MAX_HISTORIAL_ACCESO`. Se serializa sólo si NO está vacío (no ensucia el archivo de quien
+    /// nunca abrió Acceso).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub historial: Vec<EventoConexion>,
+}
+
+/// Un evento del historial local de conexiones (acceso-13): qué operación se hizo, contra qué
+/// broker, con qué resultado y cuándo. Es trazabilidad de SESIÓN (vive sólo en la desktop, nunca
+/// se manda al broker) — distinto de la bitácora de acciones del broker (`peers-core::AccionRegistrada`),
+/// que es del PEER hablando con el broker, no del jefe operando la conexión desde la desktop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventoConexion {
+    /// Marca de tiempo en RFC 3339 UTC (mismo formato que usa el broker para `creada_en` en
+    /// alertas — `time::OffsetDateTime::now_utc().format(&Rfc3339)`), para poder mostrar tanto la
+    /// hora local como calcular antigüedad relativa si hiciera falta más adelante.
+    pub cuando: String,
+    /// Qué operación generó el evento.
+    pub tipo: TipoEventoConexion,
+    /// `broker_url` contra el que se operó (tal cual estaba en el momento del evento).
+    pub broker_url: String,
+    /// `true` si la operación tuvo éxito (aplicó/probó sin error).
+    pub ok: bool,
+    /// Resumen legible del resultado (p.ej. "broker vivo · token válido" o el motivo del fallo).
+    pub detalle: String,
+}
+
+/// Qué operación generó un `EventoConexion` (acceso-13). Sólo dos: son las dos escrituras que
+/// hace hoy `PanelAcceso` (acceso-01/02 y acceso-05); si el panel gana más acciones mutantes en el
+/// futuro, se añade variante aquí, nunca se reusa una existente con otro significado.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TipoEventoConexion {
+    /// «Guardar y reconectar» (acceso-01/02).
+    Aplicar,
+    /// «Probar conexión» (acceso-05).
+    Probar,
+}
+
+impl ConfigAcceso {
+    /// Registra un evento al FRENTE del historial (más reciente primero) y lo acota a
+    /// `MAX_HISTORIAL_ACCESO`. No persiste por sí solo — el caller guarda la `Config` completa,
+    /// igual que `ConfigLanzador::registrar_reciente`.
+    pub fn registrar_evento(&mut self, evento: EventoConexion) {
+        self.historial.insert(0, evento);
+        self.historial.truncate(MAX_HISTORIAL_ACCESO);
     }
 }
 
@@ -325,6 +386,61 @@ mod tests {
         assert_eq!(cfg, leido);
         assert_eq!(leido.lanzador.recientes, vec!["/Users/max/proyecto".to_string()]);
         assert_eq!(leido.lanzador.plantillas.len(), 1);
+        let _ = std::fs::remove_file(&ruta);
+    }
+
+    // --- RFC Acceso: historial local de conexiones `[acceso]` (acceso-13) ---
+
+    fn evento_de_prueba(tipo: TipoEventoConexion, ok: bool) -> EventoConexion {
+        EventoConexion {
+            cuando: "2026-07-03T09:00:00Z".to_string(),
+            tipo,
+            broker_url: "http://127.0.0.1:7899".to_string(),
+            ok,
+            detalle: "broker vivo · token válido".to_string(),
+        }
+    }
+
+    #[test]
+    fn config_vieja_sin_acceso_deserializa() {
+        // Un config.toml previo a la RFC Acceso NO tiene la tabla [acceso]: debe cargar con la
+        // sección al default (historial vacío), sin error de deserialización — mismo criterio de
+        // retrocompatibilidad que `config_vieja_sin_lanzador_deserializa` (AC10 de Lanzador).
+        let cfg =
+            Config::desde_toml("broker_url = \"http://127.0.0.1:7899\"\nrefresh_ms = 500").unwrap();
+        assert_eq!(cfg.refresh_ms, 500);
+        assert!(cfg.acceso.historial.is_empty());
+    }
+
+    #[test]
+    fn registrar_evento_inserta_al_frente_y_acota() {
+        let mut a = ConfigAcceso::default();
+        for i in 0..(MAX_HISTORIAL_ACCESO + 3) {
+            let mut ev = evento_de_prueba(TipoEventoConexion::Probar, true);
+            ev.detalle = format!("intento {i}");
+            a.registrar_evento(ev);
+        }
+        assert_eq!(a.historial.len(), MAX_HISTORIAL_ACCESO);
+        // El último registrado queda al frente (más reciente primero).
+        assert_eq!(a.historial[0].detalle, format!("intento {}", MAX_HISTORIAL_ACCESO + 2));
+    }
+
+    #[test]
+    fn roundtrip_config_con_historial_acceso() {
+        let mut cfg = Config::default();
+        cfg.acceso.registrar_evento(evento_de_prueba(TipoEventoConexion::Aplicar, true));
+        cfg.acceso.registrar_evento(evento_de_prueba(TipoEventoConexion::Probar, false));
+        let ruta = std::env::temp_dir().join("peers-desktop-test-acceso-historial.toml");
+        cfg.guardar_en(&ruta).unwrap();
+        let leido = Config::cargar_desde(&ruta).unwrap();
+        assert_eq!(cfg, leido);
+        assert_eq!(leido.acceso.historial.len(), 2);
+        // Orden preservado tras el roundtrip TOML (más reciente al frente): el último insertado
+        // (Probar) queda en [0], el primero (Aplicar) en [1].
+        assert_eq!(leido.acceso.historial[0].tipo, TipoEventoConexion::Probar);
+        assert!(!leido.acceso.historial[0].ok);
+        assert_eq!(leido.acceso.historial[1].tipo, TipoEventoConexion::Aplicar);
+        assert!(leido.acceso.historial[1].ok);
         let _ = std::fs::remove_file(&ruta);
     }
 }
