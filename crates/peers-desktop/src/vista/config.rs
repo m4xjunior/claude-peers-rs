@@ -211,29 +211,6 @@ impl PanelConfig {
         cx.notify();
     }
 
-    /// Valida `broker_url` en frontera (config-04): devuelve `Some(motivo)` si es inválida, o
-    /// `None` si está bien. Reglas: no vacía, con esquema `http://`/`https://`, host presente y
-    /// SIN barra final (el cliente concatena rutas con `{base}{ruta}`).
-    fn validar_url(url: &str) -> Option<String> {
-        let url = url.trim();
-        if url.is_empty() {
-            return Some("la URL no puede estar vacía".to_string());
-        }
-        let resto = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"));
-        let Some(resto) = resto else {
-            return Some("falta el esquema http:// o https://".to_string());
-        };
-        if resto.is_empty() {
-            return Some("falta el host (p.ej. 127.0.0.1:7899)".to_string());
-        }
-        if url.ends_with('/') {
-            return Some("sin barra final (el cliente concatena rutas)".to_string());
-        }
-        None
-    }
-
     /// Lee los tres Inputs, valida y persiste el TOML. Equivale a la tecla 's' de la TUI.
     /// No hace `.unwrap()` sobre IO: el error de guardado se refleja en `ultimo_guardado`.
     fn guardar(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -242,8 +219,10 @@ impl PanelConfig {
         let refresh_bruto = self.entrada_refresh.read(cx).value().trim().to_string();
 
         // Validación de frontera (parse, don't validate): misma regla que la validación EN VIVO
-        // del campo (config-04) — vacía / sin esquema / sin host / con barra final no se persiste.
-        if let Some(motivo) = Self::validar_url(&broker_url) {
+        // del campo (config-04) — vacía / sin esquema / sin host / con barra final / puerto
+        // inválido no se persiste. Módulo compartido con Acceso (acceso-16): antes había una
+        // copia de esta función por pantalla, sin tests.
+        if let Some(motivo) = crate::validacion::validar_url(&broker_url).motivo {
             self.ultimo_guardado = EstadoGuardado::Error(format!("broker_url inválida: {motivo}"));
             cx.notify();
             return;
@@ -322,9 +301,10 @@ impl Render for PanelConfig {
 
         // config-04: validación EN VIVO de broker_url — borde terracota + motivo bajo el campo si
         // es inválida; ayuda estática si está bien. El subscribe del constructor repinta al teclear.
+        // Módulo compartido con Acceso (acceso-16): antes esta función vivía duplicada aquí.
         let url_actual = self.entrada_broker_url.read(cx).value().to_string();
-        let url_invalida = Self::validar_url(&url_actual);
-        let (nota_url, url_ok) = match &url_invalida {
+        let validacion_url = crate::validacion::validar_url(&url_actual);
+        let (nota_url, url_ok) = match &validacion_url.motivo {
             Some(motivo) => (format!("⚠ {motivo}"), false),
             None => ("URL base del broker (sin barra final).".to_string(), true),
         };

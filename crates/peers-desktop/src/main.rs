@@ -9,6 +9,7 @@ mod app;
 mod cliente;
 mod config;
 mod tema;
+mod validacion;
 mod vista;
 
 use app::AppDesktop;

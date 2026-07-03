@@ -985,6 +985,87 @@ impl AppDesktop {
 
         // 4) Recargar el estado contra el nuevo broker (poblará info/salud + diagnóstico en el panel).
         self.cargar_broker(cx);
+
+        // acceso-13: registra el evento "Aplicar" en el historial local. `cargar_broker` es
+        // fire-and-forget (no expone su resultado síncronamente), así que se hace un `GET /salud`
+        // propio y LIGERO —igual que el primer paso de `probar_conexion`— sólo para saber si
+        // "aplicar" terminó viendo el broker vivo o no; el resultado se pasa YA CALCULADO a
+        // `registrar_evento_acceso` (que no repite ninguna llamada de red). Se lee `self.cliente.base()`
+        // (ya normalizada tras `reconfigurar`) en vez de la variable `broker_url` local, que
+        // `reconfigurar` movió en el paso 2.
+        let cliente = self.cliente.clone();
+        let broker_url_evento = self.cliente.base().to_string();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.salud()) });
+        cx.spawn(async move |esta, cx| {
+            let salud = fondo.await;
+            let (ok, detalle) = match salud {
+                Ok(s) => (true, format!("{} · {} instancias", s.estado, s.instancias)),
+                Err(e) => (false, e.to_string()),
+            };
+            let _ = esta.update(cx, |esta, cx| {
+                esta.registrar_evento_acceso(
+                    crate::config::TipoEventoConexion::Aplicar,
+                    broker_url_evento,
+                    ok,
+                    detalle,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// Persiste un `EventoConexion` en `config.toml` (acceso-13) con un resultado YA CALCULADO por
+    /// el caller (no repite ninguna llamada de red: `probar_conexion` ya hizo su propio `/salud` y
+    /// `aplicar_conexion` el suyo; duplicar el check aquí habría significado un segundo hit de red
+    /// por acción y, peor, un resultado que podría diferir del que el jefe ya vio en pantalla).
+    /// Refresca el timeline del panel tras guardar. Se ejecuta en el `background_executor` (la
+    /// escritura a disco es síncrona pero barata; no vale la pena bloquear el hilo de UI).
+    fn registrar_evento_acceso(
+        &mut self,
+        tipo: crate::config::TipoEventoConexion,
+        broker_url: String,
+        ok: bool,
+        detalle: String,
+        cx: &mut Context<Self>,
+    ) {
+        let fondo = cx.background_executor().spawn(async move {
+            // `time` ya es dependencia (usado por alertas para `creada_en`/antigüedad relativa);
+            // se reusa el mismo formato RFC 3339 UTC en vez de introducir otra convención de hora.
+            use time::format_description::well_known::Rfc3339;
+            let cuando = time::OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| String::new());
+
+            // Cargar+mutar+guardar puede perder una escritura concurrente rara vez (dos eventos
+            // casi simultáneos), aceptable para un historial de auditoría local, no un contador
+            // crítico — mismo criterio de tolerancia que el resto de `Config`.
+            let mut cfg = crate::config::Config::cargar().unwrap_or_default();
+            cfg.acceso.registrar_evento(crate::config::EventoConexion {
+                cuando,
+                tipo,
+                broker_url,
+                ok,
+                detalle,
+            });
+            let guardado = cfg.guardar();
+            (guardado, cfg.acceso.historial)
+        });
+        cx.spawn(async move |esta, cx| {
+            let (guardado, historial) = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                if let Err(e) = guardado {
+                    eprintln!("acceso-13: no se pudo persistir el historial de conexión: {e}");
+                }
+                if let Some(panel) = &esta.datos.panel_acceso {
+                    panel.update(cx, |p, cx| p.set_historial(historial, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// "Probar conexión" (acceso-05 y config-01): check DEDICADO y ligero, SIN recargar el resto.
@@ -998,7 +1079,17 @@ impl AppDesktop {
         let cliente = self.cliente.clone();
         // El check corre en el executor de fondo (reqwest necesita su runtime tokio, no el de GPUI).
         let fondo = cx.background_executor().spawn(async move {
+            // acceso-12: RTT medido AQUÍ (dentro del executor de fondo, alrededor de la llamada
+            // bloqueante real) para no incluir el overhead de scheduling entre el background_executor
+            // y el cx.spawn async — eso mediría "cuánto tarda GPUI en despertar", no la red.
+            let inicio = std::time::Instant::now();
             let salud = cliente.bloquear_en(cliente.salud());
+            let latencia_ms = if salud.is_ok() {
+                Some(inicio.elapsed().as_millis() as u64)
+            } else {
+                // Offline/error: el tiempo transcurrido es el del timeout/rechazo, no un RTT real.
+                None
+            };
             // Sólo probamos el token si el broker respondió a /salud (si está caído, el 2º paso no
             // aporta: no hay a quién autenticar). `None` = no se llegó a probar.
             let auth = if salud.is_ok() {
@@ -1006,10 +1097,10 @@ impl AppDesktop {
             } else {
                 None
             };
-            (salud, auth)
+            (salud, auth, latencia_ms)
         });
         cx.spawn(async move |esta, cx| {
-            let (salud, auth) = fondo.await;
+            let (salud, auth, latencia_ms) = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
                 let salud_ok = salud.is_ok();
                 // Distingue token válido (200) de rechazado (401) de "no probado" (broker caído).
@@ -1034,16 +1125,31 @@ impl AppDesktop {
                     token_ok,
                     resumen,
                     en_curso: false,
+                    latencia_ms,
                 };
                 // El resultado vuelve al panel que pidió la prueba (config-01 vs acceso-05).
                 if hacia_config {
                     if let Some(panel) = &esta.datos.panel_config {
-                        panel.update(cx, |p, cx| p.set_resultado_prueba(resultado, cx));
+                        panel.update(cx, |p, cx| p.set_resultado_prueba(resultado.clone(), cx));
                     }
                 } else if let Some(panel) = &esta.datos.panel_acceso {
-                    panel.update(cx, |p, cx| p.set_resultado_prueba(resultado, cx));
+                    panel.update(cx, |p, cx| p.set_resultado_prueba(resultado.clone(), cx));
                 }
                 cx.notify();
+
+                // acceso-13: registra el evento "Probar" en el historial local (sólo desde la
+                // pestaña Acceso — config-01 comparte el MISMO check pero su propio historial no
+                // está en el alcance de esta RFC; evita mezclar el timeline de Acceso con acciones
+                // disparadas desde Config). Reusa `salud_ok`/`resumen` YA calculados: sin 2º hit.
+                if !hacia_config {
+                    esta.registrar_evento_acceso(
+                        crate::config::TipoEventoConexion::Probar,
+                        esta.cliente.base().to_string(),
+                        resultado.salud_ok.unwrap_or(false),
+                        resultado.resumen.clone(),
+                        cx,
+                    );
+                }
             });
         })
         .detach();
