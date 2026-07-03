@@ -3154,12 +3154,21 @@ impl Render for AppDesktop {
         // Área de contenido: la pantalla activa. Ocupa el resto del ancho y hace scroll si su
         // contenido excede el alto de la ventana (las pantallas largas —jornada, broker— no se
         // cortan). `min_w_0` deja que el flex encoja el hijo en vez de desbordar el sidebar.
+        // SCROLL TRANSVERSAL (fix): el contenedor de la pantalla activa debe acotarse al alto
+        // disponible de la ventana y scrollear su contenido interno. Claves:
+        //  - `h_full` en un hijo de `h_flex` con `size_full` toma el alto de la ventana (referencia
+        //    concreta, no "el contenido"), y `min_h_0` permite que el scroll interno recorte.
+        //  - `overflow_y_scroll` sobre ESTE contenedor. El hijo `self.contenido()` NO debe imponer
+        //    su propio alto (las vistas usan v_flex+gap sin h_full, así crecen y este contenedor
+        //    scrollea). Sin esto, las pantallas altas (broker/config/acceso/lanzador) quedan
+        //    cortadas abajo y no se puede bajar.
         let contenido = div()
             .id("contenido-scroll")
             .v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
+            .min_h_0()
             .overflow_y_scroll()
             .child(self.contenido());
 
