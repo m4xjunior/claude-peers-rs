@@ -31,8 +31,8 @@
 //! global; el panel la maneja internamente si se le cablea.
 
 use gpui::{
-    div, App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, App, AppContext, Context, Entity, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     input::{Input, InputEvent, InputState},
@@ -110,6 +110,17 @@ pub struct PanelConfig {
     /// `true` mientras el botón "Restablecer" espera confirmación (config-02, 2 pasos inline:
     /// restablecer descarta las ediciones no guardadas, no debe ser un mis-click).
     confirmar_reset: bool,
+    /// Info del broker conectado (config-06: host/puerto/versión/instancias). La inyecta
+    /// `AppDesktop` en cada `cargar_broker` — MISMO dato que ya consume la pestaña Broker
+    /// (`EstadoPantalla.info`), sin segunda llamada HTTP ni endpoint nuevo. `None` mientras no
+    /// haya llegado la primera respuesta o si el broker está offline.
+    info: Option<peers_core::RespuestaAdminInfo>,
+    /// Snapshot de los 3 campos PERSISTIDOS (config-12: dirty-state) — sólo lo que este panel
+    /// edita, NO el `Config` completo (que incluye `lanzador`, ajeno a esta pantalla y que otra
+    /// pestaña puede mutar sin que eso deba marcar Config como "sucio"). Se resiembra al crear el
+    /// panel, tras guardar, tras recargar y tras restablecer; comparar contra esto en cada render
+    /// evita releer el TOML en cada frame.
+    persistido: (String, Option<String>, u64),
 }
 
 impl PanelConfig {
@@ -118,6 +129,7 @@ impl PanelConfig {
     pub fn nuevo(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Ausente/corrupta → defaults: la pantalla debe abrirse siempre.
         let cfg = Config::cargar().unwrap_or_default();
+        let persistido = (cfg.broker_url.clone(), cfg.token.clone(), cfg.refresh_ms);
 
         let entrada_broker_url = cx.new(|cx| {
             InputState::new(window, cx)
@@ -153,6 +165,8 @@ impl PanelConfig {
             ultimo_guardado: EstadoGuardado::Inicial,
             prueba: ResultadoPrueba::default(),
             confirmar_reset: false,
+            info: None,
+            persistido,
         }
     }
 
@@ -160,6 +174,13 @@ impl PanelConfig {
     /// que `PanelAcceso::set_resultado_prueba`.
     pub fn set_resultado_prueba(&mut self, resultado: ResultadoPrueba, cx: &mut Context<Self>) {
         self.prueba = resultado;
+        cx.notify();
+    }
+
+    /// `AppDesktop` inyecta aquí el resultado de `GET /admin/info` (config-06), en el mismo punto
+    /// donde ya lo hace para la pestaña Broker (`cargar_broker`). Sin llamada HTTP propia.
+    pub fn set_info(&mut self, info: Option<peers_core::RespuestaAdminInfo>, cx: &mut Context<Self>) {
+        self.info = info;
         cx.notify();
     }
 
@@ -208,7 +229,34 @@ impl PanelConfig {
             "Config releída de {}",
             Config::ruta().display()
         ));
+        // config-12: los Inputs ahora reflejan EXACTAMENTE lo persistido → ya no hay nada "sucio".
+        self.persistido = (cfg.broker_url, cfg.token, cfg.refresh_ms);
         cx.notify();
+    }
+
+    /// `true` si algún Input difiere de lo PERSISTIDO (config-12: dirty-state). Compara los 3
+    /// campos tal como los leería `guardar()` (trim + token vacío → `None`), así "sucio" coincide
+    /// exactamente con "hay algo nuevo que Guardar escribiría en disco" — no una comparación cruda
+    /// de strings que marcaría sucio por espacios en blanco irrelevantes. Un `refresh_ms` que no
+    /// parsea (campo vacío o en edición) cuenta como sucio: por definición ya no es el valor
+    /// persistido, aunque `guardar()` lo rechace hasta que sea un entero válido.
+    fn sucio(&self, cx: &App) -> bool {
+        let broker_url = self.entrada_broker_url.read(cx).value().trim().to_string();
+        let token_bruto = self.entrada_token.read(cx).value().trim().to_string();
+        let token = if token_bruto.is_empty() {
+            None
+        } else {
+            Some(token_bruto)
+        };
+        let refresh_bruto = self.entrada_refresh.read(cx).value().trim().to_string();
+
+        if broker_url != self.persistido.0 || token != self.persistido.1 {
+            return true;
+        }
+        match refresh_bruto.parse::<u64>() {
+            Ok(n) => n != self.persistido.2,
+            Err(_) => true,
+        }
     }
 
     /// Valida `broker_url` en frontera (config-04): devuelve `Some(motivo)` si es inválida, o
@@ -280,6 +328,9 @@ impl PanelConfig {
             Ok(()) => {
                 self.ultimo_guardado =
                     EstadoGuardado::Ok(format!("Guardado en {}", Config::ruta().display()));
+                // config-12: se acaba de persistir EXACTAMENTE lo que hay en los Inputs → limpio.
+                // Sólo en el brazo Ok: si falló el guardado, el disco no cambió y debe seguir sucio.
+                self.persistido = (cfg.broker_url, cfg.token, cfg.refresh_ms);
             }
             Err(e) => {
                 self.ultimo_guardado = EstadoGuardado::Error(format!("No se pudo guardar: {e}"));
@@ -303,10 +354,38 @@ impl PanelConfig {
             .child(input)
             .child(tema::texto_terciario(ayuda))
     }
+
+    /// Fila `etiqueta → valor` en mono/papel para la card "Broker conectado" (config-06). Espejo
+    /// del helper `campo()` de `vista/broker.rs`, sin compartirlo entre módulos por ser trivial.
+    fn fila_info(etiqueta: &'static str, valor: impl Into<SharedString>) -> impl IntoElement {
+        div()
+            .h_flex()
+            .items_center()
+            .gap_4()
+            .child(tema::eyebrow(etiqueta).w(gpui::px(90.0)))
+            .child(
+                div()
+                    .font_family(tema::FUENTE_MONO)
+                    .text_color(tema::PAPEL)
+                    .child(valor.into()),
+            )
+    }
 }
 
 impl Render for PanelConfig {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // config-12: ¿hay ediciones sin guardar? Gobierna el punto dorado del título y si Guardar
+        // está habilitado. Se recalcula en cada render (barato: son 3 lecturas de Input + un parse).
+        let sucio = self.sucio(cx);
+
+        // config-13: ¿cuál Input tiene el foco AHORA? Gobierna el marco dorado del campo activo.
+        // `InputState` implementa `Focusable` (expone su `FocusHandle` real); comparar contra ese
+        // handle es más simple que envolver con `track_focus` (que serviría para CAPTURAR teclas,
+        // no para preguntar "¿el foco nativo del Input está aquí?").
+        let foco_url = self.entrada_broker_url.read(cx).focus_handle(cx).is_focused(window);
+        let foco_token = self.entrada_token.read(cx).focus_handle(cx).is_focused(window);
+        let foco_refresh = self.entrada_refresh.read(cx).focus_handle(cx).is_focused(window);
+
         // Línea de feedback bajo el botón: color cálido según el resultado del último guardado.
         let feedback = match &self.ultimo_guardado {
             EstadoGuardado::Inicial => div(),
@@ -366,11 +445,21 @@ impl Render for PanelConfig {
                 .flex_wrap()
                 .gap_3()
                 .child(
-                    tema::boton_primario("config-guardar", "Guardar").on_click(cx.listener(
-                        |esta, _evento, window, cx| {
-                            esta.guardar(window, cx);
-                        },
-                    )),
+                    // config-12: sin cambios → botón atenuado (opacidad reducida, cursor normal,
+                    // SIN listener de click). Con cambios → Guardar primario normal. Evita un
+                    // guardado "en el vacío" que sólo reescribiría el TOML con los mismos valores.
+                    if sucio {
+                        tema::boton_primario("config-guardar", "Guardar")
+                            .on_click(cx.listener(|esta, _evento, window, cx| {
+                                esta.guardar(window, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        tema::boton_primario("config-guardar", "Guardar")
+                            .opacity(0.4)
+                            .cursor_default()
+                            .into_any_element()
+                    },
                 )
                 .child(
                     tema::boton_secundario("config-probar", "Probar conexión").on_click(
@@ -413,7 +502,7 @@ impl Render for PanelConfig {
                     .v_flex()
                     .gap_2()
                     .child(tema::eyebrow("broker_url"))
-                    .child(self.input_tematizado_validado(&self.entrada_broker_url, url_ok))
+                    .child(self.input_tematizado_validado(&self.entrada_broker_url, url_ok, foco_url))
                     .child(
                         div()
                             .text_sm()
@@ -424,15 +513,25 @@ impl Render for PanelConfig {
             .child(Self::campo(
                 "token",
                 "Token X-Peers-Token. Vacío = broker sin token.",
-                self.input_tematizado(&self.entrada_token, true),
+                self.input_tematizado(&self.entrada_token, true, foco_token),
             ))
             .child(Self::campo(
                 "refresh_ms",
                 "Periodo de refresco de las pantallas, en milisegundos (entero > 0).",
-                self.input_tematizado(&self.entrada_refresh, false),
+                self.input_tematizado(&self.entrada_refresh, false, foco_refresh),
             ))
             // Botonera + feedback semántico cálido.
-            .child(div().v_flex().gap_3().pt_2().child(botonera).child(feedback));
+            .child(div().v_flex().gap_3().pt_2().child(botonera).child(feedback))
+            // config-13: pista de atajos (variante B de la RFC) — descubribilidad sin invadir la
+            // botonera. Mono/humo, mismo vocabulario tipográfico que el resto de datos técnicos.
+            .child(
+                div()
+                    .pt_1()
+                    .font_family(tema::FUENTE_MONO)
+                    .text_xs()
+                    .text_color(tema::HUMO)
+                    .child(SharedString::from("⌘S guardar · Esc descartar cambios")),
+            );
 
         // Resultado del último "Probar conexión" (config-01) + estado del token (config-08):
         // chips de salud y de auth derivados del check en dos pasos (mismo contrato que Acceso).
@@ -459,30 +558,92 @@ impl Render for PanelConfig {
             );
         }
 
-        // Raíz de la pantalla: fondo app Ethos + cabecera (eyebrow + título + subtítulo) + card.
+        // config-06: card "Broker conectado" (host/puerto/versión/instancias vía `admin_info()`,
+        // ya cableado en el cliente — sin segunda llamada HTTP, mismo dato que consume Broker).
+        let panel_broker = match &self.info {
+            Some(info) => tema::superficie_card()
+                .v_flex()
+                .gap_2()
+                .p_5()
+                .child(tema::eyebrow("Broker conectado"))
+                .child(Self::fila_info("Host", info.host.clone()))
+                .child(Self::fila_info("Puerto", info.puerto.to_string()))
+                .child(Self::fila_info("Versión", info.version.clone()))
+                .child(Self::fila_info("Instancias", info.instancias.to_string()))
+                .into_any_element(),
+            None => tema::superficie_card()
+                .v_flex()
+                .gap_2()
+                .p_5()
+                .child(tema::eyebrow("Broker conectado"))
+                .child(tema::texto_terciario(
+                    "Sin datos de /admin/info todavía — pulsa «Probar conexión».",
+                ))
+                .into_any_element(),
+        };
+
+        // config-13: atajos de teclado propios del panel. Las teclas burbujean desde el `InputState`
+        // enfocado hacia arriba (fase bubble de `on_key_down`, sin necesitar `track_focus` aquí), así
+        // que esto captura Cmd+S/Esc mientras el usuario está escribiendo en cualquiera de los 3
+        // campos. Cmd+S SIEMPRE se consume aquí antes que el guard global de `app.rs::manejar_tecla`
+        // (que hace `return` temprano si `m.platform` está activo, así que nunca compite con él).
+        // Esc SÓLO se maneja si NO estamos en el paso de confirmación de "Restablecer" (ese diálogo
+        // ya tiene sus propios botones Cancelar/Confirmar; Esc ahí lo sigue resolviendo el guard
+        // global, que cierra/desenfoca y devuelve el foco a la raíz).
+        let confirmando_reset = self.confirmar_reset;
+        // Raíz de la pantalla: fondo app Ethos + cabecera (eyebrow + título + subtítulo) + cards.
         tema::fondo_app()
             .v_flex()
             .gap_5()
             .p_8()
+            .on_key_down(cx.listener(move |esta, ev: &gpui::KeyDownEvent, window, cx| {
+                let m = &ev.keystroke.modifiers;
+                let tecla = ev.keystroke.key.as_str();
+                if m.platform && !m.control && !m.alt && tecla == "s" {
+                    esta.guardar(window, cx);
+                } else if tecla == "escape" && !confirmando_reset && !m.platform && !m.control && !m.alt
+                {
+                    esta.recargar(window, cx);
+                }
+            }))
             .child(
                 div()
                     .v_flex()
                     .gap_1()
                     .child(tema::eyebrow("Configuración"))
-                    .child(tema::titulo("Broker"))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(tema::titulo("Broker"))
+                            // config-12: punto dorado junto al título mientras haya ediciones sin
+                            // guardar — mismo lenguaje visual que el resalte brasa del resto de Ethos.
+                            .when(sucio, |el| {
+                                el.child(
+                                    div()
+                                        .w(gpui::px(8.0))
+                                        .h(gpui::px(8.0))
+                                        .rounded(gpui::px(999.0))
+                                        .bg(tema::BRASA),
+                                )
+                            }),
+                    )
                     .child(tema::texto_terciario(
                         "Parámetros de conexión. Guardar persiste ~/.config/claude-peers/config.toml.",
                     )),
             )
             .child(tarjeta)
+            .child(panel_broker)
     }
 }
 
 impl PanelConfig {
-    /// Envuelve un `Input` del kit en un contenedor con el estilo de control Ethos: borde LINEA,
-    /// radio de control, superficie TINTA2 y foco dorado. El propio `Input` hereda la fuente UI y
-    /// el color PAPEL del subárbol (fijados por `fondo_app`), así el widget del kit deja de verse
-    /// con su tema por defecto y encaja en la paleta. `es_token` añade el toggle de máscara.
+    /// Envuelve un `Input` del kit en un contenedor con el estilo de control Ethos: borde LINEA
+    /// (o dorado si tiene el foco, config-13), radio de control, superficie TINTA2. El propio
+    /// `Input` hereda la fuente UI y el color PAPEL del subárbol (fijados por `fondo_app`), así el
+    /// widget del kit deja de verse con su tema por defecto y encaja en la paleta. `es_token`
+    /// añade el toggle de máscara.
     ///
     /// Por qué envolver y no re-estilar el Input directamente: el `Input` de gpui-component pinta
     /// su propio fondo/borde con `cx.theme()`; envolverlo en un `div` tematizado y darle al Input
@@ -491,6 +652,7 @@ impl PanelConfig {
         &self,
         estado: &Entity<InputState>,
         es_token: bool,
+        enfocado: bool,
     ) -> impl IntoElement {
         let input = if es_token {
             Input::new(estado).cleanable(true).mask_toggle()
@@ -498,11 +660,9 @@ impl PanelConfig {
             Input::new(estado).cleanable(true)
         };
 
-        // NOTA: no se cablea `.focus(...)` en este wrapper: el foco lo posee el `InputState`
-        // interno, no este `div`, así que un `focus_style` aquí nunca se activaría (sería estilo
-        // muerto). El marco queda con borde LINEA estático; el cursor del propio Input da el
-        // feedback de edición. Si en Fase 3 se quiere marco dorado al foco, hay que envolver con
-        // `track_focus` del `focus_handle` del InputState (no trivial con la API del kit).
+        // config-13: el marco se tiñe BRASA cuando el `InputState` interno tiene el foco real
+        // (comparado en el render vía `focus_handle(cx).is_focused(window)`, no un `.focus(...)`
+        // de este wrapper — el foco lo posee el Input, no este div).
         div()
             .w_full()
             .px_3()
@@ -510,17 +670,26 @@ impl PanelConfig {
             .rounded(tema::radio(tema::RADIO_CONTROL))
             .bg(tema::TINTA)
             .border_1()
-            .border_color(tema::LINEA)
+            .border_color(if enfocado { tema::BRASA } else { tema::LINEA })
             .child(input)
     }
 
-    /// Como `input_tematizado`, pero el borde refleja la VALIDACIÓN en vivo (config-04):
-    /// LINEA si es válido, terracota si no. Solo lo usa el campo `broker_url`.
+    /// Como `input_tematizado`, pero el borde refleja la VALIDACIÓN en vivo (config-04) con
+    /// PRIORIDAD sobre el foco (config-13): terracota si inválido (aunque tenga el foco — el error
+    /// es la señal más urgente), dorado si válido Y enfocado, LINEA si válido y sin foco.
     fn input_tematizado_validado(
         &self,
         estado: &Entity<InputState>,
         valido: bool,
+        enfocado: bool,
     ) -> impl IntoElement {
+        let color = if !valido {
+            ROJO_ERROR
+        } else if enfocado {
+            tema::BRASA
+        } else {
+            tema::LINEA
+        };
         div()
             .w_full()
             .px_3()
@@ -528,7 +697,7 @@ impl PanelConfig {
             .rounded(tema::radio(tema::RADIO_CONTROL))
             .bg(tema::TINTA)
             .border_1()
-            .border_color(if valido { tema::LINEA } else { ROJO_ERROR })
+            .border_color(color)
             .child(Input::new(estado).cleanable(true))
     }
 }
