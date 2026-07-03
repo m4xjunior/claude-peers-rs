@@ -276,6 +276,24 @@ pub(crate) fn pasa_filtro(a: &Alerta, filtro: &[String]) -> bool {
     filtro.is_empty() || filtro.iter().any(|t| tipo_serializado(a.tipo) == t)
 }
 
+/// Traduce un índice de la lista VISIBLE (post-filtro) al índice REAL en `alertas`. Función PURA
+/// (sin `cx`/`AppDesktop`) para que sea testeable sin el aparato de GPUI — extraída del método
+/// `AppDesktop::indice_real_alerta` (que delega aquí) porque toda la lógica sólo depende de la
+/// lista y el filtro, nunca del `self` de la app. `None` si el índice visible no existe (lista
+/// vacía tras el filtro, o índice fuera de rango).
+///
+/// ESTA función es la que corrige el bug real de alertas-14: `alertas_seleccion`/las acciones de
+/// fila viajan en coordenadas VISIBLES; leer `alertas[indice_visible]` directo (sin pasar por
+/// aquí) opera sobre la alerta equivocada en cuanto hay un filtro de tipo activo.
+pub(crate) fn indice_real(alertas: &[Alerta], filtro: &[String], indice_visible: usize) -> Option<usize> {
+    alertas
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| pasa_filtro(a, filtro))
+        .nth(indice_visible)
+        .map(|(idx_real, _)| idx_real)
+}
+
 // Anchos fijos (px) de las columnas no flexibles, espejo de los Constraint de la TUI (10/18/…/10
 // chars). `detalle` es la flexible (`flex_1`).
 const COL_TIPO: f32 = 170.0;
@@ -875,4 +893,76 @@ fn barra_acciones_modal(idx: usize, tipo_str: &str, sujeto: &str, confirmando: b
             }),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alerta(tipo: TipoAlerta, sujeto: &str) -> Alerta {
+        Alerta {
+            tipo,
+            sujeto: sujeto.to_string(),
+            detalle: String::new(),
+            creada_en: String::new(),
+        }
+    }
+
+    /// 5 alertas de tipos mixtos, en el mismo orden en que llegarían de `/admin/alertas` (0..4).
+    /// Sólo 2 son `Ghosteo` (índices reales 1 y 3): son las que un filtro "sólo ghosteo" deja ver.
+    fn alertas_mixtas() -> Vec<Alerta> {
+        vec![
+            alerta(TipoAlerta::Ocioso, "a"),      // real 0 — NO pasa el filtro "ghosteo"
+            alerta(TipoAlerta::Ghosteo, "b"),     // real 1 — visible 0
+            alerta(TipoAlerta::Atascado, "c"),    // real 2 — NO pasa
+            alerta(TipoAlerta::Ghosteo, "d"),     // real 3 — visible 1
+            alerta(TipoAlerta::Ocioso, "e"),      // real 4 — NO pasa
+        ]
+    }
+
+    #[test]
+    fn sin_filtro_indice_visible_es_igual_al_real() {
+        let alertas = alertas_mixtas();
+        assert_eq!(indice_real(&alertas, &[], 0), Some(0));
+        assert_eq!(indice_real(&alertas, &[], 3), Some(3));
+    }
+
+    /// Reproduce el bug real (alertas-14): con el filtro "sólo ghosteo" activo, la tabla pinta
+    /// SÓLO 2 filas (las de sujeto "b" y "d"). Si el usuario resalta la SEGUNDA fila visible
+    /// (índice visible 1) y pulsa `d`, debe descartarse la alerta REAL en el índice 3 (sujeto
+    /// "d") — NO la alerta en la posición 1 de la lista TOTAL (sujeto "b", que ni siquiera pasa
+    /// el filtro). Antes del fix, `manejar_tecla`/`cargar_alertas` leían `alertas[indice_visible]`
+    /// directo, lo que habría operado sobre "b" en vez de "d".
+    #[test]
+    fn indice_visible_con_filtro_traduce_a_la_alerta_correcta_no_la_de_esa_posicion_total() {
+        let alertas = alertas_mixtas();
+        let filtro = vec![tipo_serializado(TipoAlerta::Ghosteo).to_string()];
+
+        // Fila visible 0 → real 1 (sujeto "b"), NO real 0.
+        let real_0 = indice_real(&alertas, &filtro, 0).expect("visible 0 existe");
+        assert_eq!(alertas[real_0].sujeto, "b");
+
+        // Fila visible 1 → real 3 (sujeto "d"), NO real 1 ("b", el bug habría descartado esta).
+        let real_1 = indice_real(&alertas, &filtro, 1).expect("visible 1 existe");
+        assert_eq!(alertas[real_1].sujeto, "d");
+        assert_ne!(
+            alertas[real_1].sujeto,
+            alertas.get(1).unwrap().sujeto,
+            "el índice visible 1 NUNCA debe resolver a la alerta que ocupa la posición 1 de la lista total"
+        );
+    }
+
+    #[test]
+    fn indice_visible_fuera_de_rango_del_filtro_devuelve_none() {
+        let alertas = alertas_mixtas();
+        let filtro = vec![tipo_serializado(TipoAlerta::Ghosteo).to_string()];
+        // Sólo hay 2 alertas visibles (índices 0 y 1); pedir la 3ª visible no debe apuntar a nada.
+        assert_eq!(indice_real(&alertas, &filtro, 2), None);
+    }
+
+    #[test]
+    fn filtro_vacio_no_oculta_ninguna_alerta() {
+        let a = alerta(TipoAlerta::CierreSospechoso, "x");
+        assert!(pasa_filtro(&a, &[]));
+    }
 }

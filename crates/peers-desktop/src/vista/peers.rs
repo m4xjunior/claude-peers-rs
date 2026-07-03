@@ -275,6 +275,34 @@ fn fila(indice: usize, inst: &Instancia, estado: EstadoPeer, activa: bool) -> im
         })
 }
 
+/// Indicador de salud del broker junto al título (peers-18): punto de color + etiqueta corta.
+/// Deriva SÓLO de `datos.salud`/`datos.error_acceso` (ya cargados por `cargar_broker` para la
+/// pestaña Broker) — cero llamada HTTP propia de Peers. Tres estados: vivo (verde salvia), caído/
+/// degradado (terracota) y "—" mientras no ha llegado la primera respuesta (humo, ni ok ni error).
+fn indicador_salud_broker(datos: &EstadoPantalla) -> impl IntoElement {
+    const VERDE_OK: gpui::Rgba = gpui::Rgba { r: 0x8F as f32 / 255.0, g: 0xB0 as f32 / 255.0, b: 0x7B as f32 / 255.0, a: 1.0 };
+    const ROJO_ERROR: gpui::Rgba = gpui::Rgba { r: 0xC9 as f32 / 255.0, g: 0x6A as f32 / 255.0, b: 0x5A as f32 / 255.0, a: 1.0 };
+
+    let (color, etiqueta) = match (&datos.error_acceso, &datos.salud) {
+        (Some(_), _) => (ROJO_ERROR, "broker caído".to_string()),
+        (None, Some(s)) => (VERDE_OK, format!("vivo · {} instancia(s)", s.instancias)),
+        (None, None) => (tema::HUMO, "—".to_string()),
+    };
+
+    div()
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(999.0)).bg(color))
+        .child(
+            div()
+                .font_family(tema::FUENTE_MONO)
+                .text_xs()
+                .text_color(tema::HUMO)
+                .child(SharedString::from(etiqueta)),
+        )
+}
+
 /// Banner de error: se pinta cuando la última carga contra el broker falló, para que la tabla
 /// vacía no se confunda con "no hay peers". El texto lo aporta `ErrorBroker::Display`. Colores de
 /// severidad (rojo tenue) — semántica de error, no token del tema.
@@ -296,12 +324,21 @@ fn banner_error(err: &crate::cliente::ErrorBroker) -> impl IntoElement {
 /// (composer, peers-02), Ver jornada, Expulsar (kick con confirmación, peers-03) y "Cerrar" para
 /// soltar la selección. Espejo de las teclas de la TUI (`m`/`k`) elevadas a botones visibles.
 /// `indice` viaja en `AbrirDetallePeer` (posición en `datos.instancias`).
+///
+/// PISTA DE ATAJOS (peers-18, variante B de la RFC): línea mono/humo bajo la barra con los atajos
+/// de teclado disponibles sobre el peer seleccionado. NO son tooltips reales (variante A) porque
+/// `gpui_component::tooltip::ManagedTooltipExt` (el mecanismo para adjuntar un `Tooltip` a un
+/// elemento) es `pub(crate)` — invisible fuera del crate del kit. Sólo el `Button` propio del kit
+/// expone `.tooltip(...)`, y esta pantalla usa deliberadamente `tema::boton_*` (divs planos) para
+/// mantener el look Ethos exacto, no el `Button` del kit. Reconstruir el overlay de tooltip a mano
+/// (delay/posicionamiento/animación) sería sobre-ingeniería para algo que la propia RFC no marca
+/// como bloqueante — la pista visible cubre la misma necesidad de descubribilidad.
 fn barra_acciones(inst: &Instancia, indice: usize) -> impl IntoElement {
     let id_msg = inst.id.clone();
     let id_jornada = inst.id.clone();
     let id_kick = inst.id.clone();
 
-    tema::superficie_card()
+    let barra = tema::superficie_card()
         .h_flex()
         .items_center()
         .w_full()
@@ -345,6 +382,22 @@ fn barra_acciones(inst: &Instancia, indice: usize) -> impl IntoElement {
             tema::boton_secundario("peer-accion-cerrar", "Cerrar").on_click(|_e, window, cx| {
                 window.dispatch_action(Box::new(DeseleccionarPeer), cx);
             }),
+        );
+
+    div()
+        .v_flex()
+        .w_full()
+        .gap_1()
+        .child(barra)
+        .child(
+            div()
+                .px_1()
+                .font_family(tema::FUENTE_MONO)
+                .text_xs()
+                .text_color(tema::HUMO)
+                .child(SharedString::from(
+                    "m mensaje · k expulsar · r jornada · ↵ detalle",
+                )),
         )
 }
 
@@ -361,13 +414,22 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
         .gap_4()
         .p_6();
 
-    // Cabecera: eyebrow + título Ethos con el conteo (Fraunces fallback, PAPEL, grande).
+    // Cabecera: eyebrow + título Ethos con el conteo + indicador de salud del broker (peers-18,
+    // variante 3 de la RFC: "punto verde/rojo junto al título"). Reusa `datos.salud` (GET /salud,
+    // ya cargado globalmente por `cargar_broker`) — sin llamada HTTP propia de esta pantalla.
     raiz = raiz.child(
         div()
             .v_flex()
             .gap_1()
             .child(tema::eyebrow("red claude-peers"))
-            .child(tema::titulo(format!("Peers ({total})"))),
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(tema::titulo(format!("Peers ({total})")))
+                    .child(indicador_salud_broker(datos)),
+            ),
     );
 
     if let Some(err) = &datos.error_peers {

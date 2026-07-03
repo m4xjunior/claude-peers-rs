@@ -480,12 +480,10 @@ impl AppDesktop {
                     Ok(lista) => {
                         esta.datos.alertas = lista;
                         esta.datos.error_alertas = None;
-                        let n = esta.datos.alertas.len();
-                        if n == 0 {
-                            esta.datos.alertas_seleccion = 0;
-                        } else if esta.datos.alertas_seleccion >= n {
-                            esta.datos.alertas_seleccion = n - 1;
-                        }
+                        // FIX (mismo bug de índice-visible-vs-total que mover_seleccion/tecla `d`):
+                        // acotaba contra `alertas.len()` (TOTAL), pero `alertas_seleccion` es un
+                        // índice sobre la lista VISIBLE post-filtro. Reusa el helper ya correcto.
+                        esta.acotar_seleccion_alertas_visibles();
                     }
                     Err(e) => esta.datos.error_alertas = Some(e),
                 }
@@ -527,6 +525,12 @@ impl AppDesktop {
                 // su banner tipado. El panel no habla con el broker; refleja lo que la app le pasa.
                 if let Some(panel) = &esta.datos.panel_acceso {
                     panel.update(cx, |p, cx| p.set_diagnostico(err, cx));
+                }
+                // config-06: MISMO `info` que acaba de poblar la pestaña Broker, reflejado también
+                // en el panel de Config (card "Broker conectado") — sin segunda llamada HTTP.
+                if let Some(panel) = &esta.datos.panel_config {
+                    let info = esta.datos.info.clone();
+                    panel.update(cx, |p, cx| p.set_info(info, cx));
                 }
                 cx.notify();
             });
@@ -719,14 +723,11 @@ impl AppDesktop {
     /// existe (la lista cambió entre el pintado y el click). Centraliza el mapeo para las acciones
     /// de alertas que llegan con índice visible (abrir detalle, descarte rápido de fila).
     fn indice_real_alerta(&self, indice_visible: usize) -> Option<usize> {
-        use crate::vista::alertas::pasa_filtro;
-        self.datos
-            .alertas
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| pasa_filtro(a, &self.datos.alertas_filtro_tipos))
-            .nth(indice_visible)
-            .map(|(idx_real, _)| idx_real)
+        crate::vista::alertas::indice_real(
+            &self.datos.alertas,
+            &self.datos.alertas_filtro_tipos,
+            indice_visible,
+        )
     }
 
     /// Acota `alertas_seleccion` al número de alertas VISIBLES (post-filtro), saturando al último.
@@ -2326,8 +2327,19 @@ impl AppDesktop {
                 self.datos.peers_seleccion = Some(mover(actual, delta, len));
             }
             Pantalla::Alertas => {
-                self.datos.alertas_seleccion =
-                    mover(self.datos.alertas_seleccion, delta, self.datos.alertas.len());
+                // FIX (bug real de correctitud, peers-18-style): `alertas_seleccion` es un índice
+                // sobre la lista VISIBLE post-filtro (mismo contrato que `indice_real_alerta` /
+                // `acotar_seleccion_alertas_visibles`), NO sobre `datos.alertas` completo. Clampar
+                // contra el TOTAL permitía que ↑/↓ moviera la selección más allá de las filas
+                // realmente pintadas cuando había un filtro de tipo activo (alertas-03).
+                use crate::vista::alertas::pasa_filtro;
+                let visibles = self
+                    .datos
+                    .alertas
+                    .iter()
+                    .filter(|a| pasa_filtro(a, &self.datos.alertas_filtro_tipos))
+                    .count();
+                self.datos.alertas_seleccion = mover(self.datos.alertas_seleccion, delta, visibles);
             }
             Pantalla::Tareas => {
                 self.datos.tareas_seleccion =
@@ -2443,7 +2455,9 @@ impl AppDesktop {
             }
             Pantalla::Peers => {
                 // Paridad con la TUI: `m` = componer mensaje (peers-02), `k` = kick con
-                // confirmación (peers-03). Operan sobre el peer seleccionado.
+                // confirmación (peers-03), `r` = ver jornada/trazabilidad (peers-18: la RFC lista
+                // `r` junto a `m`/`k` como paridad de teclado pendiente). Operan sobre el peer
+                // seleccionado.
                 let Some(inst) = self
                     .datos
                     .peers_seleccion
@@ -2459,20 +2473,34 @@ impl AppDesktop {
                         window,
                         cx,
                     ),
+                    "r" => self.ver_jornada_peer(id, cx),
                     _ => return false,
                 }
                 true
             }
             Pantalla::Alertas => {
-                if tecla != "d" {
+                // `d` descarta, `g` va al sujeto (alertas-14, paridad con la TUI). Ambos operan
+                // sobre la alerta RESALTADA en pantalla: `alertas_seleccion` es un índice VISIBLE
+                // (post-filtro alertas-03), así que SIEMPRE se traduce con `indice_real_alerta`
+                // antes de leer `datos.alertas` — el mismo bug que tenía `d` (descartaba la alerta
+                // de esa posición en la lista TOTAL, no la resaltada, con un filtro activo) se
+                // habría repetido en `g` si se le hubiera aplicado el patrón viejo por copia.
+                if tecla != "d" && tecla != "g" {
                     return false;
                 }
-                let Some(a) = self.datos.alertas.get(self.datos.alertas_seleccion) else {
+                let Some(real) = self.indice_real_alerta(self.datos.alertas_seleccion) else {
+                    return false;
+                };
+                let Some(a) = self.datos.alertas.get(real) else {
                     return false;
                 };
                 let tipo = crate::vista::alertas::tipo_serializado(a.tipo).to_string();
                 let sujeto = a.sujeto.clone();
-                self.descartar_alerta(tipo, sujeto, cx);
+                if tecla == "d" {
+                    self.descartar_alerta(tipo, sujeto, cx);
+                } else {
+                    self.ir_al_sujeto_alerta(tipo, sujeto, cx);
+                }
                 true
             }
             Pantalla::Redis => {
@@ -2591,7 +2619,15 @@ impl AppDesktop {
                 self.ir_a(siguiente, cx);
             }
             "down" | "j" => self.mover_seleccion(1, cx),
-            "up" | "k" => self.mover_seleccion(-1, cx),
+            // peers-18 (fix de paridad con la TUI, `peers_tui::main.rs:438`): `k` es AMBIGUO —
+            // en el resto de pantallas sube la selección, pero en Peers es el atajo de kick
+            // (peers-03). La flecha `up` siempre sube (nunca ambigua); la LETRA `k` sólo sube si
+            // la pantalla activa NO es Peers — si lo es, cae a `ejecutar_letra_accion`, que ya
+            // tiene el brazo `"k" => abrir_form_peers(Kick)` documentado pero antes INALCANZABLE
+            // (este mismo match lo interceptaba primero). Sin este guard, el atajo de kick de
+            // teclado nunca disparaba pese a estar implementado.
+            "up" => self.mover_seleccion(-1, cx),
+            "k" if self.activa != Pantalla::Peers => self.mover_seleccion(-1, cx),
             "enter" => self.abrir_seleccion(cx),
             "escape" => self.manejar_escape(cx),
             // Letras de acción del TUI (dependen de la pantalla activa).
