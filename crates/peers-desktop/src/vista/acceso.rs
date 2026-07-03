@@ -563,7 +563,9 @@ pub fn render_acceso(datos: &EstadoPantalla) -> impl IntoElement {
         .unwrap_or(false)
         && datos.acceso_sin_token;
 
-    let mut raiz = tema::fondo_app().v_flex().gap_5().p_6();
+    // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll` de
+    // app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla.
+    let mut raiz = tema::raiz_scrollable().v_flex().gap_5().p_6();
 
     // Cabecera.
     raiz = raiz.child(

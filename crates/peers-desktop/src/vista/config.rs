@@ -234,13 +234,13 @@ impl PanelConfig {
         cx.notify();
     }
 
-    /// `true` si algún Input difiere de lo PERSISTIDO (config-12: dirty-state). Compara los 3
-    /// campos tal como los leería `guardar()` (trim + token vacío → `None`), así "sucio" coincide
-    /// exactamente con "hay algo nuevo que Guardar escribiría en disco" — no una comparación cruda
-    /// de strings que marcaría sucio por espacios en blanco irrelevantes. Un `refresh_ms` que no
-    /// parsea (campo vacío o en edición) cuenta como sucio: por definición ya no es el valor
-    /// persistido, aunque `guardar()` lo rechace hasta que sea un entero válido.
-    fn sucio(&self, cx: &App) -> bool {
+    /// Compara cada Input contra su propio valor PERSISTIDO (config-12: dirty-state), desglosado
+    /// por campo (#8, badge "modificado" individual — patrón VS Code del doc de UX de s005). Trim
+    /// + token vacío→`None` + `refresh_ms` sin parsear cuenta como sucio, exactamente lo que
+    /// leería `guardar()` — así "modificado" coincide con "esto es lo que Guardar escribiría en
+    /// disco". El OR de la tupla (`url || token || refresh`) es el "sucio" a nivel de formulario
+    /// que gobierna el punto del título y el estado de Guardar.
+    fn sucio_por_campo(&self, cx: &App) -> (bool, bool, bool) {
         let broker_url = self.entrada_broker_url.read(cx).value().trim().to_string();
         let token_bruto = self.entrada_token.read(cx).value().trim().to_string();
         let token = if token_bruto.is_empty() {
@@ -249,14 +249,16 @@ impl PanelConfig {
             Some(token_bruto)
         };
         let refresh_bruto = self.entrada_refresh.read(cx).value().trim().to_string();
-
-        if broker_url != self.persistido.0 || token != self.persistido.1 {
-            return true;
-        }
-        match refresh_bruto.parse::<u64>() {
+        let refresh_sucio = match refresh_bruto.parse::<u64>() {
             Ok(n) => n != self.persistido.2,
             Err(_) => true,
-        }
+        };
+
+        (
+            broker_url != self.persistido.0,
+            token != self.persistido.1,
+            refresh_sucio,
+        )
     }
     // NOTA (merge 03/07): el `validar_url` local de config-04 se ELIMINÓ — s007 lo extrajo al
     // módulo compartido `crate::validacion::validar_url` (fuente única, reusado por Config y Acceso).
@@ -322,19 +324,38 @@ impl PanelConfig {
     }
 
     /// Construye un campo etiquetado del formulario con el vocabulario del tema Ethos:
-    /// `eyebrow` (label en mono/humo mayúsculas) encima, el Input en medio y una nota de ayuda
-    /// en texto terciario debajo. Reemplaza el `font_bold` + gris genérico previos.
+    /// `eyebrow` (label en mono/humo mayúsculas) + badge "modificado" (#8, si `sucio_campo` es
+    /// true) encima, el Input en medio y una nota de ayuda en texto terciario debajo.
     fn campo(
         etiqueta: &'static str,
         ayuda: &'static str,
         input: impl IntoElement,
+        sucio_campo: bool,
     ) -> impl IntoElement {
         div()
             .v_flex()
             .gap_2()
-            .child(tema::eyebrow(etiqueta))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(tema::eyebrow(etiqueta))
+                    .when(sucio_campo, |el| el.child(Self::badge_modificado())),
+            )
             .child(input)
             .child(tema::texto_terciario(ayuda))
+    }
+
+    /// Badge "modificado" (#8, patrón VS Code): punto dorado 6px, más pequeño que el del título
+    /// (config-12, 8px) porque marca UN campo, no todo el formulario — jerarquía visual clara
+    /// entre "algo cambió aquí" (campo) y "hay algo sin guardar en total" (título).
+    fn badge_modificado() -> impl IntoElement {
+        div()
+            .w(gpui::px(6.0))
+            .h(gpui::px(6.0))
+            .rounded(gpui::px(999.0))
+            .bg(tema::BRASA)
     }
 
     /// Fila `etiqueta → valor` en mono/papel para la card "Broker conectado" (config-06). Espejo
@@ -352,13 +373,90 @@ impl PanelConfig {
                     .child(valor.into()),
             )
     }
+
+    /// Estado de conexión compacto para el header (#8, patrón Vercel/Stripe: "estado SIEMPRE
+    /// visible"). Reusa `ResultadoPrueba` (el MISMO resultado del check config-01/08, ya pintado
+    /// más abajo con detalle) — sin segunda llamada HTTP. `None`/sin probar todavía = humo, no
+    /// rojo: ausencia de dato no es lo mismo que error (no fingir un fallo que no ocurrió).
+    fn estado_conexion_header(prueba: &ResultadoPrueba) -> impl IntoElement {
+        let (color, texto) = if prueba.en_curso {
+            (tema::HUMO, "probando…".to_string())
+        } else {
+            match prueba.salud_ok {
+                Some(true) => (VERDE_OK, "conectado".to_string()),
+                Some(false) => (ROJO_ERROR, "sin conexión".to_string()),
+                None => (tema::HUMO, "sin probar".to_string()),
+            }
+        };
+        div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .child(div().w(gpui::px(7.0)).h(gpui::px(7.0)).rounded(gpui::px(999.0)).bg(color))
+            .child(
+                div()
+                    .font_family(tema::FUENTE_MONO)
+                    .text_xs()
+                    .text_color(tema::HUMO)
+                    .child(SharedString::from(texto)),
+            )
+    }
+
+    /// Sección "Comportamiento" (#8): umbrales del supervisor, HOY constantes de compilación en
+    /// `peers-core` — NO editables desde la UI (honestidad del doc de UX: no fingir que se
+    /// guardan). Cuando exista `GET/POST /admin/umbrales` (pendiente de backend, documentado en
+    /// `.specs/desktop/broker/RFC-broker.md`), esta card gana Inputs reales; hoy es transparencia
+    /// pura — Max hoy NI SIQUIERA los ve.
+    fn seccion_comportamiento() -> impl IntoElement {
+        tema::superficie_card()
+            .v_flex()
+            .gap_3()
+            .p_5()
+            .child(tema::eyebrow("Umbrales del supervisor"))
+            .child(tema::texto_terciario(
+                "Valores de compilación (peers-core) — read-only hasta que exista \
+                 GET/POST /admin/umbrales en el broker.",
+            ))
+            .child(
+                div()
+                    .v_flex()
+                    .gap_2()
+                    .pt_1()
+                    .child(Self::fila_info(
+                        "Ocioso",
+                        format!("{}s", peers_core::UMBRAL_OCIOSO_SEG),
+                    ))
+                    .child(Self::fila_info(
+                        "Atasco",
+                        format!("{}s", peers_core::UMBRAL_ATASCO_SEG),
+                    ))
+                    .child(Self::fila_info(
+                        "Ghosteo",
+                        format!("{}s", peers_core::UMBRAL_GHOSTEO_SEG),
+                    ))
+                    .child(Self::fila_info(
+                        "Vencimiento latido",
+                        format!("{}ms", peers_core::VENCIMIENTO_MS),
+                    ))
+                    .child(Self::fila_info(
+                        "Real mínimo",
+                        format!("{}s", peers_core::UMBRAL_REAL_MINIMO_SEG),
+                    ))
+                    .child(Self::fila_info(
+                        "Ratio cancelación",
+                        format!("{:.0}%", peers_core::UMBRAL_CANCELACION * 100.0),
+                    )),
+            )
+    }
 }
 
 impl Render for PanelConfig {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // config-12: ¿hay ediciones sin guardar? Gobierna el punto dorado del título y si Guardar
         // está habilitado. Se recalcula en cada render (barato: son 3 lecturas de Input + un parse).
-        let sucio = self.sucio(cx);
+        // #8: desglosado por campo para el badge "modificado" individual (patrón VS Code).
+        let (sucio_url, sucio_token, sucio_refresh) = self.sucio_por_campo(cx);
+        let sucio = sucio_url || sucio_token || sucio_refresh;
 
         // config-13: ¿cuál Input tiene el foco AHORA? Gobierna el marco dorado del campo activo.
         // `InputState` implementa `Focusable` (expone su `FocusHandle` real); comparar contra ese
@@ -484,7 +582,14 @@ impl Render for PanelConfig {
                 div()
                     .v_flex()
                     .gap_2()
-                    .child(tema::eyebrow("broker_url"))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(tema::eyebrow("broker_url"))
+                            .when(sucio_url, |el| el.child(Self::badge_modificado())),
+                    )
                     .child(self.input_tematizado_validado(&self.entrada_broker_url, url_ok, foco_url))
                     .child(
                         div()
@@ -497,11 +602,13 @@ impl Render for PanelConfig {
                 "token",
                 "Token X-Peers-Token. Vacío = broker sin token.",
                 self.input_tematizado(&self.entrada_token, true, foco_token),
+                sucio_token,
             ))
             .child(Self::campo(
                 "refresh_ms",
                 "Periodo de refresco de las pantallas, en milisegundos (entero > 0).",
                 self.input_tematizado(&self.entrada_refresh, false, foco_refresh),
+                sucio_refresh,
             ))
             // Botonera + feedback semántico cálido.
             .child(div().v_flex().gap_3().pt_2().child(botonera).child(feedback))
@@ -575,7 +682,9 @@ impl Render for PanelConfig {
         // global, que cierra/desenfoca y devuelve el foco a la raíz).
         let confirmando_reset = self.confirmar_reset;
         // Raíz de la pantalla: fondo app Ethos + cabecera (eyebrow + título + subtítulo) + cards.
-        tema::fondo_app()
+        // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll`
+        // de app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla.
+        tema::raiz_scrollable()
             .v_flex()
             .gap_5()
             .p_8()
@@ -598,26 +707,43 @@ impl Render for PanelConfig {
                         div()
                             .h_flex()
                             .items_center()
-                            .gap_2()
-                            .child(tema::titulo("Broker"))
-                            // config-12: punto dorado junto al título mientras haya ediciones sin
-                            // guardar — mismo lenguaje visual que el resalte brasa del resto de Ethos.
-                            .when(sucio, |el| {
-                                el.child(
-                                    div()
-                                        .w(gpui::px(8.0))
-                                        .h(gpui::px(8.0))
-                                        .rounded(gpui::px(999.0))
-                                        .bg(tema::BRASA),
-                                )
-                            }),
+                            .justify_between()
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(tema::titulo("Broker"))
+                                    // config-12: punto dorado junto al título mientras haya
+                                    // ediciones sin guardar — mismo lenguaje visual que el resalte
+                                    // brasa del resto de Ethos.
+                                    .when(sucio, |el| {
+                                        el.child(
+                                            div()
+                                                .w(gpui::px(8.0))
+                                                .h(gpui::px(8.0))
+                                                .rounded(gpui::px(999.0))
+                                                .bg(tema::BRASA),
+                                        )
+                                    }),
+                            )
+                            // #8: estado de conexión SIEMPRE visible en el header (patrón Vercel/
+                            // Stripe del doc de UX de s005) — reusa `self.prueba.salud_ok`, el
+                            // MISMO resultado que ya pinta config-01/08 más abajo; sin llamada
+                            // HTTP nueva. `None` = aún no se probó esta sesión (ni ok ni error).
+                            .child(Self::estado_conexion_header(&self.prueba)),
                     )
                     .child(tema::texto_terciario(
                         "Parámetros de conexión. Guardar persiste ~/.config/claude-peers/config.toml.",
                     )),
             )
+            // #8: secciones agrupadas (patrón Linear del doc de UX, versión ligera con
+            // superficie_card+eyebrow — sin sub-router/kit nuevo, alcance mínimo de hoy).
+            .child(tema::eyebrow("Conexión"))
             .child(tarjeta)
             .child(panel_broker)
+            .child(tema::eyebrow("Comportamiento"))
+            .child(Self::seccion_comportamiento())
     }
 }
 
@@ -691,7 +817,7 @@ impl PanelConfig {
 pub fn render_config(datos: &EstadoPantalla) -> impl IntoElement {
     match &datos.panel_config {
         Some(panel) => div().size_full().child(panel.clone()),
-        None => tema::fondo_app()
+        None => tema::raiz_scrollable()
             .v_flex()
             .p_8()
             .gap_2()

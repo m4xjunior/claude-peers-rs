@@ -117,6 +117,15 @@ pub struct AbrirFormBloquear {
     pub tarea_id: String,
 }
 
+/// Abrir el formulario que pide EVIDENCIA obligatoria antes de marcar Hecha (#7, paquete de bugs
+/// Max). `AppDesktop` decide si hace falta (ver `boton_estado`): si la tarea ya tiene evidencia, se
+/// dispara `CambiarEstadoTarea` directo sin pasar por aquí.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = tareas, no_json)]
+pub struct AbrirFormEvidencia {
+    pub tarea_id: String,
+}
+
 /// Pedir CONFIRMACIÓN antes de una transición destructiva (tareas-08): Cancelar (pierde el
 /// trabajo dirigido) o Reabrir una terminal (revierte el cierre). `estado` es el destino.
 #[derive(Clone, PartialEq, Action)]
@@ -150,6 +159,11 @@ pub enum FormTareas {
     Ampliar { tarea_id: String, estimado_actual: Option<i64> },
     /// tareas-07: bloquear con motivo obligatorio.
     Bloquear { tarea_id: String },
+    /// #7 (paquete de bugs Max): pedir EVIDENCIA obligatoria antes de marcar Hecha, si la tarea
+    /// todavía no tiene ninguna (`t.evidencia.is_none()`). Si ya tiene evidencia de un ciclo previo
+    /// (reabrir→volver a cerrar), "Hecha" transiciona directo sin volver a pedirla — la fricción es
+    /// para NUNCA quedarse sin verificación, no para exigirla dos veces a la misma tarea.
+    PedirEvidencia { tarea_id: String },
     /// tareas-08: confirmación destructiva (Cancelada o Abierta=reabrir). `descripcion` recortada
     /// para el texto "¿Seguro?" (capturada al abrir: no depende de re-buscar la tarea).
     Confirmar {
@@ -317,6 +331,7 @@ fn recortar(texto: &str, max: usize) -> String {
 }
 
 // Anchos fijos (px) de las columnas no flexibles. `tarea` es la flexible (`flex_1`).
+const COL_ID: f32 = 76.0;
 const COL_PEER: f32 = 150.0;
 const COL_ESTADO: f32 = 110.0;
 const COL_ESTIMADO: f32 = 84.0;
@@ -333,7 +348,9 @@ pub fn render_tareas(datos: &EstadoPantalla) -> impl IntoElement {
     let tareas = datos.tareas.as_slice();
     let total = tareas.len();
 
-    let mut raiz = tema::fondo_app().v_flex().gap_4().p_6();
+    // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll` de
+    // app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla.
+    let mut raiz = tema::raiz_scrollable().v_flex().gap_4().p_6();
 
     // Cabecera: eyebrow + título (nº de tareas) a la izquierda, botón Asignar a la derecha.
     raiz = raiz.child(cabecera(total));
@@ -442,7 +459,7 @@ fn tabla(tareas: &[Tarea], seleccion: usize) -> AnyElement {
         .into_any_element()
 }
 
-/// Fila de encabezado con eyebrows por columna (peer | tarea | estado | estimado | real).
+/// Fila de encabezado con eyebrows por columna (id | peer | tarea | estado | estimado | real).
 fn encabezado_columnas() -> impl IntoElement {
     let cel = |texto: &str, ancho: f32| div().w(px(ancho)).flex_shrink_0().child(tema::eyebrow(texto));
 
@@ -454,6 +471,7 @@ fn encabezado_columnas() -> impl IntoElement {
         .py_3()
         .border_b_1()
         .border_color(tema::LINEA)
+        .child(cel("id", COL_ID))
         .child(cel("peer", COL_PEER))
         .child(div().flex_1().min_w(px(160.0)).child(tema::eyebrow("tarea")))
         .child(cel("estado", COL_ESTADO))
@@ -485,7 +503,32 @@ fn fila_tarea(idx: usize, t: &Tarea, activa: bool) -> impl IntoElement {
             .child(SharedString::from(peer_txt))
     };
 
+    // Id de la tarea, copiable de un clic (bug #5 de Max: "conectar tarea↔agente" por ID). El id
+    // de la fila y el que se copia son AMBOS `t.id` (no el índice `idx`, que es sólo posición de
+    // render) — es el mismo id que ve Max en la bitácora/broker (`tar-XXX`), lo que hace que el
+    // copiado sirva para buscarlo en otro sitio (logs, mensajes al peer, etc.).
+    let id_copiar = t.id.clone();
+
     tema::fila_seleccionable(SharedString::from(format!("tarea-fila-{idx}")), activa)
+        // `.occlude()` evita que el clic aquí atraviese hacia el `.on_click` de la fila (que
+        // seleccionaría/abriría detalle): esta celda SÓLO copia. Mismo patrón que el botón de
+        // descarte rápido de `alertas.rs` y el de reenvío de `trazabilidad.rs`.
+        .child(
+            div()
+                .id(gpui::ElementId::Name(format!("tarea-copiar-id-{idx}").into()))
+                .occlude()
+                .w(px(COL_ID))
+                .flex_shrink_0()
+                .font_family(tema::FUENTE_MONO)
+                .text_xs()
+                .text_color(tema::HUMO)
+                .cursor_pointer()
+                .hover(|s| s.text_color(tema::BRASA))
+                .child(SharedString::from(t.id.clone()))
+                .on_click(move |_e, _window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(id_copiar.clone()));
+                }),
+        )
         .child(celda_peer)
         // Descripción: columna flexible con recorte suave. Datos → fuente mono del Ethos.
         .child(
@@ -583,11 +626,29 @@ fn barra_acciones(t: &Tarea, indice: usize) -> AnyElement {
         .into_any_element()
 }
 
-/// Botón de transición de estado: despacha `CambiarEstadoTarea{tarea_id, estado}`. Secundario
-/// (borde) salvo "Hecha" que va primario (dorado) por ser la transición constructiva principal.
+/// #7 (paquete de bugs Max): decide si la transición a `estado` debe pedir EVIDENCIA antes de
+/// aplicarse. Función PURA (sin `Tarea`/GPUI) para poder testearla y para que los 3 caminos que
+/// llegan a Hecha (botón, atajo de teclado "h", modal de detalle desde Jornada) compartan la MISMA
+/// regla en vez de repetirla con variaciones — divergir aquí sería el tipo de bug sutil que deja un
+/// bypass en un camino que se arregló en los otros dos.
+pub(crate) fn necesita_pedir_evidencia(
+    estado: EstadoTarea,
+    evidencia_existente: Option<&String>,
+) -> bool {
+    matches!(estado, EstadoTarea::Hecha) && evidencia_existente.is_none()
+}
+
+/// Botón de transición de estado: despacha `CambiarEstadoTarea{tarea_id, estado}` DIRECTO, salvo
+/// la transición a Hecha sin evidencia previa (#7, paquete de bugs Max): ahí despacha
+/// `AbrirFormEvidencia` en su lugar, que pide la evidencia ANTES de permitir el cierre — nunca se
+/// dispara el cambio de estado a ciegas si la tarea no tiene ninguna verificación todavía.
+/// Secundario (borde) salvo "Hecha" que va primario (dorado) por ser la transición principal.
 fn boton_estado(t: &Tarea, label: &'static str, estado: EstadoTarea) -> impl IntoElement {
     let tarea_id = t.id.clone();
     let id = SharedString::from(format!("estado-{label}-{}", t.id));
+    // Capturado ANTES del closure `move` (no se puede leer `t.evidencia` dentro: `t` no sobrevive
+    // más allá de esta función).
+    let necesita_evidencia = necesita_pedir_evidencia(estado, t.evidencia.as_ref());
 
     let boton = if matches!(estado, EstadoTarea::Hecha) {
         tema::boton_primario(id, label)
@@ -596,13 +657,22 @@ fn boton_estado(t: &Tarea, label: &'static str, estado: EstadoTarea) -> impl Int
     };
 
     boton.on_click(move |_e, window, cx| {
-        window.dispatch_action(
-            Box::new(CambiarEstadoTarea {
-                tarea_id: tarea_id.clone(),
-                estado,
-            }),
-            cx,
-        );
+        if necesita_evidencia {
+            window.dispatch_action(
+                Box::new(AbrirFormEvidencia {
+                    tarea_id: tarea_id.clone(),
+                }),
+                cx,
+            );
+        } else {
+            window.dispatch_action(
+                Box::new(CambiarEstadoTarea {
+                    tarea_id: tarea_id.clone(),
+                    estado,
+                }),
+                cx,
+            );
+        }
     })
 }
 
@@ -753,7 +823,33 @@ pub fn render_modal_detalle_tarea(t: &Tarea) -> AnyElement {
         )
         // Dueño e id de la tarea: datos → fuente mono (convención DS de la RFC).
         .child(campo_mono("dueño", t.instancia_id.clone()))
-        .child(campo_mono("id", t.id.clone()))
+        // El id es COPIABLE de un clic (bug #5): mismo objetivo que la celda de id en la tabla —
+        // Max quiere pegar este id donde conecte visualmente la tarea con su agente. Variante de
+        // `campo_mono` con cursor/hover/click en vez de texto plano; "dueño" arriba se queda como
+        // texto plano porque el bug pide IDs de tarea, no ids de peer (esos ya los cubre el bug #4
+        // en `vista/peers.rs`).
+        .child({
+            let id_copiar = t.id.clone();
+            div()
+                .h_flex()
+                .items_baseline()
+                .gap_3()
+                .child(div().w(px(110.0)).flex_shrink_0().child(tema::eyebrow("id")))
+                .child(
+                    div()
+                        .id("modal-tarea-copiar-id")
+                        .font_family(tema::FUENTE_MONO)
+                        .text_color(tema::PAPEL)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(tema::BRASA))
+                        .child(SharedString::from(t.id.clone()))
+                        .on_click(move |_e, _window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                id_copiar.clone(),
+                            ));
+                        }),
+                )
+        })
         // Estimado vs real en una sola fila, con la marca ⚠ brasa si está en overrun (#14/R3).
         .child(
             div()
@@ -972,6 +1068,19 @@ pub fn render_modal_form(form: &FormTareas, datos: &EstadoPantalla) -> AnyElemen
                 modal = modal.child(aviso_sin_inputs());
             }
         }
+        FormTareas::PedirEvidencia { .. } => {
+            // #7: reusa el MISMO Input `motivo` que Bloquear (sólo un formulario abierto a la vez,
+            // no hace falta un cuarto InputState en InputsTareas para un caso más de texto libre).
+            modal = modal.child(tema::texto_terciario(
+                "Antes de marcar la tarea como Hecha, deja constancia de la evidencia (qué se \
+                 verificó, link, resultado del test…).",
+            ));
+            if let Some(inputs) = &datos.inputs_tareas {
+                modal = modal.child(campo_form_input("evidencia (obligatoria)", &inputs.motivo));
+            } else {
+                modal = modal.child(aviso_sin_inputs());
+            }
+        }
         FormTareas::Confirmar {
             estado,
             descripcion,
@@ -1066,6 +1175,7 @@ fn titulo_form(form: &FormTareas) -> &'static str {
         FormTareas::Editar { .. } => "Editar descripción",
         FormTareas::Ampliar { .. } => "Ampliar estimado",
         FormTareas::Bloquear { .. } => "Bloquear tarea",
+        FormTareas::PedirEvidencia { .. } => "Evidencia antes de marcar Hecha",
         FormTareas::Confirmar {
             estado: EstadoTarea::Abierta,
             ..
@@ -1082,6 +1192,7 @@ fn label_confirmar(form: &FormTareas) -> &'static str {
         FormTareas::Editar { .. } => "Guardar",
         FormTareas::Ampliar { .. } => "Ampliar",
         FormTareas::Bloquear { .. } => "Bloquear",
+        FormTareas::PedirEvidencia { .. } => "Marcar Hecha",
         FormTareas::Confirmar { .. } => "Confirmar",
     }
 }
@@ -1164,4 +1275,30 @@ fn campo_form_input(etiqueta: &'static str, estado: &Entity<InputState>) -> impl
 fn aviso_sin_inputs() -> AnyElement {
     tema::texto_terciario("Los campos de edición no están inicializados; reinicia la app.")
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hecha_sin_evidencia_pide_evidencia() {
+        assert!(necesita_pedir_evidencia(EstadoTarea::Hecha, None));
+    }
+
+    #[test]
+    fn hecha_con_evidencia_previa_no_pide_de_nuevo() {
+        // Reabrir→volver a cerrar no debe exigir evidencia una segunda vez a la misma tarea.
+        let ev = "link al PR".to_string();
+        assert!(!necesita_pedir_evidencia(EstadoTarea::Hecha, Some(&ev)));
+    }
+
+    #[test]
+    fn otros_estados_nunca_piden_evidencia() {
+        // La fricción es SÓLO para Hecha — bloquear/cancelar/en-curso no la necesitan.
+        assert!(!necesita_pedir_evidencia(EstadoTarea::EnCurso, None));
+        assert!(!necesita_pedir_evidencia(EstadoTarea::Bloqueada, None));
+        assert!(!necesita_pedir_evidencia(EstadoTarea::Cancelada, None));
+        assert!(!necesita_pedir_evidencia(EstadoTarea::Abierta, None));
+    }
 }

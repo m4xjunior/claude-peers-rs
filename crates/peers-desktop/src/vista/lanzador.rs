@@ -369,6 +369,11 @@ pub struct PanelLanzador {
     host_ssh: Entity<InputState>,
     /// Dir remoto para SSH (R4.2): el picker local no aplica en remoto, se escribe a mano.
     dir_remoto: Entity<InputState>,
+    /// R7/E-05 — id explícito de agente (`CLAUDE_PEERS_ID`), texto libre opcional. Alcance de HOY
+    /// (sin la maquinaria de Cargo/Proyecto de RFC-organigrama-roles, no implementada): si Max lo
+    /// rellena, s007 lo inyecta como env var al lanzar (`ComandoPty.env`); vacío = comportamiento
+    /// actual sin cambios (peers-client deriva su id de la carpeta, como siempre).
+    id_agente: Entity<InputState>,
     /// Nombre de la sesión tmux (R4.3), input de una línea.
     nombre_tmux: Entity<InputState>,
     /// Nombre con el que guardar la plantilla actual (R2.1).
@@ -427,6 +432,8 @@ impl PanelLanzador {
         let host_ssh = cx.new(|cx| InputState::new(window, cx).placeholder("otus"));
         let dir_remoto =
             cx.new(|cx| InputState::new(window, cx).placeholder("/ruta/remota/al/proyecto"));
+        let id_agente =
+            cx.new(|cx| InputState::new(window, cx).placeholder("backend@proyecto-x (opcional)"));
         let nombre_tmux = cx.new(|cx| InputState::new(window, cx).placeholder("front-p2v"));
         let nombre_plantilla =
             cx.new(|cx| InputState::new(window, cx).placeholder("nombre de la plantilla"));
@@ -440,6 +447,7 @@ impl PanelLanzador {
             prompt,
             host_ssh,
             dir_remoto,
+            id_agente,
             nombre_tmux,
             nombre_plantilla,
             nueva_tarea_desc,
@@ -588,6 +596,15 @@ impl PanelLanzador {
         }
     }
 
+    /// R7/E-05 — id explícito de agente (`CLAUDE_PEERS_ID`) tecleado por Max, o `None` si el campo
+    /// está vacío (comportamiento actual sin cambios). NO va en `ParamsComando`/`argv_claude`: no es
+    /// parte de la cadena de shell del preview (R6, "Copiar comando" no debería filtrar el env var
+    /// que se inyecta al proceso), sino algo que `lanzar_pty` pasa aparte a `ComandoPty.env`.
+    pub(crate) fn id_agente(&self, cx: &App) -> Option<String> {
+        let valor = self.id_agente.read(cx).value().trim().to_string();
+        (!valor.is_empty()).then_some(valor)
+    }
+
     /// Reúne los parámetros actuales del comando (R6). El dir depende del destino: en SSH es el
     /// dir remoto tecleado; en Local/tmux, el del picker.
     fn params(&self, cx: &App) -> ParamsComando {
@@ -644,7 +661,14 @@ impl PanelLanzador {
         };
 
         let dim = medir_dimensiones_ventana(window, cx);
-        let comando = ComandoPty { programa, args, dir };
+        // E-05: si Max rellenó "id de agente", se inyecta CLAUDE_PEERS_ID en el env del proceso
+        // hijo (agnóstico de shell, ver pty.rs::abrir). `None` (campo vacío) = sin env extra — el
+        // client sigue derivando su id de la carpeta como hoy (compat total).
+        let env = match self.id_agente(cx) {
+            Some(id) => vec![("CLAUDE_PEERS_ID".to_string(), id)],
+            None => Vec::new(),
+        };
+        let comando = ComandoPty { programa, args, dir, env };
         match SesionPty::abrir(comando, dim) {
             Ok(mut sesion) => {
                 self.dim_pty = dim;
@@ -1114,6 +1138,16 @@ impl Render for PanelLanzador {
             ))
         };
 
+        // R7/E-05: id explícito de agente, opcional. Sólo se usa al "Lanzar aquí" (PTY embebido);
+        // "Copiar comando" NO lo incluye (no es parte de la cadena de shell del preview, es un env
+        // var que se inyecta al proceso, ver `id_agente()`). Alcance de HOY: campo libre, sin
+        // Cargo/Proyecto (RFC-organigrama-roles no implementada todavía).
+        let campo_id_agente = self.campo(
+            "id de agente (opcional)",
+            "CLAUDE_PEERS_ID al lanzar con \"Lanzar aquí\" (p.ej. backend@proyecto-x). Vacío = comportamiento actual, sin cambios.",
+            self.control(&self.id_agente),
+        );
+
         let botonera = div()
             .h_flex()
             .items_center()
@@ -1147,7 +1181,13 @@ impl Render for PanelLanzador {
         let card_comando = self.seccion(
             "comando",
             "Lo que se ejecutaría, exacto (R6). Revísalo antes de copiar.",
-            div().v_flex().gap_3().child(preview).child(botonera).child(feedback),
+            div()
+                .v_flex()
+                .gap_3()
+                .child(preview)
+                .child(campo_id_agente)
+                .child(botonera)
+                .child(feedback),
         );
 
         // --- R7: card del terminal embebido — banner de error (R7.2), rejilla activa, o ausente.
@@ -1224,7 +1264,11 @@ impl Render for PanelLanzador {
             .child(card_terminal);
 
         // Raíz de la pantalla: fondo Ethos + cabecera FIJA + cuerpo scrollable.
-        tema::fondo_app()
+        // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll`
+        // de app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla
+        // — sin este cambio, el `size_full` de `fondo_app()` competiría con el `overflow_y_scroll`
+        // interno del cuerpo de esta misma pantalla (doble contenedor con alto fijo anidado).
+        tema::raiz_scrollable()
             .v_flex()
             .child(
                 div()
@@ -1416,7 +1460,7 @@ fn render_rejilla_pty(contenido: &crate::pty::ContenidoPty, dim: DimensionesCeld
 pub fn render_lanzador(datos: &EstadoPantalla) -> impl IntoElement {
     match &datos.panel_lanzador {
         Some(panel) => div().size_full().child(panel.clone()),
-        None => tema::fondo_app()
+        None => tema::raiz_scrollable()
             .v_flex()
             .p_8()
             .gap_2()

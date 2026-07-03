@@ -19,11 +19,15 @@
 //! usando `tema::fila_seleccionable`, blindando la pantalla contra cambios de API del kit.
 
 use gpui::{
-    div, px, Action, AnyElement, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled,
+    div, px, Action, AnyElement, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled,
 };
 // `v_flex`/`h_flex` viven en el trait `StyledExt` del kit (no en el `Styled` de gpui).
-use gpui_component::StyledExt;
+// `Collapsible` (RenderOnce puro, sin Entity propia — verificado contra el checkout del rev que
+// resuelve el workspace) sólo oculta/muestra su `.content()` según `.open(bool)` externo; NO
+// gestiona su propio título/chevron/toggle. Encaja con el contrato de vista PURA de este archivo
+// porque el estado (`open`) sigue viviendo en `EstadoPantalla`, no en el componente.
+use gpui_component::{collapsible::Collapsible, StyledExt};
 use peers_core::{AccionRegistrada, EstadoTarea, RespuestaJornada, Sesion, Tarea, TipoAccion};
 
 use crate::app::EstadoPantalla;
@@ -61,6 +65,26 @@ pub struct SeleccionarTareaJornada {
 // de detalle de sesión (jornada-02). El modal de detalle de TAREA (jornada-01) reutiliza
 // `tareas::CerrarDetalleTarea` porque su contenido ES el modal de la pestaña Tareas (fase 1).
 gpui::actions!(jornada, [AlternarDropdownJornada, CerrarSesionJornada]);
+
+/// Qué tabla de Jornada se colapsa/expande (bug #1: peers con muchas sesiones/tareas/acciones
+/// llenaban la pantalla y sepultaban el resto — Sesiones/Tareas/Acciones son ahora colapsables).
+/// Un solo enum + una sola Action parametrizada, en vez de 3 Actions gemelas, para no triplicar
+/// el manejador en `AppDesktop`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeccionJornada {
+    Sesiones,
+    Tareas,
+    Acciones,
+}
+
+/// Alterna colapsado/expandido de UNA de las 3 tablas de Jornada (Sesiones/Tareas/Acciones).
+/// `AppDesktop` mantiene el flag correspondiente en `EstadoPantalla` (persiste mientras dure la
+/// sesión de la app; no se guarda en disco — es preferencia efímera de scroll, no config).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = jornada, no_json)]
+pub struct AlternarSeccionJornada {
+    pub seccion: SeccionJornada,
+}
 
 /// Abrir el pop-up de DETALLE de la tarea `indice` de la jornada (jornada-01): doble-click en la
 /// fila de tarea. Índice dentro de `jornada.tareas`. El contenido del modal se REUTILIZA de la
@@ -110,16 +134,6 @@ pub struct CambiarEstadoTareaJornada {
 // HELPERS PUROS — espejo de los de la TUI. Ahora los colores de estado usan la paleta Ethos donde
 // aplica; el resto (severidades) mantiene sus hex de dominio porque son semánticos (verde=hecho…).
 // -------------------------------------------------------------------------------------------------
-
-/// Extrae `HH:MM:SS` de un ISO 8601. Espejo de `hora_iso` de la TUI. Sin patrón `T` → cadena tal cual.
-fn hora_iso(iso: &str) -> String {
-    if let Some(pos) = iso.find('T') {
-        let resto = &iso[pos + 1..];
-        let fin = resto.find(['.', 'Z', '+']).unwrap_or(resto.len());
-        return resto[..fin].to_string();
-    }
-    iso.to_string()
-}
 
 /// Formatea segundos como `HhMM`/`MMmin`/`SSs`. `None`/negativo → "—" (abierta: sin fin timbrado).
 /// Espejo de `formatear_duracion` de la TUI.
@@ -220,12 +234,67 @@ fn cabecera(cols: &[(&'static str, Option<f32>)]) -> impl IntoElement {
 }
 
 // -------------------------------------------------------------------------------------------------
+// SECCIÓN COLAPSABLE (bug #1) — helper REUTILIZABLE para las 3 tablas (Sesiones/Tareas/Acciones),
+// no 3 implementaciones gemelas. `colapsada` viene de `EstadoPantalla` (la vista sigue pura, sin
+// `cx`); el chevron despacha `AlternarSeccionJornada { seccion }`, que `AppDesktop` maneja
+// alternando el flag correspondiente. `Collapsible` del kit (verificado en el checkout del rev que
+// resuelve el workspace) sólo oculta/muestra `.content()`; el título+contador+chevron son nuestros.
+// -------------------------------------------------------------------------------------------------
+
+/// Envuelve `contenido` en una card colapsable con header "eyebrow + (n) + chevron". El chevron es
+/// la ÚNICA parte clicable (no toda la fila — evita colapsar por error al hacer click en el título
+/// para leerlo). `▾` = expandida, `▸` = colapsada (mismo lenguaje visual que los desplegables del
+/// Lanzador, `dropdown_recientes`/`dropdown_destino`).
+fn seccion_colapsable(
+    seccion: SeccionJornada,
+    titulo: &'static str,
+    contador: usize,
+    colapsada: bool,
+    extra_header: Option<AnyElement>,
+    contenido: impl IntoElement,
+) -> impl IntoElement {
+    let chevron = if colapsada { "▸" } else { "▾" };
+    let mut header = div()
+        .id(SharedString::from(format!("jornada-seccion-{titulo}")))
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .pb_1()
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(14.0))
+                .text_color(tema::HUMO)
+                .child(SharedString::from(chevron)),
+        )
+        .child(tema::eyebrow(titulo))
+        .child(tema::texto_terciario(format!("({contador})")))
+        .on_click(move |_e, window, cx| {
+            window.dispatch_action(Box::new(AlternarSeccionJornada { seccion }), cx);
+        });
+    if let Some(extra) = extra_header {
+        header = header.child(extra);
+    }
+
+    let mut card = tema::superficie_card().v_flex().gap_1().p_4().child(header);
+    card = card.child(
+        Collapsible::new()
+            .open(!colapsada)
+            .content(contenido.into_any_element()),
+    );
+    card
+}
+
+// -------------------------------------------------------------------------------------------------
 // RENDER
 // -------------------------------------------------------------------------------------------------
 
 pub fn render_jornada(datos: &EstadoPantalla) -> impl IntoElement {
-    // Raíz sobre fondo app (tinta + papel + Inter). `fondo_app` ya fija size_full/color/fuente.
-    let base = tema::fondo_app().v_flex().gap_4().p_6();
+    // Raíz sobre fondo app (tinta + papel + Inter). `raiz_scrollable()` (NO `fondo_app()`, que trae
+    // `size_full`): el contenedor `contenido-scroll` de app.rs necesita que esta vista NO fije su
+    // propio alto para poder medirla y scrollearla — causa raíz del bug #3 (Jornada no scrollea:
+    // sus 4 cards resumen+sesiones+tareas+acciones desbordaban sin activar el scroll del padre).
+    let base = tema::raiz_scrollable().v_flex().gap_4().p_6();
 
     // Sin peer enfocado: card guía CON el selector de peer (jornada-03) — la queja era justamente
     // que había que irse a la pantalla Peers para poder ver una jornada.
@@ -295,10 +364,13 @@ pub fn render_jornada(datos: &EstadoPantalla) -> impl IntoElement {
                 .h_flex()
                 .gap_5()
                 .items_center()
-                // Métrica: nº de sesiones (label humo + valor mono papel).
-                .child(metrica("sesiones", &sesiones.len().to_string()))
-                // Total trabajado: el dato clave → valor en acento brasa (con moderación).
+                // NEW-2 (P2, jerarquía visual): "total trabajado" va PRIMERO, no en el medio — es
+                // el dato que Max quiere ver de un vistazo, no algo que busque entre "sesiones" y
+                // el chip de estado. Combinado con el tamaño/peso de `metrica_acento` (24px BOLD,
+                // antes 16px normal como el resto), ahora gana el ojo por posición Y por jerarquía
+                // tipográfica, no sólo por el tono dorado.
                 .child(metrica_acento("total trabajado", &formatear_duracion(Some(total_seg))))
+                .child(metrica("sesiones", &sesiones.len().to_string()))
                 // Estado de la jornada: chip vivo/cerrado.
                 .child(if hay_abierta {
                     tema::chip_estado("● en curso", gpui::rgb(0x22C55E))
@@ -307,64 +379,68 @@ pub fn render_jornada(datos: &EstadoPantalla) -> impl IntoElement {
                 }),
         );
 
-    // --- Tabla de sesiones ---
-    let mut tabla_ses = tema::superficie_card().v_flex().gap_1().p_4().child(
-        div()
-            .h_flex()
-            .items_center()
-            .gap_2()
-            .pb_1()
-            .child(tema::eyebrow("Sesiones"))
-            .child(tema::texto_terciario(format!("({})", sesiones.len()))),
-    );
-    tabla_ses = tabla_ses.child(cabecera(&[
-        ("inicio", Some(120.0)),
-        ("fin", Some(120.0)),
+    // --- Tabla de sesiones (colapsable, bug #1: peers con muchas sesiones desbordaban la
+    // pantalla) --- Pista discreta "UTC" en el header (Julio, tras confirmar que el broker timbra
+    // en UTC — main.rs `ahora_iso` — y que convertir a hora local España hoy es frágil: `time`
+    // sin feature `local-offset` + `current_local_offset()` falla en multi-thread, el caso de
+    // GPUI). Evita que Max lea "07:18" como hora local cuando en realidad es UTC.
+    // Ancho de columna 170px (antes 120): "dd/mm/aaaa hh:mm:ss" (19 chars mono) no cabía en el
+    // ancho pensado sólo para "HH:MM:SS" (8 chars) — Max pidió fecha completa uniforme (#10).
+    let mut cuerpo_ses = div().v_flex().gap_1().child(cabecera(&[
+        ("inicio", Some(170.0)),
+        ("fin", Some(170.0)),
         ("duración", None),
     ]));
     for (idx, s) in sesiones.iter().enumerate() {
-        tabla_ses = tabla_ses.child(fila_sesion(idx, s, ses_sel));
+        cuerpo_ses = cuerpo_ses.child(fila_sesion(idx, s, ses_sel));
     }
-
-    // --- Tabla de tareas (estimado vs real) ---
-    let mut tabla_tar = tema::superficie_card().v_flex().gap_1().p_4().child(
-        div()
-            .h_flex()
-            .items_center()
-            .gap_2()
-            .pb_1()
-            .child(tema::eyebrow("Tareas"))
-            .child(tema::texto_terciario(format!("({})", tareas.len()))),
+    let tabla_ses = seccion_colapsable(
+        SeccionJornada::Sesiones,
+        "Sesiones",
+        sesiones.len(),
+        datos.jornada_ses_colapsada,
+        Some(tema::texto_terciario("· horas en UTC").into_any_element()),
+        cuerpo_ses,
     );
-    tabla_tar = tabla_tar.child(cabecera(&[
+
+    // --- Tabla de tareas (estimado vs real), colapsable ---
+    let mut cuerpo_tar = div().v_flex().gap_1().child(cabecera(&[
         ("tarea", None),
         ("estimado", Some(90.0)),
         ("real", Some(90.0)),
         ("estado", Some(120.0)),
     ]));
     for (idx, t) in tareas.iter().enumerate() {
-        tabla_tar = tabla_tar.child(fila_tarea(idx, t, tar_sel));
+        cuerpo_tar = cuerpo_tar.child(fila_tarea(idx, t, tar_sel));
     }
-
-    // --- Bitácora de acciones (registro-acciones R10): timeline "qué hizo, cuándo" ---
-    let acciones = &datos.jornada_acciones;
-    let mut tabla_acc = tema::superficie_card().v_flex().gap_1().p_4().child(
-        div()
-            .h_flex()
-            .items_center()
-            .gap_2()
-            .pb_1()
-            .child(tema::eyebrow("Acciones"))
-            .child(tema::texto_terciario(format!("({})", acciones.len()))),
+    let tabla_tar = seccion_colapsable(
+        SeccionJornada::Tareas,
+        "Tareas",
+        tareas.len(),
+        datos.jornada_tar_colapsada,
+        None,
+        cuerpo_tar,
     );
+
+    // --- Bitácora de acciones (registro-acciones R10): timeline "qué hizo, cuándo", colapsable ---
+    let acciones = &datos.jornada_acciones;
+    let mut cuerpo_acc = div().v_flex().gap_1();
     if acciones.is_empty() {
         // Estado vacío legible (AC3): sin bitácora en el broker o peer sin acciones aún.
-        tabla_acc = tabla_acc.child(tema::texto_terciario("Sin acciones registradas todavía."));
+        cuerpo_acc = cuerpo_acc.child(tema::texto_terciario("Sin acciones registradas todavía."));
     } else {
         for (idx, a) in acciones.iter().enumerate() {
-            tabla_acc = tabla_acc.child(fila_accion(idx, a, tareas));
+            cuerpo_acc = cuerpo_acc.child(fila_accion(idx, a, tareas));
         }
     }
+    let tabla_acc = seccion_colapsable(
+        SeccionJornada::Acciones,
+        "Acciones",
+        acciones.len(),
+        datos.jornada_acc_colapsada,
+        Some(tema::texto_terciario("· horas en UTC").into_any_element()),
+        cuerpo_acc,
+    );
 
     base.child(resumen)
         .child(tabla_ses)
@@ -403,8 +479,10 @@ fn celdas_accion<T: ParentElement + Styled>(
     detalle: &str,
 ) -> T {
     fila.child(
+        // 140px (antes 64): la columna se llamaba "hora" cuando sólo mostraba HH:MM:SS (8 chars);
+        // ahora `fila_accion` pasa `formatear_fecha` (dd/mm/aaaa hh:mm:ss, 19 chars) — #10.
         div()
-            .w(px(64.0))
+            .w(px(140.0))
             .flex_none()
             .font_family(tema::FUENTE_MONO)
             .text_xs()
@@ -444,8 +522,10 @@ fn celdas_accion<T: ParentElement + Styled>(
 /// Action `AbrirTareaJornada` y el modal ya existentes. Si no (mensajes, purgas, sujetos de
 /// otras pantallas), fila estática con el mismo layout.
 fn fila_accion(idx: usize, a: &AccionRegistrada, tareas: &[Tarea]) -> AnyElement {
-    // `cuando` es ISO 8601 UTC (posiciones 11..19 = HH:MM:SS); si viniera corto, guion.
-    let hora = a.cuando.get(11..19).unwrap_or("—").to_string();
+    // `cuando` es ISO 8601 UTC del broker. `formatear_fecha` da dd/mm/aaaa hh:mm:ss (antes sólo se
+    // mostraba la hora — Max pidió fecha completa uniforme en toda la GPUI, sin ese contexto una
+    // acción de "hace 3 días" y una de "hoy" a la misma hora eran indistinguibles en la lista).
+    let hora = tema::formatear_fecha(&a.cuando);
     let etiqueta = etiqueta_accion(a.accion);
     let sujeto = a.sujeto.clone().unwrap_or_default();
     let detalle = a.detalle.clone().unwrap_or_default();
@@ -455,7 +535,7 @@ fn fila_accion(idx: usize, a: &AccionRegistrada, tareas: &[Tarea]) -> AnyElement
         .as_deref()
         .and_then(|s| tareas.iter().position(|t| t.id == s));
 
-    match indice_tarea {
+    let fila = match indice_tarea {
         Some(indice) => celdas_accion(
             tema::fila_seleccionable(format!("jornada-accion-{idx}"), false).on_click(
                 move |_e, window, cx| {
@@ -483,7 +563,55 @@ fn fila_accion(idx: usize, a: &AccionRegistrada, tareas: &[Tarea]) -> AnyElement
             &detalle,
         )
         .into_any_element(),
+    };
+
+    // #11 (última capa: mostrar): si la acción trae evidencia (Option<String>, la propaga el
+    // broker desde #7 tras el fix de s007), una segunda línea discreta bajo la fila principal —
+    // aditivo, no toca `celdas_accion` ni el layout de columnas de la fila. Sin evidencia (el
+    // caso de HOY para toda la bitácora anterior a este campo, y la mayoría de acciones futuras
+    // que no la llevan), el `v_flex` de un solo hijo es indistinguible de la fila simple de antes.
+    match &a.evidencia {
+        Some(ev) => div()
+            .v_flex()
+            .w_full()
+            .gap_0()
+            .child(fila)
+            .child(fila_evidencia(ev))
+            .into_any_element(),
+        None => fila,
     }
+}
+
+/// Línea de evidencia bajo una fila del timeline (#11). Icono 📎 + texto truncado a una línea
+/// (`.truncate()`: la evidencia puede ser larga — link, resumen — y esto es sólo el vistazo del
+/// timeline, no el lugar para leerla íntegra). Indentada para leerse como "detalle de la fila de
+/// arriba", no como una fila nueva del mismo nivel.
+fn fila_evidencia(evidencia: &str) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .pl(px(140.0 + 8.0 + 16.0)) // alineado bajo la columna "sujeto": hora(140) + gap + chip
+        .pr_3()
+        .pb_2()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(tema::HUMO)
+                .child(SharedString::from("📎")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .truncate()
+                .text_xs()
+                .font_family(tema::FUENTE_MONO)
+                .text_color(tema::HUMO)
+                .child(SharedString::from(evidencia.to_string())),
+        )
 }
 
 /// Métrica del resumen: label humo pequeño encima, valor mono papel debajo.
@@ -501,7 +629,11 @@ fn metrica(label: &str, valor: &str) -> impl IntoElement {
         )
 }
 
-/// Métrica destacada: como `metrica` pero el valor en acento brasa (dato clave: total trabajado).
+/// Métrica DESTACADA (NEW-2, mejora P2 de jerarquía visual): antes sólo se diferenciaba de
+/// `metrica` por el color (mismo `text_size(16.0)` que "sesiones"/estado — el KPI clave no se leía
+/// como el dato principal de un vistazo, sólo por su tono dorado). Ahora +50% de tamaño (24px) y
+/// peso `BOLD`, además del acento brasa — "total trabajado" debe ganar el ojo primero en la card
+/// de resumen, es el dato que Max quiere ver sin tener que buscarlo entre las otras 2 métricas.
 fn metrica_acento(label: &str, valor: &str) -> impl IntoElement {
     div()
         .v_flex()
@@ -510,7 +642,8 @@ fn metrica_acento(label: &str, valor: &str) -> impl IntoElement {
         .child(
             div()
                 .font_family(tema::FUENTE_MONO)
-                .text_size(px(16.0))
+                .text_size(px(24.0))
+                .font_weight(FontWeight::BOLD)
                 .text_color(tema::BRASA)
                 .child(SharedString::from(valor.to_string())),
         )
@@ -519,13 +652,15 @@ fn metrica_acento(label: &str, valor: &str) -> impl IntoElement {
 /// Fila de la tabla de sesiones: inicio · fin ("(abierta)" si sigue viva) · duración. Clicable →
 /// despacha `SeleccionarSesion { indice }`. `fila_seleccionable` resalta la activa (brasa tenue).
 fn fila_sesion(idx: usize, s: &Sesion, seleccion: usize) -> impl IntoElement {
+    // dd/mm/aaaa hh:mm:ss (antes sólo la hora, `hora_iso`) — sesiones de días distintos a la misma
+    // hora eran indistinguibles sin la fecha (#10).
     let fin = match &s.fin {
-        Some(f) if !f.is_empty() => hora_iso(f),
+        Some(f) if !f.is_empty() => tema::formatear_fecha(f),
         _ => "(abierta)".to_string(),
     };
     tema::fila_seleccionable(SharedString::from(format!("jornada-ses-{idx}")), idx == seleccion)
-        .child(celda_dato(hora_iso(&s.inicio), 120.0))
-        .child(celda_dato(fin, 120.0))
+        .child(celda_dato(tema::formatear_fecha(&s.inicio), 170.0))
+        .child(celda_dato(fin, 170.0))
         .child(celda_dato_flex(formatear_duracion(s.duracion_seg)))
         .on_click(move |evento, window, cx| {
             // Doble-click abre el detalle de la sesión (jornada-02); click simple selecciona.
@@ -835,11 +970,16 @@ pub fn render_modal_sesion(s: &Sesion, tareas: &[Tarea]) -> AnyElement {
                 ),
         )
         .child(campo_mono_sesion("id sesión", s.id.clone()))
-        .child(campo_mono_sesion("inicio", s.inicio.clone()))
+        // Antes mostraban el ISO 8601 CRUDO ("2026-07-03T09:42:15.123Z") — exactamente la queja de
+        // Max sobre timestamps sin formatear (#10). "(UTC)" en la etiqueta: el broker timbra en UTC
+        // (confirmado, `ahora_iso` en main.rs) y no se convierte a hora local hoy (ver nota de
+        // Julio: `time` sin feature local-offset + fallo conocido de `current_local_offset` en
+        // multi-thread) — sin la pista, Max podría leer la hora como local España.
+        .child(campo_mono_sesion("inicio (UTC)", tema::formatear_fecha(&s.inicio)))
         .child(campo_mono_sesion(
-            "fin",
+            "fin (UTC)",
             match &s.fin {
-                Some(f) if !f.is_empty() => f.clone(),
+                Some(f) if !f.is_empty() => tema::formatear_fecha(f),
                 _ => "(abierta)".to_string(),
             },
         ))
@@ -906,10 +1046,5 @@ mod tests {
         assert_eq!(formatear_duracion(Some(45)), "45s");
         assert_eq!(formatear_duracion(Some(600)), "10min");
         assert_eq!(formatear_duracion(Some(3720)), "1h02");
-    }
-
-    #[test]
-    fn hora_iso_extrae_hh_mm_ss() {
-        assert_eq!(hora_iso("2026-07-01T09:05:00Z"), "09:05:00");
     }
 }

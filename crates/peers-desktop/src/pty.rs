@@ -122,6 +122,12 @@ pub struct ComandoPty {
     pub programa: String,
     pub args: Vec<String>,
     pub dir: Option<PathBuf>,
+    /// Variables de entorno adicionales para el proceso hijo (E-05: binding `CLAUDE_PEERS_ID`).
+    /// `Vec<(String, String)>` y no `HashMap` — coherente con el resto del módulo (`ParamsComando`/
+    /// `argv_claude` son todo `String`/`Vec<String>` plano) y más simple de construir con un solo
+    /// `push` sin la Entry API; se colecciona a `HashMap` recién en `SesionPty::abrir`, que es
+    /// donde `alacritty_terminal::tty::Options` realmente lo exige.
+    pub env: Vec<(String, String)>,
 }
 
 /// Sesión de terminal embebido viva: PTY + `Term` + hilo del event loop + canal de eventos hacia
@@ -148,7 +154,10 @@ impl SesionPty {
             shell: Some(ShellTty::new(comando.programa, comando.args)),
             working_directory: comando.dir,
             drain_on_exit: true,
-            env: Default::default(),
+            // E-05: env real del proceso hijo (agnóstico de shell — a diferencia de un `export`
+            // en el string de shell, esto no depende de que el PTY corra un shell POSIX que lo
+            // respete; alacritty_terminal lo aplica directo al `execve`, igual en Local/SSH/tmux).
+            env: comando.env.into_iter().collect(),
             #[cfg(not(windows))]
             child_signal_mask: None,
             #[cfg(target_os = "windows")]

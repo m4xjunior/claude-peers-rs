@@ -186,10 +186,29 @@ pub fn sombra_card() -> Vec<BoxShadow> {
 
 /// Fondo raíz de la app: ocupa todo, pinta TINTA, texto PAPEL por defecto y fija la fuente UI para
 /// todo el subárbol (los hijos heredan la familia salvo que la pisen). Punto de partida del render
-/// raíz de `AppDesktop`.
+/// raíz de `AppDesktop` — el layout de dos columnas (sidebar + `contenido-scroll`) que SÍ necesita
+/// `size_full` porque referencia el alto real de la ventana. NO usar como raíz de una pantalla
+/// individual (`render_<pantalla>`): para eso está `raiz_scrollable()`.
 pub fn fondo_app() -> Div {
     div()
         .size_full()
+        .bg(TINTA)
+        .text_color(PAPEL)
+        .font_family(FUENTE_UI)
+        .text_size(px(14.0))
+}
+
+/// Raíz canónica de una PANTALLA individual (`render_<pantalla>` — broker/config/acceso/jornada/
+/// redis/lanzador/tareas). Mismos tokens visuales que `fondo_app()` (TINTA/PAPEL/FUENTE_UI/14px)
+/// pero SIN `size_full`: el contenedor `contenido-scroll` de `app.rs` (raíz de ventana, `h_full` +
+/// `min_h_0` + `overflow_y_scroll`) necesita que su hijo NO fije su propio alto para poder medirlo y
+/// scrollearlo — un hijo con `size_full` se clava al alto exacto del scrollable y su contenido
+/// interno desborda sin activar el scroll del padre (bug verificado 03/07/2026: Jornada con 4 cards
+/// era la primera en desbordar, pero las 7 vistas que usaban `fondo_app()` como raíz lo tenían
+/// latente). `w_full` sí se fija (ancho conocido, no rompe el layout horizontal).
+pub fn raiz_scrollable() -> Div {
+    div()
+        .w_full()
         .bg(TINTA)
         .text_color(PAPEL)
         .font_family(FUENTE_UI)
@@ -355,4 +374,70 @@ pub fn chip_estado(texto: impl Into<SharedString>, color: Rgba) -> Div {
 /// `.rounded(tema::radio(tema::RADIO_CARD))` sin importar `px` ellas mismas.
 pub fn radio(valor: f32) -> Pixels {
     px(valor)
+}
+
+// -------------------------------------------------------------------------------------------------
+// 9) FORMATO DE FECHA/HORA — el broker timbra en ISO 8601/RFC 3339 (`AAAA-MM-DDTHH:MM:SS[.fff][Z]`);
+//    las vistas mostraban ese crudo o sólo la hora (`hora_iso` local a cada vista). Max pidió un
+//    formato humano uniforme en toda la GPUI: `dd/mm/aaaa hh:mm:ss`.
+// -------------------------------------------------------------------------------------------------
+
+/// Formatea un timestamp ISO 8601/RFC 3339 (el que timbra el broker) como `dd/mm/aaaa hh:mm:ss`.
+/// Parseo MANUAL por posición fija (mismo criterio que el `hora_iso` local de cada vista) — evita
+/// traer una dependencia de parsing sólo para reordenar dígitos; el broker siempre timbra con el
+/// prefijo `AAAA-MM-DDT` fijo (crate `time`, formato `Rfc3339`), así que la posición es estable.
+///
+/// Degradación (R10, nunca panic): si `iso` no tiene el patrón esperado (cadena vacía, formato
+/// inesperado, JSON viejo con otro formato), devuelve el string ORIGINAL tal cual — mejor mostrar
+/// el dato crudo que un "invalid date" o un valor inventado.
+pub fn formatear_fecha(iso: &str) -> String {
+    // Se esperan al menos 19 chars fijos: "AAAA-MM-DDTHH:MM:SS" (índices 0-18). Cualquier milisegundo
+    // u offset de zona después de esa posición se ignora — no se necesita para el formato pedido.
+    if iso.len() < 19 || iso.as_bytes().get(4) != Some(&b'-') || iso.as_bytes().get(10) != Some(&b'T')
+    {
+        return iso.to_string();
+    }
+    let anio = &iso[0..4];
+    let mes = &iso[5..7];
+    let dia = &iso[8..10];
+    let hora = &iso[11..19];
+    // Los 4 componentes deben ser dígitos/`:` válidos (si el ISO viene truncado o corrupto en medio,
+    // `hora` podría tener basura en vez de "HH:MM:SS" — degradar al crudo en vez de mostrarlo mal).
+    if !anio.bytes().all(|b| b.is_ascii_digit())
+        || !mes.bytes().all(|b| b.is_ascii_digit())
+        || !dia.bytes().all(|b| b.is_ascii_digit())
+    {
+        return iso.to_string();
+    }
+    format!("{dia}/{mes}/{anio} {hora}")
+}
+
+#[cfg(test)]
+mod tests_formato_fecha {
+    use super::formatear_fecha;
+
+    #[test]
+    fn formatea_iso_con_milisegundos_y_z() {
+        assert_eq!(
+            formatear_fecha("2026-07-03T09:42:15.123Z"),
+            "03/07/2026 09:42:15"
+        );
+    }
+
+    #[test]
+    fn formatea_iso_sin_milisegundos() {
+        assert_eq!(formatear_fecha("2026-01-09T07:49:28"), "09/01/2026 07:49:28");
+    }
+
+    #[test]
+    fn cadena_vacia_o_corta_devuelve_tal_cual() {
+        assert_eq!(formatear_fecha(""), "");
+        assert_eq!(formatear_fecha("2026-07-03"), "2026-07-03");
+    }
+
+    #[test]
+    fn formato_inesperado_degrada_al_crudo_sin_panic() {
+        assert_eq!(formatear_fecha("no es una fecha"), "no es una fecha");
+        assert_eq!(formatear_fecha("2026/07/03 09:42:15"), "2026/07/03 09:42:15");
+    }
 }

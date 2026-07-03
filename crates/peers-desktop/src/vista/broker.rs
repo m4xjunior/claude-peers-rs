@@ -197,7 +197,9 @@ pub fn render_broker(datos: &EstadoPantalla) -> impl IntoElement {
     let banner_conexion = banner_estado_conexion(datos);
 
     // Layout: fondo Ethos (tinta/papel/Inter) + cabecera + banner de conexión + paneles apilados.
-    tema::fondo_app()
+    // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll` de
+    // app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla.
+    tema::raiz_scrollable()
         .flex()
         .flex_col()
         .gap_5()

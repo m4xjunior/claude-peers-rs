@@ -297,6 +297,12 @@ pub struct EstadoPantalla {
     /// Si `true`, el DROPDOWN del selector de peer (jornada-03, decisión A+B de Max) está
     /// desplegado mostrando los peers vivos.
     pub jornada_dropdown: bool,
+    /// Colapsado/expandido de las 3 tablas de Jornada (bug #1: peers con muchas sesiones/tareas/
+    /// acciones desbordaban la pantalla y sepultaban el resto). `false` = expandida por defecto
+    /// (comportamiento actual sin cambios si Max nunca toca el chevron). Efímero, no se persiste.
+    pub jornada_ses_colapsada: bool,
+    pub jornada_tar_colapsada: bool,
+    pub jornada_acc_colapsada: bool,
 
     // --- Pantalla Config (Fase 2) ---
     /// Panel de configuración con estado propio (Inputs editables + feedback de guardado). Es una
@@ -1890,6 +1896,32 @@ impl AppDesktop {
                     cx,
                 );
             }
+            FormTareas::PedirEvidencia { tarea_id } => {
+                // #7 (paquete de bugs Max): la evidencia es OBLIGATORIA para llegar a Hecha desde
+                // este flujo — nunca se dispara el cambio de estado sin ella (mismo criterio que
+                // el motivo de Bloquear arriba). Reusa el Input `motivo` (un sólo formulario abierto
+                // a la vez); el valor tecleado se envía como `evidencia`, no como `motivo`, al POST.
+                if motivo.is_empty() {
+                    self.datos.tareas_form_error =
+                        Some("la evidencia es obligatoria para marcar Hecha".to_string());
+                    cx.notify();
+                    return;
+                }
+                self.cerrar_form_tareas(cx);
+                self.mutar_tarea(
+                    "Tarea marcada como hecha (evidencia registrada)".to_string(),
+                    move |c| {
+                        c.bloquear_en(c.tarea_estado(
+                            &tarea_id,
+                            peers_core::EstadoTarea::Hecha,
+                            None,
+                            Some(motivo),
+                        ))
+                        .map(|_| ())
+                    },
+                    cx,
+                );
+            }
             FormTareas::Confirmar {
                 tarea_id, estado, ..
             } => {
@@ -2325,6 +2357,24 @@ impl AppDesktop {
         cx.notify();
     }
 
+    /// Alterna colapsado/expandido de UNA de las 3 tablas de Jornada (bug #1: peers con muchas
+    /// sesiones/tareas/acciones desbordaban la pantalla). Un solo manejador para las 3 — el `match`
+    /// sólo decide QUÉ flag tocar, la lógica de alternar es idéntica.
+    fn alternar_seccion_jornada(
+        &mut self,
+        seccion: crate::vista::jornada::SeccionJornada,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::vista::jornada::SeccionJornada;
+        let flag = match seccion {
+            SeccionJornada::Sesiones => &mut self.datos.jornada_ses_colapsada,
+            SeccionJornada::Tareas => &mut self.datos.jornada_tar_colapsada,
+            SeccionJornada::Acciones => &mut self.datos.jornada_acc_colapsada,
+        };
+        *flag = !*flag;
+        cx.notify();
+    }
+
     /// Salta al peer `id` desde el dropdown (jornada-03 A): cierra el desplegable, fija el foco y
     /// recarga la jornada (reutiliza `ver_jornada_peer`, que resetea selecciones y fuerza fetch).
     fn elegir_peer_jornada(&mut self, id: String, cx: &mut Context<Self>) {
@@ -2391,6 +2441,31 @@ impl AppDesktop {
                         estado,
                         descripcion,
                     },
+                    "",
+                    "",
+                    window,
+                    cx,
+                );
+            }
+            // #7 (paquete de bugs Max): MISMA función pura `necesita_pedir_evidencia` que
+            // `boton_estado`/atajo "h" de Tareas — no una condición divergente escrita a mano. Este
+            // es el TERCER camino hacia Hecha (modal de detalle de tarea desde Jornada) que hubiera
+            // seguido siendo un bypass si sólo arreglaba `boton_estado` y el atajo de teclado.
+            // Si la tarea no aparece en la caché de jornada (no debería pasar, pero R10 exige
+            // degradar hacia el lado SEGURO), `and_then` encadena a `None` → `necesita_pedir_evidencia`
+            // ve `evidencia_existente: None` → pide evidencia igual, nunca al revés.
+            EstadoTarea::Hecha
+                if crate::vista::tareas::necesita_pedir_evidencia(
+                    estado,
+                    self.datos
+                        .jornada
+                        .as_ref()
+                        .and_then(|j| j.tareas.iter().find(|t| t.id == tarea_id))
+                        .and_then(|t| t.evidencia.as_ref()),
+                ) =>
+            {
+                self.abrir_form_tareas(
+                    crate::vista::tareas::FormTareas::PedirEvidencia { tarea_id },
                     "",
                     "",
                     window,
@@ -2551,6 +2626,23 @@ impl AppDesktop {
                         window,
                         cx,
                     ),
+                    // "h" (Hecha) MISMO criterio de #7 que `boton_estado` — reusa la MISMA función
+                    // pura `necesita_pedir_evidencia`, no una condición divergente escrita a mano
+                    // (evita el bypass sutil de un tercer camino con su propia lógica ligeramente
+                    // distinta a los otros dos).
+                    "h" if crate::vista::tareas::necesita_pedir_evidencia(
+                        EstadoTarea::Hecha,
+                        t.evidencia.as_ref(),
+                    ) =>
+                    {
+                        self.abrir_form_tareas(
+                            crate::vista::tareas::FormTareas::PedirEvidencia { tarea_id },
+                            "",
+                            "",
+                            window,
+                            cx,
+                        )
+                    }
                     "h" => self.cambiar_estado_tarea(tarea_id, EstadoTarea::Hecha, cx),
                     "x" => self.pedir_confirm_estado(tarea_id, EstadoTarea::Cancelada, window, cx),
                     "a" => self.abrir_form_reasignar(tarea_id, window, cx),
@@ -3326,8 +3418,8 @@ impl Render for AppDesktop {
         use crate::vista::config::RecargarConfig;
         use crate::vista::jornada::{
             AbrirSesionJornada, AbrirTareaJornada, AlternarDropdownJornada,
-            CambiarEstadoTareaJornada, CerrarSesionJornada, CiclarPeerJornada, ElegirPeerJornada,
-            SeleccionarSesion, SeleccionarTareaJornada,
+            AlternarSeccionJornada, CambiarEstadoTareaJornada, CerrarSesionJornada,
+            CiclarPeerJornada, ElegirPeerJornada, SeleccionarSesion, SeleccionarTareaJornada,
         };
         use crate::vista::peers::{
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
@@ -3509,6 +3601,17 @@ impl Render for AppDesktop {
                     cx,
                 );
             }))
+            .on_action(cx.listener(|esta, a: &crate::vista::tareas::AbrirFormEvidencia, window, cx| {
+                esta.abrir_form_tareas(
+                    crate::vista::tareas::FormTareas::PedirEvidencia {
+                        tarea_id: a.tarea_id.clone(),
+                    },
+                    "",
+                    "",
+                    window,
+                    cx,
+                );
+            }))
             .on_action(cx.listener(|esta, a: &PedirConfirmEstado, window, cx| {
                 esta.pedir_confirm_estado(a.tarea_id.clone(), a.estado, window, cx);
             }))
@@ -3566,6 +3669,9 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, _a: &AlternarDropdownJornada, _window, cx| {
                 esta.alternar_dropdown_jornada(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AlternarSeccionJornada, _window, cx| {
+                esta.alternar_seccion_jornada(a.seccion, cx);
             }))
             .on_action(cx.listener(|esta, a: &ElegirPeerJornada, _window, cx| {
                 esta.elegir_peer_jornada(a.id.clone(), cx);

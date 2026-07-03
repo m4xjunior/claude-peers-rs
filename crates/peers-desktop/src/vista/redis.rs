@@ -103,7 +103,9 @@ pub fn render_redis(datos: &EstadoPantalla) -> impl IntoElement {
         None => (0, &[], &[]),
     };
 
-    let mut raiz = tema::fondo_app().v_flex().gap_4().p_6();
+    // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll` de
+    // app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla.
+    let mut raiz = tema::raiz_scrollable().v_flex().gap_4().p_6();
 
     // Cabecera Ethos: eyebrow + título + conteo, y a la derecha el REFRESCO manual (redis-05):
     // botón "↻ Refrescar" + sello "actualizado hace Xs" (edad de la última respuesta OK, contada

@@ -181,10 +181,12 @@ const COL_ESTADO: f32 = 120.0;
 // fondo); los timestamps en mono (`tema::FUENTE_MONO`) para alineación de dígitos.
 // -------------------------------------------------------------------------------------------------
 
-/// Celda de texto de ancho fijo (id, directorio). Texto PAPEL, tamaño base.
+/// Celda de texto de ancho fijo (directorio). Texto PAPEL, tamaño base. `.truncate()` (craft P2):
+/// mismo fix que la celda de id — un directorio/anotación de repo largo no debe partirse por wrap.
 fn celda(texto: impl Into<SharedString>, ancho: f32) -> impl IntoElement {
     div()
         .w(px(ancho))
+        .truncate()
         .px_1()
         .text_color(tema::PAPEL)
         .child(texto.into())
@@ -238,8 +240,12 @@ fn fila(indice: usize, inst: &Instancia, estado: EstadoPeer, activa: bool) -> im
     let visto = hora_iso(&inst.visto_en);
     let repo = inst.repo_git.as_deref().unwrap_or("");
 
-    // El directorio se muestra tal cual; si hay repo git, se anota entre paréntesis como pista.
-    let dir = if repo.is_empty() {
+    // El directorio se muestra tal cual; si hay repo git DISTINTO del directorio, se anota entre
+    // paréntesis como pista (craft P2, s005): `repo_git` es `git rev-parse --show-toplevel` — si
+    // el peer arrancó en el ROOT del repo (el caso común), `repo == directorio` y el paréntesis
+    // sólo repetía la misma ruta ("…/claude-peers-rs (…/claude-peers-rs)"). Sólo aporta cuando el
+    // peer arrancó en un SUBDIRECTORIO del repo (`directorio` != `repo_git`).
+    let dir = if repo.is_empty() || repo == inst.directorio {
         inst.directorio.clone()
     } else {
         format!("{} ({repo})", inst.directorio)
@@ -247,9 +253,13 @@ fn fila(indice: usize, inst: &Instancia, estado: EstadoPeer, activa: bool) -> im
 
     tema::fila_seleccionable(SharedString::from(format!("peer-fila-{indice}")), activa)
         // El id del peer se destaca en dorado brasa: es la identidad, el ancla de la fila.
+        // `.truncate()` (craft P2, s005): un id largo partía la palabra a media sílaba por wrap
+        // ("app-planificacion-servi\ndor") — nunca se debe romper un identificador. El id íntegro
+        // sigue disponible en el modal de detalle y en "Copiar id" (bug #4).
         .child(
             div()
                 .w(px(COL_ID))
+                .truncate()
                 .px_1()
                 .text_color(tema::BRASA)
                 .font_weight(gpui::FontWeight::MEDIUM)
@@ -319,11 +329,36 @@ fn banner_error(err: &crate::cliente::ErrorBroker) -> impl IntoElement {
         .child(SharedString::from(format!("⚠ Broker: {err}")))
 }
 
+/// Compone el identificador de una línea de un peer para copiar al portapapeles (bug #4 de Max:
+/// "conectar visualmente una tarea con el agente que la ejecuta" — copiar el id + contexto en un
+/// clic y pegarlo donde Max lo necesite, ej. junto a la tarea que ese peer ejecuta).
+///
+/// DECISIÓN sobre "jornada" (el pedido de Max era "id + jornada + descripción + PID"): `Instancia`
+/// NO trae un campo de jornada — eso es `GET /jornada` (sesiones+tareas completas, una llamada HTTP
+/// aparte, pensada para la pantalla Jornada, no para un identificador de un clic). Pedirla por cada
+/// fila para armar un string a copiar sería una llamada de red innecesaria para algo que debe ser
+/// INSTANTÁNEO. Se usa `visto_en` (último latido, YA en caché local) como el dato de "actividad/
+/// jornada" más cercano sin red extra — es lo que la tabla y el resto de la app ya muestran como
+/// pulso del peer. Si Max quiere el detalle completo de sesiones, ya existe el botón "Ver jornada".
+fn identificador_peer(inst: &Instancia) -> String {
+    format!(
+        "{} · pid {} · {} · {}",
+        inst.id,
+        inst.pid,
+        if inst.resumen.is_empty() {
+            "(sin resumen)"
+        } else {
+            &inst.resumen
+        },
+        hora_iso(&inst.visto_en),
+    )
+}
+
 /// Barra de acciones del peer seleccionado: aparece bajo la tabla cuando hay un peer marcado.
 /// Muestra el id del peer en foco y los botones Abrir (detalle, peers-01), Enviar mensaje
-/// (composer, peers-02), Ver jornada, Expulsar (kick con confirmación, peers-03) y "Cerrar" para
-/// soltar la selección. Espejo de las teclas de la TUI (`m`/`k`) elevadas a botones visibles.
-/// `indice` viaja en `AbrirDetallePeer` (posición en `datos.instancias`).
+/// (composer, peers-02), Ver jornada, Copiar id (bug #4), Expulsar (kick con confirmación,
+/// peers-03) y "Cerrar" para soltar la selección. Espejo de las teclas de la TUI (`m`/`k`)
+/// elevadas a botones visibles. `indice` viaja en `AbrirDetallePeer` (posición en `datos.instancias`).
 ///
 /// PISTA DE ATAJOS (peers-18, variante B de la RFC): línea mono/humo bajo la barra con los atajos
 /// de teclado disponibles sobre el peer seleccionado. NO son tooltips reales (variante A) porque
@@ -337,6 +372,7 @@ fn barra_acciones(inst: &Instancia, indice: usize) -> impl IntoElement {
     let id_msg = inst.id.clone();
     let id_jornada = inst.id.clone();
     let id_kick = inst.id.clone();
+    let id_copiar = identificador_peer(inst);
 
     let barra = tema::superficie_card()
         .h_flex()
@@ -370,6 +406,18 @@ fn barra_acciones(inst: &Instancia, indice: usize) -> impl IntoElement {
             tema::boton_secundario("peer-accion-jornada", "Ver jornada").on_click(
                 move |_e, window, cx| {
                     window.dispatch_action(Box::new(VerJornadaPeer { id: id_jornada.clone() }), cx);
+                },
+            ),
+        )
+        // Copiar id (bug #4 de Max): compone el identificador de una línea y lo escribe al
+        // portapapeles del sistema vía GPUI (cero deps, mismo mecanismo que `lanzador.rs`). Al ser
+        // una acción puramente local (no toca el broker), NO se despacha por Action: se resuelve
+        // aquí mismo con `cx.write_to_clipboard`, igual que cualquier otro `on_click` de esta vista
+        // pura (el closure ya recibe `cx` sin necesitar `Entity`/estado propio).
+        .child(
+            tema::boton_secundario("peer-accion-copiar-id", "Copiar id").on_click(
+                move |_e, _window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(id_copiar.clone()));
                 },
             ),
         )
@@ -532,6 +580,31 @@ fn campo_mono(etiqueta: &'static str, valor: String) -> impl IntoElement {
         )
 }
 
+/// Fila de una métrica CONTABLE del modal (craft P2, s005): columna "métricas" (ancho fijo, como
+/// el resto de campos) + `n <descripción>` con singular/plural real (nunca "alerta(s)") y color
+/// BRASA si `n > 0` (llama la atención sobre lo pendiente), HUMO si es 0 (nada que ver, no compite
+/// visualmente). `plural`/`singular` se pasan explícitos (no un pluralizador genérico) porque son
+/// sólo 2 casos reales en este modal — más simple y correcto que reglas gramaticales de más.
+fn campo_metrica(columna: &'static str, singular: &str, plural: &str, n: usize) -> impl IntoElement {
+    let color = if n > 0 { tema::BRASA } else { tema::HUMO };
+    let texto = if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {plural}")
+    };
+    div()
+        .h_flex()
+        .items_baseline()
+        .gap_3()
+        .child(div().w(px(110.0)).flex_shrink_0().child(tema::eyebrow(columna)))
+        .child(
+            div()
+                .font_family(tema::FUENTE_MONO)
+                .text_color(color)
+                .child(SharedString::from(texto)),
+        )
+}
+
 /// Contenido del pop-up "Detalle del peer" (peers-01). Consolida TODO lo que la fila recorta:
 /// identidad (id + directorio + repos + tty/pid/hostname), resumen íntegro, estado operativo
 /// (chip derivado de alertas), señales (`registrada_en`/`visto_en` mono) y métricas ligeras
@@ -552,6 +625,7 @@ pub fn render_modal_detalle_peer(inst: &Instancia, datos: &EstadoPantalla) -> An
     let id_msg = inst.id.clone();
     let id_jornada = inst.id.clone();
     let id_kick = inst.id.clone();
+    let id_copiar = identificador_peer(inst);
 
     div()
         .v_flex()
@@ -637,14 +711,19 @@ pub fn render_modal_detalle_peer(inst: &Instancia, datos: &EstadoPantalla) -> An
                         })),
                 ),
         )
-        // Señales de vida: registro y último latido, en mono (timestamps).
-        .child(campo_mono("registrada", inst.registrada_en.clone()))
-        .child(campo_mono("visto", inst.visto_en.clone()))
-        // Métricas ligeras de las cachés (alertas del peer + tareas abiertas).
-        .child(campo_mono(
-            "métricas",
-            format!("{alertas_vivas} alerta(s) viva(s) · {tareas_abiertas} tarea(s) abierta(s)"),
-        ))
+        // Señales de vida: registro y último latido, en mono (timestamps). Antes mostraban el ISO
+        // CRUDO con microsegundos ("2026-07-03T07:18:43.453626Z") — Max pidió fecha uniforme
+        // dd/mm/aaaa hh:mm:ss en toda la GPUI (#10, hallazgo de crítica de diseño confirmado).
+        // "(UTC)": el broker timbra en UTC (no se convierte a hora local España hoy, ver nota de
+        // Julio sobre `time`/`current_local_offset` frágil en multi-thread).
+        .child(campo_mono("registrada (UTC)", tema::formatear_fecha(&inst.registrada_en)))
+        .child(campo_mono("visto (UTC)", tema::formatear_fecha(&inst.visto_en)))
+        // Métricas ligeras de las cachés (alertas del peer + tareas abiertas). Craft P2 (s005):
+        // "1 alerta(s) viva(s) · 0 tarea(s) abierta(s)" era pluralización literal fea; ahora
+        // singular/plural real + color BRASA si >0 (llama la atención cuando hay algo pendiente),
+        // HUMO neutro en 0 (nada que ver aquí).
+        .child(campo_metrica("alertas", "alerta viva", "alertas vivas", alertas_vivas))
+        .child(campo_metrica("tareas", "tarea abierta", "tareas abiertas", tareas_abiertas))
         // Pie: acciones del peer (el detalle es el hub). Cerrar + mensaje + jornada + expulsar.
         .child(
             div()
@@ -676,6 +755,17 @@ pub fn render_modal_detalle_peer(inst: &Instancia, datos: &EstadoPantalla) -> An
                                 Box::new(VerJornadaPeer { id: id_jornada.clone() }),
                                 cx,
                             );
+                        },
+                    ),
+                )
+                // Copiar id (bug #4): mismo mecanismo que `barra_acciones` — acción local, sin
+                // Action/broker, resuelta directo en el `on_click` con `cx.write_to_clipboard`.
+                .child(
+                    tema::boton_secundario("modal-peer-copiar-id", "Copiar id").on_click(
+                        move |_e, _window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                id_copiar.clone(),
+                            ));
                         },
                     ),
                 )
