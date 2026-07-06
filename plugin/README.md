@@ -60,6 +60,25 @@ nombre `peers-client-<os>-<arch>` que el shim espera (ver el mapa en `peers-clie
 | `CLAUDE_PEERS_ID` | id de rol estable (si no, se deriva de la carpeta) |
 | `CLAUDE_PEERS_PORT` | puerto del broker (defecto 7899) |
 | `CLAUDE_PEERS_BROKER_URL` | apunta a un broker remoto (no levanta uno local) |
+| `CLAUDE_PEERS_TOKEN` | token de acceso al broker (si el broker lo exige) |
+
+### Config por archivo (recomendado en Windows, o si las env vars no se propagan)
+
+En Windows las variables de entorno del SO a veces NO llegan al proceso del cliente. Vía robusta que
+**no** depende del entorno: crea el archivo `~/.claude/claude-peers.json` (en Windows:
+`C:\Users\<usuario>\.claude\claude-peers.json`) con:
+
+```json
+{
+  "broker_url": "http://10.0.1.60:7899",
+  "token": "el-token-del-broker"
+}
+```
+
+El launcher lo lee y pasa `--broker-url`/`--token` explícitos al binario. **Sobrevive a
+`claude update plugin`** (vive fuera del plugin). Precedencia: args del `.mcp.json` > este archivo >
+variables de entorno. Diagnóstico de arranque en `<tmp>/claude-peers-launcher.log`
+(en Windows: `%TEMP%\claude-peers-launcher.log`).
 | `CLAUDE_PEERS_REDIS_URL` | Redis del broker (defecto redis://127.0.0.1:6379) |
 
 ## Servidor 24/7

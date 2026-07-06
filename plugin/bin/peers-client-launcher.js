@@ -71,13 +71,53 @@ if (!fs.existsSync(exe)) {
 }
 diag(`binario elegido: ${exe} (existe)`);
 
+// --- Config explícita broker-url/token (Windows, bug de Daniela: las env vars del SO no se
+// propagan de forma fiable al proceso hijo). Solución robusta: el launcher LEE la config de varias
+// fuentes y la pasa como ARGS EXPLÍCITOS (--broker-url/--token) al .exe, en vez de confiar en que
+// la env var herede. Precedencia (la primera que exista gana, por clave):
+//   1. args que ya vengan en el `command` del .mcp.json (respetados tal cual, no se duplican).
+//   2. archivo de config del usuario: <HOME>/.claude/claude-peers.json  → { broker_url, token }.
+//      SOBREVIVE a `claude update plugin` (vive fuera del plugin) y NO depende de env vars del SO.
+//   3. env vars CLAUDE_PEERS_BROKER_URL / CLAUDE_PEERS_TOKEN (si el SO sí las propaga).
+// Así Daniela solo edita UN archivo de texto una vez, sin tocar setx/registro de Windows. ---
+function leerConfigUsuario() {
+  const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  const ruta = path.join(home, ".claude", "claude-peers.json");
+  try {
+    if (fs.existsSync(ruta)) {
+      const cfg = JSON.parse(fs.readFileSync(ruta, "utf8"));
+      diag(`config de usuario leída: ${ruta}`);
+      return cfg && typeof cfg === "object" ? cfg : {};
+    }
+  } catch (e) {
+    diag(`aviso: no se pudo leer ${ruta}: ${e && e.message}`);
+  }
+  return {};
+}
+
+const argsBase = process.argv.slice(2);
+const cfgUsuario = leerConfigUsuario();
+// Añade un arg SOLO si no venía ya en argsBase (no pisar lo que el .mcp.json declare explícito).
+function agregarArg(args, flag, valorArchivo, valorEnv) {
+  if (args.includes(flag)) return args; // ya presente: respetar
+  const valor = valorArchivo || valorEnv;
+  if (valor) {
+    args.push(flag, String(valor));
+    diag(`arg añadido: ${flag} (fuente: ${valorArchivo ? "config" : "env"})`);
+  }
+  return args;
+}
+let argsFinal = argsBase.slice();
+argsFinal = agregarArg(argsFinal, "--broker-url", cfgUsuario.broker_url, process.env.CLAUDE_PEERS_BROKER_URL);
+argsFinal = agregarArg(argsFinal, "--token", cfgUsuario.token, process.env.CLAUDE_PEERS_TOKEN);
+
 // Ejecuta el binario nativo heredando stdio (el MCP stdio pasa transparente) y reenviando args.
 // `windowsHide` evita una consola parpadeante. NO usamos shell:true (no hace falta y evita
 // problemas de escaping con rutas que tengan espacios). `windowsVerbatimArguments:false` (default)
 // deja que Node escape los args correctamente en Windows.
 let hijo;
 try {
-  hijo = spawn(exe, process.argv.slice(2), {
+  hijo = spawn(exe, argsFinal, {
     stdio: "inherit",
     windowsHide: true,
   });
