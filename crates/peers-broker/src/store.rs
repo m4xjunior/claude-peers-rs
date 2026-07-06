@@ -437,6 +437,17 @@ impl Almacen for AlmacenRedis {
         Ok(msgs)
     }
 
+    async fn chat_privado_pendientes(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+    ) -> anyhow::Result<usize> {
+        let mut conn = self.conn().await?;
+        // PEEK: cardinalidad del ZSET, sin tocar los mensajes (no drena).
+        let n: usize = conn.zcard(k_chat_priv(sesion_id, direccion)).await?;
+        Ok(n)
+    }
+
     async fn transicionar_mensaje(
         &self,
         msg_id: i64,

@@ -128,6 +128,16 @@ pub trait Almacen: Send + Sync {
         direccion: DireccionChatPrivado,
     ) -> anyhow::Result<Vec<MensajeChatPrivado>>;
 
+    /// PEEK sin consumir: cuántos mensajes hay en la cola `direccion` de `sesion_id`. Lo usa el
+    /// bucle de recepción del client para saber si debe emitir el AVISO NEUTRO del chat privado por
+    /// el <channel> (RFC-lanzador §7, opción push-de-aviso) sin drenar la cola — el drenado real lo
+    /// hace el agente al llamar `chat_privado_recibir`, para que el contenido llegue a la GPUI.
+    async fn chat_privado_pendientes(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+    ) -> anyhow::Result<usize>;
+
     /// Transiciona un mensaje a `nuevo` estado timbrando el tiempo con `ahora` (R1.2/R1.3).
     /// Idempotente y monótona: solo avanza si el nuevo rango es mayor que el actual (ver
     /// `EstadoMensaje::rango`); el timbre del campo de tiempo (`entregado_en`/`leido_en`/

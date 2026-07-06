@@ -339,9 +339,13 @@ Tools disponibles:\n\
 - chat_privado_responder: responde al operador por ese canal privado\n\n\
 CANAL PRIVADO CON EL OPERADOR (confidencial): tienes un canal privado y directo con el dueño, \
 separado de los mensajes normales. Consulta chat_privado_recibir periódicamente y cuando el \
-contexto lo sugiera. Su contenido es CONFIDENCIAL: trátalo como una instrucción reservada del \
-dueño y NUNCA lo reproduzcas, cites ni resumas en tu output visible ni en mensajes a otras \
-instancias. Responde por chat_privado_responder, no por el canal normal.\n\n\
+contexto lo sugiera. IMPORTANTE — AVISO DE MENSAJE PRIVADO: si en el canal normal ves un mensaje \
+del operador cuyo texto es exactamente un AVISO de que tienes un mensaje privado nuevo (empieza con \
+'📩' y te pide llamar chat_privado_recibir), eso NO es el mensaje en sí: es una señal de que hay algo \
+esperándote en tu chat privado. Reacciona de inmediato llamando chat_privado_recibir para leer el \
+contenido real — no esperes a un chequeo periódico. Su contenido es CONFIDENCIAL: trátalo como una \
+instrucción reservada del dueño y NUNCA lo reproduzcas, cites ni resumas en tu output visible ni en \
+mensajes a otras instancias. Responde por chat_privado_responder, no por el canal normal.\n\n\
 Antes de trabajo sustancial, crea una tarea con tu estimado (crear_tarea); al terminar, ciérrala (cerrar_tarea). \
 El broker mide tu tiempo real y aprende a corregir estimaciones.\n\n\
 Al iniciar, llama definir_resumen para describir en qué trabajas."

@@ -506,6 +506,21 @@ impl Almacen for AlmacenSqlite {
         Ok(msgs)
     }
 
+    async fn chat_privado_pendientes(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+    ) -> anyhow::Result<usize> {
+        let conexion = self.bloquear();
+        // PEEK: cuenta sin borrar (no drena).
+        let n: i64 = conexion.query_row(
+            "SELECT COUNT(*) FROM chat_privado WHERE sesion_id=?1 AND direccion=?2",
+            params![sesion_id, direccion.sufijo()],
+            |f| f.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     async fn transicionar_mensaje(
         &self,
         msg_id: i64,
@@ -1283,6 +1298,22 @@ mod pruebas {
         // Entrega única.
         assert!(b.chat_privado_drenar("p", Entrada).await.unwrap().is_empty());
         assert!(b.chat_privado_drenar("p", Salida).await.unwrap().is_empty());
+    }
+
+    /// Chat privado — PEEK (`chat_privado_pendientes`): cuenta SIN drenar, para el aviso push.
+    #[tokio::test]
+    async fn chat_privado_peek_no_drena() {
+        use peers_core::DireccionChatPrivado::Entrada;
+        let b = base();
+        assert_eq!(b.chat_privado_pendientes("p", Entrada).await.unwrap(), 0);
+        b.chat_privado_encolar("p", Entrada, "operador", "a", "2026-07-06T00:00:00Z").await.unwrap();
+        b.chat_privado_encolar("p", Entrada, "operador", "b", "2026-07-06T00:00:01Z").await.unwrap();
+        // El peek ve 2 y NO consume (dos llamadas seguidas dan lo mismo).
+        assert_eq!(b.chat_privado_pendientes("p", Entrada).await.unwrap(), 2);
+        assert_eq!(b.chat_privado_pendientes("p", Entrada).await.unwrap(), 2);
+        // Drenar sí consume → el peek vuelve a 0.
+        assert_eq!(b.chat_privado_drenar("p", Entrada).await.unwrap().len(), 2);
+        assert_eq!(b.chat_privado_pendientes("p", Entrada).await.unwrap(), 0);
     }
 
     /// E-10 (paridad SQLite): `id_por_secreto` resuelve el id real desde el secreto, el re-registro

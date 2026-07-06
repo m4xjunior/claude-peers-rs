@@ -708,6 +708,25 @@ async fn chat_privado_recibir(
     Ok(Json(peers_core::RespuestaChatPrivadoRecibir { mensajes }))
 }
 
+/// `POST /chat-privado/pendiente` (RFC-lanzador §7, aviso push): PEEK sin drenar — cuántos mensajes
+/// privados tiene el peer llamante en su bandeja de Entrada. Lo usa el bucle de recepción del client
+/// para decidir si emite el AVISO NEUTRO por el <channel> (sin el contenido). Anti-IDOR idéntico a
+/// `recibir`: el peer se resuelve por SU secreto de sesión, el body no puede declarar a quién mirar.
+async fn chat_privado_pendiente(
+    State(e): State<Estado>,
+    headers: axum::http::HeaderMap,
+    Json(_p): Json<peers_core::PeticionChatPrivadoRecibir>,
+) -> Result<Json<peers_core::RespuestaChatPrivadoPendiente>, ErrorApp> {
+    use peers_core::DireccionChatPrivado;
+    let Some(sesion_id) = id_del_llamador(&e, &headers).await? else {
+        // Sin secreto válido: no revelamos nada (0 pendientes), como en recibir.
+        return Ok(Json(peers_core::RespuestaChatPrivadoPendiente { pendientes: 0 }));
+    };
+    let pendientes =
+        e.almacen.chat_privado_pendientes(&sesion_id, DireccionChatPrivado::Entrada).await?;
+    Ok(Json(peers_core::RespuestaChatPrivadoPendiente { pendientes }))
+}
+
 /// `POST /chat-privado/responder` (RFC-lanzador §7): el peer responde al operador. Encola en la cola
 /// de SALIDA del peer (la que el panel del operador drena). El `de` es el id REAL del peer, resuelto
 /// por su secreto (anti-IDOR: el body no puede declarar quién responde). El `sesion_id` del body se
@@ -2074,6 +2093,7 @@ async fn main() -> anyhow::Result<()> {
         // por peer: enviar/leer las usa el operador (panel); recibir/responder las usa el peer.
         .route("/chat-privado/enviar", post(chat_privado_enviar))
         .route("/chat-privado/recibir", post(chat_privado_recibir))
+        .route("/chat-privado/pendiente", post(chat_privado_pendiente))
         .route("/chat-privado/responder", post(chat_privado_responder))
         .route("/chat-privado/leer", post(chat_privado_leer))
         .route("/confirmar", post(confirmar))

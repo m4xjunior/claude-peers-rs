@@ -725,10 +725,23 @@ async fn reintentar_registro(estado: &Arc<EstadoCliente>, id_preferido: Option<S
 /// empujados (ventana ~RETENCION_HISTORIAL). Solo confirmamos `Leido` al broker si el flush
 /// del push a stdout tuvo éxito real (`empujar_canal == true`); si falló, NO confirmamos y NO
 /// añadimos al set → se reintenta en el próximo ciclo (entrega durable, no fire-and-forget).
+/// Timestamp ISO-8601 (UTC) para el `enviado_en` del aviso de chat privado. Best-effort: si el
+/// formateo fallara (no debería), cae a una cadena vacía — el campo es cosmético en el aviso.
+fn ahora_iso_aviso() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
     tokio::spawn(async move {
         // Ventana de idempotencia en memoria: ids ya empujados a la sesión.
         let mut empujados: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        // Chat privado (aviso push): conteo de pendientes del ciclo ANTERIOR. Solo emitimos el aviso
+        // neutro cuando el conteo pasa de 0 a >0 (flanco de subida) → un aviso por "llegó algo nuevo",
+        // sin spamear cada segundo mientras el agente aún no lo consumió. Al consumir (baja a 0) se
+        // rearma para el próximo mensaje. RFC-lanzador §7: el aviso NO lleva el contenido.
+        let mut chat_priv_prev: usize = 0;
         let mut intervalo = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             intervalo.tick().await;
@@ -740,6 +753,30 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
             // durable del broker, no se pierden).
             let peer = estado.peer.read().await.clone();
             let Some(peer) = peer else { continue };
+
+            // --- Chat privado: aviso neutro por el <channel> (RFC-lanzador §7, opción push-aviso) ---
+            // Corre SIEMPRE (independiente de si hay mensajes normales). PEEK sin drenar: el drenado
+            // real lo hace el agente vía chat_privado_recibir, para que el contenido llegue a la GPUI.
+            let secreto = estado.secreto.read().await.clone();
+            if let Ok(p) = estado.broker.chat_privado_pendiente(secreto.as_deref()).await {
+                let ahora = p.pendientes;
+                if ahora > 0 && chat_priv_prev == 0 {
+                    // Flanco de subida: avisar UNA vez. Texto fijo NEUTRO, sin el contenido privado.
+                    let aviso = "📩 Tenés un mensaje privado nuevo del operador (canal confidencial). \
+                        Llamá la tool chat_privado_recibir AHORA para leerlo — no esperes.";
+                    let _ = mcp::empujar_canal(
+                        &peer,
+                        aviso,
+                        peers_core::ID_OPERADOR,
+                        "chat privado",
+                        "",
+                        &ahora_iso_aviso(),
+                    )
+                    .await;
+                    info!("aviso de chat privado empujado ({} pendiente/s)", ahora);
+                }
+                chat_priv_prev = ahora;
+            }
 
             let resp = match estado.broker.recibir(&id).await {
                 Ok(r) => r,

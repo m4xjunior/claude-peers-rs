@@ -312,6 +312,14 @@ pub struct RespuestaChatPrivadoRecibir {
     pub mensajes: Vec<MensajeChatPrivado>,
 }
 
+/// Respuesta del PEEK `/chat-privado/pendiente` (RFC-lanzador §7, aviso push): cuántos mensajes
+/// privados hay en la bandeja del peer SIN drenarlos. El client la usa para decidir si emite el
+/// aviso neutro por el <channel>; el contenido nunca viaja aquí (solo el conteo).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RespuestaChatPrivadoPendiente {
+    pub pendientes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeticionSalir {
     pub id: String,

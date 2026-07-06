@@ -167,6 +167,20 @@ impl ClienteBroker {
         }
     }
 
+    /// Chat privado (RFC-lanzador §7, aviso push): PEEK — cuántos mensajes privados hay pendientes
+    /// SIN drenarlos. El bucle de recepción lo consulta para decidir si emite el aviso neutro por el
+    /// <channel>. Anti-IDOR: el broker resuelve el peer por el secreto (body ignorado).
+    pub async fn chat_privado_pendiente(
+        &self,
+        secreto: Option<&str>,
+    ) -> Result<peers_core::RespuestaChatPrivadoPendiente> {
+        let cuerpo = PeticionChatPrivadoRecibir { sesion_id: String::new() };
+        match secreto {
+            Some(s) => self.post_con_secreto("/chat-privado/pendiente", &cuerpo, s).await,
+            None => self.post("/chat-privado/pendiente", &cuerpo).await,
+        }
+    }
+
     /// Chat privado (RFC-lanzador §7): el peer responde al operador (va a su cola de SALIDA). El
     /// broker fija el `de` al id real del peer resuelto por el secreto (anti-IDOR). Sin secreto,
     /// el broker responde ok:false (no se puede atribuir la respuesta).
