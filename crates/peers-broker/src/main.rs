@@ -420,6 +420,7 @@ async fn definir_resumen(
     Json(p): Json<PeticionDefinirResumen>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     e.almacen.definir_resumen(&p.id, &p.resumen).await?;
+    marcar_actividad(&e, &p.id).await; // RFC actividad-real: definir resumen es trabajo del LLM.
     // Bitácora (R4): el nuevo resumen (recortado) como detalle — el historial de resúmenes
     // que hoy se pierde (solo quedaba el último en la instancia).
     registrar_accion(
@@ -619,6 +620,8 @@ async fn enviar(
     e.almacen
         .encolar_mensaje(&p.de_id, &p.para_id, &p.texto, &ahora_iso())
         .await?;
+    // RFC actividad-real: enviar un mensaje ES trabajo del LLM → timbra su actividad.
+    marcar_actividad(&e, &p.de_id).await;
     // Bitácora (R4/R5): el emisor declarado es el actor. Sin el texto del mensaje (vive en el
     // historial de la cola); el sujeto es el destinatario.
     registrar_accion(
@@ -703,6 +706,17 @@ async fn chat_privado_enviar(
     // sea otro: la bitácora registra quién ejecutó la acción, no el remitente declarado.
     info!("chat privado: operador → '{}' (de aparente: '{}', msg #{})", p.sesion_id, de, msg.id);
     Ok(Json(RespuestaOk { ok: true }))
+}
+
+/// Timbra `ultima_actividad_en` del peer `id` (RFC actividad-real). Se llama SOLO desde los handlers
+/// de tools de NEGOCIO (enviar/crear_tarea/cerrar_tarea/definir_resumen/reportar_tarea/avisar_equipo),
+/// NUNCA desde latido/listar (que solo prueban "proceso vivo", no "LLM trabajando" — contarlos haría
+/// que nadie fuese nunca ocioso). Best-effort: un fallo al timbrar NO rompe la operación principal
+/// (se loguea y sigue). Si el id ya no existe, el store hace no-op silencioso.
+async fn marcar_actividad(e: &Estado, id: &str) {
+    if let Err(err) = e.almacen.actualizar_actividad(id, &ahora_iso()).await {
+        warn!("no se pudo timbrar actividad de '{id}' (operación sigue): {err:#}");
+    }
 }
 
 /// Resuelve el id real del llamador desde su secreto de sesión (header `X-Peers-Secreto`). None si
@@ -911,6 +925,7 @@ async fn tarea_abrir(
 ) -> Result<Json<RespuestaAbrirTarea>, ErrorApp> {
     let ahora = ahora_iso();
     let (tarea, issue_number) = abrir_tarea_con_estimado(&e, &p, &ahora).await?;
+    marcar_actividad(&e, &p.instancia_id).await; // RFC actividad-real: abrir tarea es trabajo del LLM.
 
     // Bitácora (R4/R5): la creación se atribuye al peer dueño (abre su propia tarea).
     registrar_accion(
@@ -946,6 +961,7 @@ async fn tarea_reportar(
     // Bitácora (R4/R5): el reporte se atribuye al dueño de la tarea (las tools MCP reportan
     // sobre tareas propias). Refetch barato — ruta fría; degrada si la tarea ya no está.
     if let Some(t) = e.almacen.tarea_obtener(&p.tarea_id).await? {
+        marcar_actividad(&e, &t.instancia_id).await; // RFC actividad-real: reportar progreso es trabajo del LLM.
         registrar_accion(
             &e,
             &t.instancia_id,
@@ -1115,6 +1131,7 @@ async fn tarea_cerrar(
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     let tarea = cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
+    marcar_actividad(&e, &tarea.instancia_id).await; // RFC actividad-real: cerrar tarea es trabajo del LLM.
     // Bitácora (R4/R5/#11): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
     // La evidencia YA llegaba en el payload (`p.evidencia`, persistida en `Tarea.evidencia` desde
     // #7) pero se descartaba aquí — #11 es justamente conectar ese último tramo a la bitácora.
@@ -1147,6 +1164,7 @@ async fn crear_tarea(
 ) -> Result<Json<RespuestaAbrirTarea>, ErrorApp> {
     let ahora = ahora_iso();
     let (tarea, issue_number) = abrir_tarea_con_estimado(&e, &p, &ahora).await?;
+    marcar_actividad(&e, &p.instancia_id).await; // RFC actividad-real: crear tarea es trabajo del LLM.
 
     // Bitácora (R4/R5): la creación se atribuye al peer dueño (tool MCP crear_tarea).
     registrar_accion(
@@ -1190,6 +1208,7 @@ async fn cerrar_tarea(
     Json(p): Json<PeticionCerrarTarea>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     let tarea = cerrar_tarea_y_aprender(&e, &p.tarea_id, p.evidencia.as_deref(), &ahora_iso()).await?;
+    marcar_actividad(&e, &tarea.instancia_id).await; // RFC actividad-real: cerrar tarea es trabajo del LLM.
     // Bitácora (R4/R5/#11): el cierre se atribuye al dueño (las tools MCP cierran tareas propias).
     // La evidencia YA llegaba en el payload (`p.evidencia`, persistida en `Tarea.evidencia` desde
     // #7) pero se descartaba aquí — #11 es justamente conectar ese último tramo a la bitácora.
@@ -1862,11 +1881,23 @@ async fn detectar_ociosos(estado: &Estado, umbral_seg: i64, ahora: &str) -> anyh
             continue;
         }
 
-        // Instante de la última actividad conocida: el inicio más reciente entre las tareas y
-        // las sesiones; si no hay ninguna, su `visto_en` (latido). Es el ancla del "desde".
-        let ultima_actividad = tareas
-            .iter()
-            .map(|t| t.inicio.as_str())
+        // Instante de la última actividad conocida. Se combina (el MÁXIMO / más reciente):
+        //   - `ultima_actividad_en`: timbre de actividad REAL del LLM — lo actualiza el broker en
+        //     cada tool de negocio (enviar/crear_tarea/…), NO en el latido. Es la señal precisa que
+        //     reemplaza la inferencia vieja (RFC actividad-real): un peer que usa tools SIN abrir
+        //     tarea ya NO se marca ocioso falsamente.
+        //   - el inicio más reciente de tareas/sesiones (compat: cubre actividad reflejada en la
+        //     jornada aunque no haya pasado por un handler con actualizar_actividad).
+        //   - `visto_en` (latido) como piso: si no hay NADA más, al menos el proceso vive. Es el
+        //     fallback más débil — un peer solo con latido y sin actividad real SÍ debe poder
+        //     marcarse ocioso, así que `visto_en` va último (el latido no "resetea" el ocioso).
+        // OJO: `visto_en` se incluye como fallback SOLO si los otros están vacíos, no en el max —
+        // si el latido entrara al max, el pulso de 15s haría que nadie sea nunca ocioso (el bug que
+        // el diseño del middleware habría tenido). Por eso el max es sobre actividad REAL, y
+        // `visto_en` es el `unwrap_or` (solo cuando no hay ninguna actividad real registrada).
+        let ultima_actividad = std::iter::once(inst.ultima_actividad_en.as_str())
+            .filter(|s| !s.is_empty())
+            .chain(tareas.iter().map(|t| t.inicio.as_str()))
             .chain(sesiones.iter().map(|s| s.inicio.as_str()))
             .max()
             .unwrap_or(inst.visto_en.as_str());
