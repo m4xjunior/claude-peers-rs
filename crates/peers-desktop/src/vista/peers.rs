@@ -452,7 +452,15 @@ fn barra_acciones(inst: &Instancia, indice: usize) -> impl IntoElement {
 /// Render de la pantalla Peers. Consume `instancias` y `alertas` ya cargadas por la app, más la
 /// selección (`peers_seleccion`, campo NUEVO que Fase 3 añade a `EstadoPantalla`).
 pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
-    let total = datos.instancias.len();
+    // R11: filtro por proyecto activo (aislamiento por convención de id). Se conserva el ÍNDICE REAL
+    // de cada instancia (posición en `datos.instancias`) en la fila pintada, así las acciones que
+    // viajan con `indice` siguen apuntando a la lista completa — sin traducción, sin bug índice-real.
+    let activo = datos.proyecto_activo.as_deref();
+    let total = datos
+        .instancias
+        .iter()
+        .filter(|i| crate::vista::proyectos::id_del_proyecto_activo(&i.id, activo))
+        .count();
 
     // Raíz: fondo/tipografía heredados del contenedor raíz de la app; aquí sólo el espaciado y la
     // cabecera. Se compone dentro del `fondo_app` del `AppDesktop`, así que no repite `.bg(TINTA)`.
@@ -501,10 +509,13 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
     let seleccion = datos.peers_seleccion;
 
     // Filas seleccionables: cada una deriva su estado de las alertas cacheadas (cruce sujeto == id).
+    // R11: se PINTAN solo las del proyecto activo, pero conservando `idx` REAL (posición en
+    // `datos.instancias`) — así `SeleccionarPeer{indice}` y la barra de acciones siguen correctos.
     let filas = datos
         .instancias
         .iter()
         .enumerate()
+        .filter(|(_, inst)| crate::vista::proyectos::id_del_proyecto_activo(&inst.id, activo))
         .map(|(idx, inst)| {
             let estado = estado_peer(&inst.id, &datos.alertas);
             let activa = seleccion == Some(idx);
@@ -522,10 +533,13 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
 
     raiz = raiz.child(tabla);
 
-    // Barra de acciones del peer marcado (si la selección apunta a una fila válida).
+    // Barra de acciones del peer marcado (si la selección apunta a una fila válida Y VISIBLE bajo el
+    // filtro de proyecto activo — un peer seleccionado que el filtro oculta no muestra su barra).
     if let Some(idx) = seleccion {
         if let Some(inst) = datos.instancias.get(idx) {
-            raiz = raiz.child(barra_acciones(inst, idx));
+            if crate::vista::proyectos::id_del_proyecto_activo(&inst.id, activo) {
+                raiz = raiz.child(barra_acciones(inst, idx));
+            }
         }
     }
 

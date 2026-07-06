@@ -346,7 +346,12 @@ const COL_REAL: f32 = 84.0;
 /// de acciones sobre la tarea seleccionada. Lee `datos.tareas` y `datos.tareas_seleccion`.
 pub fn render_tareas(datos: &EstadoPantalla) -> impl IntoElement {
     let tareas = datos.tareas.as_slice();
-    let total = tareas.len();
+    // R11: filtro por proyecto activo (por el sufijo @proyecto del id dueño de cada tarea).
+    let activo = datos.proyecto_activo.as_deref();
+    let total = tareas
+        .iter()
+        .filter(|t| crate::vista::proyectos::id_del_proyecto_activo(&t.instancia_id, activo))
+        .count();
 
     // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll` de
     // app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla.
@@ -360,20 +365,24 @@ pub fn render_tareas(datos: &EstadoPantalla) -> impl IntoElement {
         raiz = raiz.child(banner_error(&err.to_string()));
     }
 
-    if tareas.is_empty() {
-        // Sin tareas: mensaje guía dentro de una card, no una tabla muda.
+    if total == 0 {
+        // Sin tareas visibles (ninguna o todas filtradas por el proyecto activo): mensaje guía.
         raiz = raiz.child(estado_vacio());
         return raiz;
     }
 
-    // Selección acotada al rango actual (defensivo: la lista pudo encoger tras recargar).
-    let seleccion = datos.tareas_seleccion.min(total.saturating_sub(1));
+    // Selección acotada a la longitud REAL de `datos.tareas` (NO al total filtrado): `seleccion` es
+    // un índice sobre la lista completa, que la tabla/barra usan tal cual (patrón idx-real de R11).
+    let seleccion = datos.tareas_seleccion.min(tareas.len().saturating_sub(1));
 
-    raiz = raiz.child(tabla(tareas, seleccion));
+    raiz = raiz.child(tabla(tareas, seleccion, activo));
 
-    // Barra de acciones sobre la tarea seleccionada (bajo la tabla, siempre visible si hay tareas).
+    // Barra de acciones sobre la tarea seleccionada (si es válida Y VISIBLE bajo el filtro: una
+    // tarea seleccionada que el filtro de proyecto oculta no muestra su barra).
     if let Some(t) = tareas.get(seleccion) {
-        raiz = raiz.child(barra_acciones(t, seleccion));
+        if crate::vista::proyectos::id_del_proyecto_activo(&t.instancia_id, activo) {
+            raiz = raiz.child(barra_acciones(t, seleccion));
+        }
     }
 
     raiz
@@ -433,10 +442,13 @@ fn estado_vacio() -> AnyElement {
 
 /// Tabla completa: encabezado de columnas (eyebrows) + filas seleccionables scrollables, todo
 /// dentro de una superficie card.
-fn tabla(tareas: &[Tarea], seleccion: usize) -> AnyElement {
+fn tabla(tareas: &[Tarea], seleccion: usize, activo: Option<&str>) -> AnyElement {
+    // R11: se pintan solo las tareas del proyecto activo (por el sufijo @proyecto del id dueño),
+    // conservando el `idx` REAL en `datos.tareas` — así `SeleccionarTarea{indice}` sigue correcto.
     let filas = tareas
         .iter()
         .enumerate()
+        .filter(|(_, t)| crate::vista::proyectos::id_del_proyecto_activo(&t.instancia_id, activo))
         .map(|(idx, t)| fila_tarea(idx, t, idx == seleccion))
         .collect::<Vec<_>>();
 

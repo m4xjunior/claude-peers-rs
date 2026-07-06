@@ -498,6 +498,9 @@ impl AppDesktop {
             Pantalla::Redis => self.cargar_redis(cx),
             Pantalla::Tareas => self.cargar_tareas(cx),
             Pantalla::Trazabilidad => self.cargar_trazabilidad(cx),
+            // Jornada muestra la jornada de UN peer ya elegido (jornada_peer); NO aplica el filtro
+            // de proyecto activo por sí misma (R11) — hereda del peer, que ya se elige desde Peers
+            // (que sí filtra). Filtrarla de nuevo no tendría sujeto sobre qué actuar.
             Pantalla::Jornada => self.cargar_jornada(cx),
             // Chat privado: refresca el roster (para el selector) y drena la salida del peer activo.
             Pantalla::ChatPrivado => {
@@ -819,19 +822,21 @@ impl AppDesktop {
         crate::vista::alertas::indice_real(
             &self.datos.alertas,
             &self.datos.alertas_filtro_tipos,
+            self.datos.proyecto_activo.as_deref(),
             indice_visible,
         )
     }
 
-    /// Acota `alertas_seleccion` al número de alertas VISIBLES (post-filtro), saturando al último.
-    /// El cursor de selección se indexa sobre la lista visible (igual que las filas pintadas).
+    /// Acota `alertas_seleccion` al número de alertas VISIBLES (post-filtro de tipo + proyecto),
+    /// saturando al último. El cursor se indexa sobre la lista visible (igual que las filas).
     fn acotar_seleccion_alertas_visibles(&mut self) {
-        use crate::vista::alertas::pasa_filtro;
+        use crate::vista::alertas::pasa_filtros;
+        let activo = self.datos.proyecto_activo.as_deref();
         let visibles = self
             .datos
             .alertas
             .iter()
-            .filter(|a| pasa_filtro(a, &self.datos.alertas_filtro_tipos))
+            .filter(|a| pasa_filtros(a, &self.datos.alertas_filtro_tipos, activo))
             .count();
         if visibles == 0 {
             self.datos.alertas_seleccion = 0;
@@ -1647,6 +1652,19 @@ impl AppDesktop {
     fn fijar_proyecto_activo(&mut self, id: String, cx: &mut Context<Self>) {
         self.datos.proyecto_activo = if id.trim().is_empty() { None } else { Some(id) };
         cx.notify();
+    }
+
+    /// Lanzar un agente del proyecto (R9): precarga el Lanzador con el id `rol@proyecto` + la ruta
+    /// del proyecto y navega a la pantalla Lanzador. Max dispara el lanzamiento allí (reusa el
+    /// mecanismo E-05 que ya inyecta CLAUDE_PEERS_ID). Si el panel no está construido, solo navega.
+    fn lanzar_agente(&mut self, id_agente: String, ruta: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = self.datos.panel_lanzador.clone() {
+            let dir = if ruta.trim().is_empty() { None } else { Some(ruta) };
+            panel.update(cx, |p, cx| {
+                p.precargar_desde_proyecto(&id_agente, dir, window, cx);
+            });
+        }
+        self.ir_a(Pantalla::Lanzador, cx);
     }
 
     /// Confirma el formulario de Peers activo: valida la frontera y dispara el POST vía
@@ -2907,12 +2925,13 @@ impl AppDesktop {
                 // `acotar_seleccion_alertas_visibles`), NO sobre `datos.alertas` completo. Clampar
                 // contra el TOTAL permitía que ↑/↓ moviera la selección más allá de las filas
                 // realmente pintadas cuando había un filtro de tipo activo (alertas-03).
-                use crate::vista::alertas::pasa_filtro;
+                use crate::vista::alertas::pasa_filtros;
+                let activo = self.datos.proyecto_activo.as_deref();
                 let visibles = self
                     .datos
                     .alertas
                     .iter()
-                    .filter(|a| pasa_filtro(a, &self.datos.alertas_filtro_tipos))
+                    .filter(|a| pasa_filtros(a, &self.datos.alertas_filtro_tipos, activo))
                     .count();
                 self.datos.alertas_seleccion = mover(self.datos.alertas_seleccion, delta, visibles);
             }
@@ -3829,6 +3848,7 @@ impl Render for AppDesktop {
             AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, ArchivarProyecto,
             CambiarFichaTab, CerrarFichaProyecto, CerrarFormProyecto, ConfirmarFormProyecto,
             DuplicarProyecto, ElegirCarpetaProyecto, ElegirTipoUbicacion, FijarProyectoActivo,
+            LanzarAgente,
         };
         use crate::vista::peers::{
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
@@ -3945,6 +3965,9 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, a: &FijarProyectoActivo, _window, cx| {
                 esta.fijar_proyecto_activo(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, a: &LanzarAgente, window, cx| {
+                esta.lanzar_agente(a.id_agente.clone(), a.ruta.clone(), window, cx);
             }))
             // --- Peers: detalle + composer + kick (peers-01/02/03) ---
             .on_action(cx.listener(|esta, a: &AbrirDetallePeer, _window, cx| {

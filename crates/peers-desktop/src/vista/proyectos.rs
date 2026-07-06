@@ -144,6 +144,34 @@ pub struct FijarProyectoActivo {
     pub id: String,
 }
 
+/// Lanza un agente del proyecto (R9): navega al Lanzador con `id_agente` (rol@proyecto) y la ruta
+/// del proyecto precargados. AppDesktop hace la navegación + precarga; Max dispara el lanzamiento.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct LanzarAgente {
+    pub id_agente: String,
+    /// Ruta local del proyecto (para precargar el dir del Lanzador). Vacío si la ubicación no es local.
+    pub ruta: String,
+}
+
+// --- Filtrado por proyecto activo (R11). PUROS y reutilizables por Peers/Tareas/Jornada/Alertas. ---
+
+/// ¿El id `id` pertenece al proyecto activo? (R11, aislamiento por convención de id). Con
+/// `activo = None` ("todos") SIEMPRE pasa. Con `Some(proyecto)`, pasa si el id termina en
+/// `@<proyecto>` — la convención `rol@proyecto`. Un id sin `@` NO pertenece a ningún proyecto.
+#[must_use]
+pub fn id_del_proyecto_activo(id: &str, activo: Option<&str>) -> bool {
+    match activo {
+        None => true,
+        Some(p) => id.ends_with(&format!("@{p}")),
+    }
+}
+
+// NOTA de diseño (R11): Peers/Tareas/Alertas NO traducen índice visible→real, sino que PINTAN solo
+// las filas del proyecto activo CONSERVANDO su índice REAL en la lista completa (el `idx` que viaja
+// en las acciones sigue apuntando a `datos.X`). Así se evita el patrón de traducción y su clase de
+// bugs. Alertas ya tenía un `indice_real` (por el filtro de tipo) que ahora AND-ea el de proyecto.
+
 // --- Render ---
 
 /// Render de la pantalla. Si hay un proyecto abierto → su ficha; si no → el grid + CRUD.
@@ -356,6 +384,18 @@ fn ficha(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
         .child(ficha_cabecera(p))
         .child(barra_tabs(datos.proyecto_ficha_tab))
         .child(seccion_activa(datos, p))
+        // R12 (aislar proyecto) — DIFERIDO a v2 (decisión de Max): el hard-block cross-proyecto
+        // necesita extender el motor de política del broker con un patrón por `@proyecto` (hoy el
+        // `Patron` solo hace match exacto o `*`), que es backend. En v1 el aislamiento es por
+        // convención de id (el filtro de proyecto activo de esta pantalla). Se documenta aquí para
+        // que se vea que fue una decisión, no un olvido.
+        .child(
+            tema::texto_terciario(
+                "Aislamiento estricto (bloquear comunicación cross-proyecto): v2 — hoy el proyecto \
+                 se aísla por convención de id + el filtro de proyecto activo.",
+            )
+            .text_color(tema::HUMO),
+        )
 }
 
 /// Cabecera de la ficha: botón volver + nombre BRASA + ubicación mono.
@@ -424,6 +464,12 @@ fn seccion_activa(datos: &EstadoPantalla, p: &Proyecto) -> gpui::AnyElement {
 
 /// Equipo: los agentes del proyecto con su estado vivo (cruzando `instancias`).
 fn seccion_equipo(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
+    use crate::config::Ubicacion;
+    // Ruta local del proyecto (para precargar el dir del Lanzador). Solo si la ubicación es Local.
+    let ruta_local = match &p.ubicacion {
+        Ubicacion::Local { ruta } => ruta.clone(),
+        _ => String::new(),
+    };
     let mut cont = tema::superficie_card().v_flex().gap_2().p_4();
     if p.agentes.is_empty() {
         return cont.child(tema::texto_terciario(
@@ -437,6 +483,8 @@ fn seccion_equipo(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
         } else {
             ("caído", tema::HUMO)
         };
+        let id_owned = id.clone();
+        let ruta = ruta_local.clone();
         cont = cont.child(
             div()
                 .h_flex()
@@ -448,7 +496,17 @@ fn seccion_equipo(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
                         .text_color(tema::PAPEL)
                         .child(SharedString::from(id.clone())),
                 )
-                .child(tema::chip_estado(texto_estado, color)),
+                .child(tema::chip_estado(texto_estado, color))
+                // "Lanzar" (R9): navega al Lanzador con este id (rol@proyecto) + la ruta precargados.
+                .child(
+                    tema::boton_secundario(format!("lanzar-{id}"), "Lanzar")
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(LanzarAgente { id_agente: id_owned.clone(), ruta: ruta.clone() }),
+                                cx,
+                            )
+                        }),
+                ),
         );
     }
     cont
@@ -653,4 +711,20 @@ mod tests {
         let t: Vec<_> = FichaProyectoTab::TODAS.iter().map(|x| x.titulo()).collect();
         assert_eq!(t, vec!["Equipo", "Tablero", "Actividad", "Alertas"]);
     }
+
+    /// El filtro por proyecto activo (R11) matchea por el sufijo `@proyecto` del id; `None` = todos.
+    #[test]
+    fn filtro_por_proyecto_activo() {
+        // Sin filtro: todo pasa.
+        assert!(id_del_proyecto_activo("backend@web", None));
+        assert!(id_del_proyecto_activo("cualquier-id", None));
+        // Con filtro: solo los del proyecto.
+        assert!(id_del_proyecto_activo("backend@web", Some("web")));
+        assert!(id_del_proyecto_activo("qa@web", Some("web")));
+        assert!(!id_del_proyecto_activo("backend@otro", Some("web")));
+        assert!(!id_del_proyecto_activo("sin-sufijo", Some("web")));
+        // Cuidado con prefijos: "web" no debe matchear "@webapp".
+        assert!(!id_del_proyecto_activo("rol@webapp", Some("web")));
+    }
+
 }

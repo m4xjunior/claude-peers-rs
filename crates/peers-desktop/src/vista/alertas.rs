@@ -276,6 +276,13 @@ pub(crate) fn pasa_filtro(a: &Alerta, filtro: &[String]) -> bool {
     filtro.is_empty() || filtro.iter().any(|t| tipo_serializado(a.tipo) == t)
 }
 
+/// Filtro COMBINADO (R11): la alerta pasa si pasa el filtro de tipo Y pertenece al proyecto activo
+/// (su `sujeto` termina en `@<proyecto>`, o `activo=None` = todos). Es el predicado que usan render
+/// e `indice_real` para que el filtro de proyecto y el de tipo se apliquen juntos, coherentes.
+pub(crate) fn pasa_filtros(a: &Alerta, filtro: &[String], activo: Option<&str>) -> bool {
+    pasa_filtro(a, filtro) && crate::vista::proyectos::id_del_proyecto_activo(&a.sujeto, activo)
+}
+
 /// Traduce un índice de la lista VISIBLE (post-filtro) al índice REAL en `alertas`. Función PURA
 /// (sin `cx`/`AppDesktop`) para que sea testeable sin el aparato de GPUI — extraída del método
 /// `AppDesktop::indice_real_alerta` (que delega aquí) porque toda la lógica sólo depende de la
@@ -285,11 +292,16 @@ pub(crate) fn pasa_filtro(a: &Alerta, filtro: &[String]) -> bool {
 /// ESTA función es la que corrige el bug real de alertas-14: `alertas_seleccion`/las acciones de
 /// fila viajan en coordenadas VISIBLES; leer `alertas[indice_visible]` directo (sin pasar por
 /// aquí) opera sobre la alerta equivocada en cuanto hay un filtro de tipo activo.
-pub(crate) fn indice_real(alertas: &[Alerta], filtro: &[String], indice_visible: usize) -> Option<usize> {
+pub(crate) fn indice_real(
+    alertas: &[Alerta],
+    filtro: &[String],
+    activo: Option<&str>,
+    indice_visible: usize,
+) -> Option<usize> {
     alertas
         .iter()
         .enumerate()
-        .filter(|(_, a)| pasa_filtro(a, filtro))
+        .filter(|(_, a)| pasa_filtros(a, filtro, activo))
         .nth(indice_visible)
         .map(|(idx_real, _)| idx_real)
 }
@@ -316,13 +328,15 @@ const ERROR_TEXTO: u32 = 0xF1_A8_A8;
 /// (alertas-03), banner de error (si hubo) y tabla de alertas VISIBLES (tras filtrar). El DETALLE
 /// ya NO se pinta aquí: vive en un `Modal` montado por `AppDesktop` (alertas-01).
 pub fn render_alertas(datos: &EstadoPantalla) -> impl IntoElement {
-    // Alertas visibles tras aplicar el filtro por tipo. Se materializa aquí (índices estables para
-    // el pintado); `AppDesktop` reconstruye el mismo filtrado para resolver el índice real al clicar.
+    // Alertas visibles tras aplicar el filtro por tipo Y por proyecto activo (R11). Se materializa
+    // aquí con el ÍNDICE REAL preservado (par `(idx_real, &Alerta)`); `AppDesktop` reconstruye el
+    // mismo filtrado combinado (`pasa_filtros`) para resolver el índice real al clicar.
+    let activo = datos.proyecto_activo.as_deref();
     let visibles: Vec<(usize, &Alerta)> = datos
         .alertas
         .iter()
         .enumerate()
-        .filter(|(_, a)| pasa_filtro(a, &datos.alertas_filtro_tipos))
+        .filter(|(_, a)| pasa_filtros(a, &datos.alertas_filtro_tipos, activo))
         .collect();
     let total = datos.alertas.len();
     let mostradas = visibles.len();
@@ -923,8 +937,8 @@ mod tests {
     #[test]
     fn sin_filtro_indice_visible_es_igual_al_real() {
         let alertas = alertas_mixtas();
-        assert_eq!(indice_real(&alertas, &[], 0), Some(0));
-        assert_eq!(indice_real(&alertas, &[], 3), Some(3));
+        assert_eq!(indice_real(&alertas, &[], None, 0), Some(0));
+        assert_eq!(indice_real(&alertas, &[], None, 3), Some(3));
     }
 
     /// Reproduce el bug real (alertas-14): con el filtro "sólo ghosteo" activo, la tabla pinta
@@ -939,11 +953,11 @@ mod tests {
         let filtro = vec![tipo_serializado(TipoAlerta::Ghosteo).to_string()];
 
         // Fila visible 0 → real 1 (sujeto "b"), NO real 0.
-        let real_0 = indice_real(&alertas, &filtro, 0).expect("visible 0 existe");
+        let real_0 = indice_real(&alertas, &filtro, None, 0).expect("visible 0 existe");
         assert_eq!(alertas[real_0].sujeto, "b");
 
         // Fila visible 1 → real 3 (sujeto "d"), NO real 1 ("b", el bug habría descartado esta).
-        let real_1 = indice_real(&alertas, &filtro, 1).expect("visible 1 existe");
+        let real_1 = indice_real(&alertas, &filtro, None, 1).expect("visible 1 existe");
         assert_eq!(alertas[real_1].sujeto, "d");
         assert_ne!(
             alertas[real_1].sujeto,
@@ -957,7 +971,7 @@ mod tests {
         let alertas = alertas_mixtas();
         let filtro = vec![tipo_serializado(TipoAlerta::Ghosteo).to_string()];
         // Sólo hay 2 alertas visibles (índices 0 y 1); pedir la 3ª visible no debe apuntar a nada.
-        assert_eq!(indice_real(&alertas, &filtro, 2), None);
+        assert_eq!(indice_real(&alertas, &filtro, None, 2), None);
     }
 
     #[test]

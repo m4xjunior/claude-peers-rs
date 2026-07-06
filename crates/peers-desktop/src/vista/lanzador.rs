@@ -516,6 +516,28 @@ impl PanelLanzador {
         cx.notify();
     }
 
+    /// Precarga el panel desde un proyecto (RFC-proyectos R9 "Lanzar equipo"): fija el id de agente
+    /// (`rol@proyecto`, se inyecta como CLAUDE_PEERS_ID al lanzar) y el directorio de trabajo. Lo
+    /// llama `AppDesktop` al navegar aquí desde la ficha de un proyecto, con un agente elegido. El
+    /// destino SSH/tmux del proyecto NO se precarga en v1 (el panel arranca en Local; Max ajusta).
+    pub fn precargar_desde_proyecto(
+        &mut self,
+        id_agente: &str,
+        dir: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.id_agente.update(cx, |s, cx| s.set_value(id_agente.to_string(), window, cx));
+        if let Some(d) = dir {
+            self.dir = Some(PathBuf::from(&d));
+            // Registra el dir en recientes también (coherente con elegir por picker).
+            if self.lanzador_cfg.registrar_reciente(d) {
+                self.persistir_lanzador();
+            }
+        }
+        cx.notify();
+    }
+
     /// Elige un directorio de la lista de recientes (R1.2) sin reabrir el picker. Lo sube al frente.
     fn elegir_reciente(&mut self, ruta: String, cx: &mut Context<Self>) {
         self.dir = Some(PathBuf::from(&ruta));
