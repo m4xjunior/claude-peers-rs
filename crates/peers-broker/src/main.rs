@@ -642,6 +642,106 @@ async fn recibir(
     Ok(Json(peers_core::RespuestaRecibir { mensajes }))
 }
 
+/// `POST /chat-privado/enviar` (RFC-lanzador §7): el operador manda un mensaje privado a un peer.
+/// El `de` NO viene del payload — el broker lo FIJA a `ID_OPERADOR` (decisión de Max: el canal es
+/// dueño→peer por definición, un `de` libre sería suplantable y sin sentido). Bajo token.
+async fn chat_privado_enviar(
+    State(e): State<Estado>,
+    Json(p): Json<peers_core::PeticionChatPrivadoEnviar>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    use peers_core::DireccionChatPrivado;
+    // Operador→peer: encola en la cola de ENTRADA del peer (la que el peer drena). `de`=operador
+    // (lo fija el broker). Este endpoint es del PANEL del operador → basta el token como autoridad.
+    let msg = e
+        .almacen
+        .chat_privado_encolar(&p.sesion_id, DireccionChatPrivado::Entrada, ID_OPERADOR, &p.texto, &ahora_iso())
+        .await?;
+    // Bitácora (observabilidad): el operador escribió al peer por el canal privado. El texto NO se
+    // registra (es confidencial); solo el destino y un marcador. Best-effort, como el resto.
+    registrar_accion(
+        &e,
+        ID_OPERADOR,
+        TipoAccion::EnviarMensaje,
+        Some(p.sesion_id.clone()),
+        Some("chat privado".to_string()),
+        None,
+        None,
+    )
+    .await;
+    info!("chat privado: operador → '{}' (msg #{})", p.sesion_id, msg.id);
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+/// Resuelve el id real del llamador desde su secreto de sesión (header `X-Peers-Secreto`). None si
+/// no hay secreto o no resuelve a una instancia. Helper del chat privado (anti-IDOR): los endpoints
+/// que un PEER usa NUNCA confían en un id del body — el sujeto es siempre la identidad verificada.
+async fn id_del_llamador(e: &Estado, headers: &axum::http::HeaderMap) -> anyhow::Result<Option<String>> {
+    let presentado = headers
+        .get(peers_core::HEADER_SECRETO)
+        .and_then(|v| v.to_str().ok());
+    match presentado {
+        Some(s) => e.almacen.id_por_secreto(s).await,
+        None => Ok(None),
+    }
+}
+
+/// `POST /chat-privado/recibir` (RFC-lanzador §7): el peer TIRA (pull) de su cola de ENTRADA. v1:
+/// drena (pop) todo lo pendiente — entrega única, sin re-entrega ni estados. Bajo token.
+///
+/// ANTI-IDOR (SEGURIDAD, obligatorio aquí): el contenido del chat privado es CONFIDENCIAL, así que
+/// NO se confía en el `sesion_id` del payload — se resuelve el id REAL del llamador desde su secreto
+/// de sesión y se drena ESA cola. Un peer solo puede leer SU propia entrada. A diferencia de
+/// `/enviar` (que respeta un flag global y un modo compat laxo), verifica SIEMPRE: sin secreto que
+/// resuelva a una instancia, no drena nada — leer la cola de otro es fuga de datos, no spoofing.
+async fn chat_privado_recibir(
+    State(e): State<Estado>,
+    headers: axum::http::HeaderMap,
+    Json(_p): Json<peers_core::PeticionChatPrivadoRecibir>,
+) -> Result<Json<peers_core::RespuestaChatPrivadoRecibir>, ErrorApp> {
+    use peers_core::DireccionChatPrivado;
+    // El `sesion_id` del body se IGNORA a propósito (permitir declararlo sería el IDOR).
+    let Some(sesion_id) = id_del_llamador(&e, &headers).await? else {
+        warn!("chat-privado/recibir RECHAZADO: sin secreto de sesión válido (anti-IDOR)");
+        return Ok(Json(peers_core::RespuestaChatPrivadoRecibir { mensajes: vec![] }));
+    };
+    let mensajes = e.almacen.chat_privado_drenar(&sesion_id, DireccionChatPrivado::Entrada).await?;
+    Ok(Json(peers_core::RespuestaChatPrivadoRecibir { mensajes }))
+}
+
+/// `POST /chat-privado/responder` (RFC-lanzador §7): el peer responde al operador. Encola en la cola
+/// de SALIDA del peer (la que el panel del operador drena). El `de` es el id REAL del peer, resuelto
+/// por su secreto (anti-IDOR: el body no puede declarar quién responde). El `sesion_id` del body se
+/// ignora — el peer responde en SU propia cola de salida. Sin secreto válido → rechazo (ok:false).
+async fn chat_privado_responder(
+    State(e): State<Estado>,
+    headers: axum::http::HeaderMap,
+    Json(p): Json<peers_core::PeticionChatPrivadoEnviar>,
+) -> Result<Json<RespuestaOk>, ErrorApp> {
+    use peers_core::DireccionChatPrivado;
+    let Some(peer_id) = id_del_llamador(&e, &headers).await? else {
+        warn!("chat-privado/responder RECHAZADO: sin secreto de sesión válido (anti-IDOR)");
+        return Ok(Json(RespuestaOk { ok: false }));
+    };
+    let msg = e
+        .almacen
+        .chat_privado_encolar(&peer_id, DireccionChatPrivado::Salida, &peer_id, &p.texto, &ahora_iso())
+        .await?;
+    info!("chat privado: '{}' → operador (msg #{})", peer_id, msg.id);
+    Ok(Json(RespuestaOk { ok: true }))
+}
+
+/// `POST /chat-privado/leer` (RFC-lanzador §7): el PANEL del operador drena la cola de SALIDA de un
+/// peer (sus respuestas). El `sesion_id` (qué peer leer) SÍ viene del body: es el operador eligiendo,
+/// y su autoridad es el token (este endpoint es de panel, no de peer). Drena y borra (entrega única).
+async fn chat_privado_leer(
+    State(e): State<Estado>,
+    Json(p): Json<peers_core::PeticionChatPrivadoRecibir>,
+) -> Result<Json<peers_core::RespuestaChatPrivadoRecibir>, ErrorApp> {
+    use peers_core::DireccionChatPrivado;
+    let mensajes = e.almacen.chat_privado_drenar(&p.sesion_id, DireccionChatPrivado::Salida).await?;
+    Ok(Json(peers_core::RespuestaChatPrivadoRecibir { mensajes }))
+}
+
 async fn salir(
     State(e): State<Estado>,
     Json(p): Json<PeticionSalir>,
@@ -1970,6 +2070,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/listar", post(listar))
         .route("/enviar", post(enviar))
         .route("/recibir", post(recibir))
+        // Chat privado dueño↔peer (RFC-lanzador §7): canal paralelo al <channel>, pull. Dos colas
+        // por peer: enviar/leer las usa el operador (panel); recibir/responder las usa el peer.
+        .route("/chat-privado/enviar", post(chat_privado_enviar))
+        .route("/chat-privado/recibir", post(chat_privado_recibir))
+        .route("/chat-privado/responder", post(chat_privado_responder))
+        .route("/chat-privado/leer", post(chat_privado_leer))
         .route("/confirmar", post(confirmar))
         .route("/salir", post(salir))
         .route("/tarea/abrir", post(tarea_abrir))

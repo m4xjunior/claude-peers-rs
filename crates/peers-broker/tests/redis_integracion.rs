@@ -492,3 +492,38 @@ async fn redis_secreto_resuelve_emisor_y_rota() {
 
     limpiar(&alm, &["it-sec"]).await;
 }
+
+/// Chat privado (RFC-lanzador §7): las dos colas por peer (Entrada/Salida) son INDEPENDIENTES,
+/// se drenan por separado y la entrega es única (drenar borra). Guardarraíl de que el operador y
+/// el peer no se pisan las lecturas.
+#[tokio::test]
+async fn redis_chat_privado_dos_colas_independientes() {
+    use peers_core::DireccionChatPrivado::{Entrada, Salida};
+    let Some(alm) = almacen_o_saltar().await else {
+        eprintln!("SALTADO: no hay Redis disponible");
+        return;
+    };
+    // Limpieza previa de las claves del test (por si quedó de una corrida anterior).
+    for dir in [Entrada, Salida] {
+        let _ = alm.chat_privado_drenar("it-cp", dir).await;
+    }
+
+    // Operador → peer (Entrada) y peer → operador (Salida): dos mensajes en colas distintas.
+    alm.chat_privado_encolar("it-cp", Entrada, "operador", "orden confidencial", "2026-07-06T00:00:00Z").await.unwrap();
+    alm.chat_privado_encolar("it-cp", Salida, "it-cp", "respuesta del peer", "2026-07-06T00:00:01Z").await.unwrap();
+
+    // Drenar Entrada devuelve SOLO el del operador; no toca la Salida.
+    let entrada = alm.chat_privado_drenar("it-cp", Entrada).await.unwrap();
+    assert_eq!(entrada.len(), 1);
+    assert_eq!(entrada[0].de, "operador");
+    assert_eq!(entrada[0].texto, "orden confidencial");
+
+    // La Salida sigue intacta tras drenar la Entrada (colas independientes).
+    let salida = alm.chat_privado_drenar("it-cp", Salida).await.unwrap();
+    assert_eq!(salida.len(), 1);
+    assert_eq!(salida[0].de, "it-cp");
+
+    // Entrega única: un segundo drenar de cualquiera devuelve vacío.
+    assert!(alm.chat_privado_drenar("it-cp", Entrada).await.unwrap().is_empty());
+    assert!(alm.chat_privado_drenar("it-cp", Salida).await.unwrap().is_empty());
+}

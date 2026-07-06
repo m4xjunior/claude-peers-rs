@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use peers_core::{
     aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, BloqueoComunicacion,
-    EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Politica,
-    Sesion, Tarea, TipoAlerta, MAX_ALERTAS, MAX_BLOQUEOS,
+    DireccionChatPrivado, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox,
+    Mensaje, MensajeChatPrivado, Politica, Sesion, Tarea, TipoAlerta, MAX_ALERTAS, MAX_BLOQUEOS,
 };
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
@@ -208,6 +208,15 @@ impl AlmacenSqlite {
                 de_id TEXT NOT NULL, para_id TEXT NOT NULL,
                 motivo TEXT NOT NULL, cuando TEXT NOT NULL
             );
+            -- Chat privado dueño↔peer (RFC-lanzador §7). v1 SIMPLE: cola drenar-al-recibir. La fila
+            -- se BORRA al drenar (entrega única, sin estados). `sesion_id` = id del peer. `direccion`
+            -- discrimina las dos colas por peer: 'in' (operador→peer) y 'out' (peer→operador).
+            CREATE TABLE IF NOT EXISTS chat_privado (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sesion_id TEXT NOT NULL, direccion TEXT NOT NULL DEFAULT 'in', de TEXT NOT NULL,
+                texto TEXT NOT NULL, enviado_en TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_privado_sesion ON chat_privado(sesion_id, direccion, id);
             "#,
         )?;
         // Migración para bases YA existentes (R10/AC6): `CREATE TABLE IF NOT EXISTS` no añade
@@ -443,6 +452,58 @@ impl Almacen for AlmacenSqlite {
         let mut stmt = conexion.prepare(&sql)?;
         let filas = stmt.query_map(params![id], fila_a_mensaje)?;
         Ok(filas.filter_map(Result::ok).collect())
+    }
+
+    async fn chat_privado_encolar(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+        de: &str,
+        texto: &str,
+        ahora: &str,
+    ) -> anyhow::Result<MensajeChatPrivado> {
+        let conexion = self.bloquear();
+        conexion.execute(
+            "INSERT INTO chat_privado (sesion_id, direccion, de, texto, enviado_en) VALUES (?1,?2,?3,?4,?5)",
+            params![sesion_id, direccion.sufijo(), de, texto, ahora],
+        )?;
+        // El id lo asigna AUTOINCREMENT: lo recuperamos para devolver el mensaje completo.
+        let id = conexion.last_insert_rowid();
+        Ok(MensajeChatPrivado {
+            id,
+            de: de.to_string(),
+            texto: texto.to_string(),
+            enviado_en: ahora.to_string(),
+        })
+    }
+
+    async fn chat_privado_drenar(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+    ) -> anyhow::Result<Vec<MensajeChatPrivado>> {
+        let conexion = self.bloquear();
+        // Lee todo lo pendiente de ESA dirección ordenado por id, luego BORRA (entrega única, v1).
+        // El lock del Mutex serializa lectura+borrado: sin ventana para que un drenar concurrente duplique.
+        let mut stmt = conexion.prepare(
+            "SELECT id, de, texto, enviado_en FROM chat_privado WHERE sesion_id=?1 AND direccion=?2 ORDER BY id ASC",
+        )?;
+        let filas = stmt.query_map(params![sesion_id, direccion.sufijo()], |f| {
+            Ok(MensajeChatPrivado {
+                id: f.get(0)?,
+                de: f.get(1)?,
+                texto: f.get(2)?,
+                enviado_en: f.get(3)?,
+            })
+        })?;
+        let msgs: Vec<MensajeChatPrivado> = filas.filter_map(Result::ok).collect();
+        if !msgs.is_empty() {
+            conexion.execute(
+                "DELETE FROM chat_privado WHERE sesion_id=?1 AND direccion=?2",
+                params![sesion_id, direccion.sufijo()],
+            )?;
+        }
+        Ok(msgs)
     }
 
     async fn transicionar_mensaje(
@@ -1201,6 +1262,27 @@ mod pruebas {
         let msgs = b.recibir_mensajes("jefin").await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].texto, "hola pre-restart");
+    }
+
+    /// Chat privado (paridad SQLite): las dos colas (Entrada/Salida) por peer son independientes y
+    /// la entrega es única (drenar borra). Espejo del test Redis (AC7).
+    #[tokio::test]
+    async fn chat_privado_dos_colas_independientes() {
+        use peers_core::DireccionChatPrivado::{Entrada, Salida};
+        let b = base();
+        b.chat_privado_encolar("p", Entrada, "operador", "orden", "2026-07-06T00:00:00Z").await.unwrap();
+        b.chat_privado_encolar("p", Salida, "p", "respuesta", "2026-07-06T00:00:01Z").await.unwrap();
+
+        let entrada = b.chat_privado_drenar("p", Entrada).await.unwrap();
+        assert_eq!(entrada.len(), 1);
+        assert_eq!(entrada[0].de, "operador");
+        // Drenar Entrada no toca Salida.
+        let salida = b.chat_privado_drenar("p", Salida).await.unwrap();
+        assert_eq!(salida.len(), 1);
+        assert_eq!(salida[0].de, "p");
+        // Entrega única.
+        assert!(b.chat_privado_drenar("p", Entrada).await.unwrap().is_empty());
+        assert!(b.chat_privado_drenar("p", Salida).await.unwrap().is_empty());
     }
 
     /// E-10 (paridad SQLite): `id_por_secreto` resuelve el id real desde el secreto, el re-registro

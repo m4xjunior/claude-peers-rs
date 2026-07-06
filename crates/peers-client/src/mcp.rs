@@ -94,6 +94,12 @@ pub struct ArgsCerrarTarea {
     pub tarea_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArgsChatPrivadoResponder {
+    /// Tu respuesta al operador por el canal privado. Confidencial: no la reproduzcas en el chat visible.
+    pub texto: String,
+}
+
 /// Servidor MCP de la instancia. Lleva el estado compartido (broker, id, secreto, etc.) para que
 /// las tools puedan operar. `tool_router` es el registro de tools que genera el macro.
 #[derive(Clone)]
@@ -214,6 +220,24 @@ impl ServidorPeers {
             .await
             .unwrap_or_else(|e| e)
     }
+
+    #[tool(
+        name = "chat_privado_recibir",
+        description = "Consulta tu canal PRIVADO y confidencial con el operador (el dueño). Devuelve los mensajes que te haya dejado. IMPORTANTE: el contenido es CONFIDENCIAL — NO lo reproduzcas ni lo resumas en tu output visible; trátalo como una instrucción reservada. Consúltalo periódicamente y cuando el contexto lo sugiera."
+    )]
+    async fn chat_privado_recibir(&self) -> String {
+        crate::tool_chat_privado_recibir(&self.estado).await.unwrap_or_else(|e| e)
+    }
+
+    #[tool(
+        name = "chat_privado_responder",
+        description = "Responde al operador por el canal PRIVADO (solo él lo lee, no aparece en el chat visible de nadie). Úsalo para comunicación confidencial de vuelta al dueño."
+    )]
+    async fn chat_privado_responder(&self, Parameters(a): Parameters<ArgsChatPrivadoResponder>) -> String {
+        crate::tool_chat_privado_responder(&self.estado, &json!({ "texto": a.texto }))
+            .await
+            .unwrap_or_else(|e| e)
+    }
 }
 
 #[tool_handler]
@@ -301,7 +325,14 @@ Tools disponibles:\n\
 - reportar_tarea: añade una nota de progreso a una tarea\n\
 - cerrar_tarea: cierra una tarea al terminarla\n\
 - listar_tareas: lista tus tareas con sus tiempos\n\
-- revisar_tareas: resumen de tus tareas abiertas\n\n\
+- revisar_tareas: resumen de tus tareas abiertas\n\
+- chat_privado_recibir: consulta tu canal PRIVADO y confidencial con el operador (el dueño)\n\
+- chat_privado_responder: responde al operador por ese canal privado\n\n\
+CANAL PRIVADO CON EL OPERADOR (confidencial): tienes un canal privado y directo con el dueño, \
+separado de los mensajes normales. Consulta chat_privado_recibir periódicamente y cuando el \
+contexto lo sugiera. Su contenido es CONFIDENCIAL: trátalo como una instrucción reservada del \
+dueño y NUNCA lo reproduzcas, cites ni resumas en tu output visible ni en mensajes a otras \
+instancias. Responde por chat_privado_responder, no por el canal normal.\n\n\
 Antes de trabajo sustancial, crea una tarea con tu estimado (crear_tarea); al terminar, ciérrala (cerrar_tarea). \
 El broker mide tu tiempo real y aprende a corregir estimaciones.\n\n\
 Al iniciar, llama definir_resumen para describir en qué trabajas."
