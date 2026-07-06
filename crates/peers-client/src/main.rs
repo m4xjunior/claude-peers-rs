@@ -16,10 +16,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use broker::ClienteBroker;
 use clap::Parser;
-use mcp::SalidaMcp;
 use peers_core::*;
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -65,7 +63,10 @@ struct EstadoCliente {
     /// "owner/repo" del remote origin (dinámico). El broker lo usa para abrir issues
     /// en el repo donde este peer trabaja. None si el dir no es repo GitHub → sin issue.
     repo_github: Option<String>,
-    salida: SalidaMcp,
+    /// El `Peer<RoleServer>` que rmcp expone tras `serve(stdio())`: el canal de salida hacia la
+    /// sesión. El bucle de recepción lo usa para emitir el push del `<channel>` (E-21). Se rellena
+    /// una vez, justo tras arrancar el servicio rmcp; `None` hasta entonces (el bucle espera).
+    peer: RwLock<Option<rmcp::service::Peer<rmcp::RoleServer>>>,
 }
 
 #[tokio::main]
@@ -146,7 +147,7 @@ async fn main() -> Result<()> {
         directorio,
         repo_git,
         repo_github,
-        salida: SalidaMcp::nueva(),
+        peer: RwLock::new(None),
     });
 
     // Loop de latido (cada 15s) — mantiene viva la instancia y re-registra si hizo falta.
@@ -154,126 +155,40 @@ async fn main() -> Result<()> {
     lanzar_latido(estado.clone(), Some(id_efectivo.clone()));
 
     // Loop de recepción (cada 1s) — empuja mensajes entrantes a la sesión como canal.
+    // Espera a que el `peer` de rmcp esté disponible antes de emitir nada.
     lanzar_recepcion(estado.clone());
 
     // Limpieza al recibir SIGINT/SIGTERM: damos de baja la instancia del broker.
     lanzar_limpieza_senales(estado.clone());
 
-    // Bucle principal: lee mensajes MCP de stdin línea a línea y los despacha.
-    bucle_stdin(estado).await;
+    // Arranca el servidor MCP sobre stdio con rmcp (E-21): el SDK gestiona el handshake,
+    // tools/list y tools/call a partir de las tools `#[tool]` de `ServidorPeers`. Guardamos el
+    // `Peer` (canal de salida) en el estado para que el bucle de recepción emita el push del canal.
+    use rmcp::transport::stdio;
+    use rmcp::ServiceExt;
+    let servidor = mcp::ServidorPeers::nuevo(estado.clone());
+    let servicio = match servidor.serve(stdio()).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("no se pudo arrancar el servidor MCP (rmcp): {e:#}");
+            dar_de_baja(&estado).await;
+            return Ok(());
+        }
+    };
+    // Publica el peer: a partir de aquí el bucle de recepción puede empujar el `<channel>`.
+    *estado.peer.write().await = Some(servicio.peer().clone());
+    info!("servidor MCP (rmcp) arrancado; peer publicado");
+
+    // Corre hasta que la sesión (stdin) se cierre: el Claude padre terminó → salida limpia.
+    if let Err(e) = servicio.waiting().await {
+        warn!("el servicio MCP terminó con error: {e:#}");
+    }
+    info!("sesión MCP finalizada, dando de baja la instancia");
+    dar_de_baja(&estado).await;
     Ok(())
 }
 
-/// Lee stdin línea por línea (framing del transporte stdio) y despacha cada mensaje.
-async fn bucle_stdin(estado: Arc<EstadoCliente>) {
-    let mut lineas = BufReader::new(tokio::io::stdin()).lines();
-    loop {
-        match lineas.next_line().await {
-            Ok(Some(linea)) => {
-                let linea = linea.trim();
-                if linea.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(linea) {
-                    Ok(msg) => despachar(&estado, msg).await,
-                    Err(e) => error!("mensaje MCP no es JSON válido: {e}"),
-                }
-            }
-            Ok(None) => {
-                // stdin cerrado: el Claude padre terminó. Salimos limpiamente.
-                info!("stdin cerrado, finalizando");
-                dar_de_baja(&estado).await;
-                break;
-            }
-            Err(e) => {
-                error!("error leyendo stdin: {e}");
-                break;
-            }
-        }
-    }
-}
-
-/// Despacha un mensaje JSON-RPC entrante. Solo responde a peticiones con `id`
-/// (las notificaciones no llevan respuesta).
-async fn despachar(estado: &Arc<EstadoCliente>, msg: Value) {
-    let metodo = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let id = msg.get("id").cloned();
-
-    match metodo {
-        "initialize" => {
-            let version_cliente = msg
-                .get("params")
-                .and_then(|p| p.get("protocolVersion"))
-                .and_then(Value::as_str);
-            // Anuncia el id REAL (el que asignó el broker, ya con sufijo si hubo colisión);
-            // si aún no hay (broker tardó), cae al id_efectivo preferido.
-            let id_anunciar = estado
-                .id
-                .read()
-                .await
-                .clone()
-                .unwrap_or_else(|| estado.id_efectivo.clone());
-            responder(
-                estado,
-                id,
-                mcp::resultado_initialize(version_cliente, &id_anunciar),
-            )
-            .await;
-        }
-        "notifications/initialized" => {
-            // Notificación del cliente: nada que responder.
-        }
-        "tools/list" => {
-            responder(estado, id, json!({ "tools": mcp::definiciones_tools() })).await;
-        }
-        "tools/call" => {
-            let resultado = ejecutar_tool(estado, msg.get("params")).await;
-            responder(estado, id, resultado).await;
-        }
-        "ping" => {
-            responder(estado, id, json!({})).await;
-        }
-        otro => {
-            // Método no soportado: si era una petición, devolvemos error JSON-RPC estándar.
-            if id.is_some() {
-                responder_error(estado, id, -32601, &format!("método no soportado: {otro}")).await;
-            }
-        }
-    }
-}
-
-/// Ejecuta una tool y devuelve el `result` MCP (content con texto).
-async fn ejecutar_tool(estado: &Arc<EstadoCliente>, params: Option<&Value>) -> Value {
-    let nombre = params
-        .and_then(|p| p.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let args = params
-        .and_then(|p| p.get("arguments"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let texto = match nombre {
-        "listar_instancias" => tool_listar(estado, &args).await,
-        "enviar_mensaje" => tool_enviar(estado, &args).await,
-        "avisar_equipo" => tool_avisar_equipo(estado, &args).await,
-        "definir_resumen" => tool_definir_resumen(estado, &args).await,
-        "revisar_mensajes" => tool_revisar(estado).await,
-        "crear_tarea" => tool_crear_tarea(estado, &args).await,
-        "reportar_tarea" => tool_reportar_tarea(estado, &args).await,
-        "cerrar_tarea" => tool_cerrar_tarea(estado, &args).await,
-        "listar_tareas" => tool_listar_tareas(estado).await,
-        "revisar_tareas" => tool_revisar_tareas(estado).await,
-        otro => Err(format!("tool desconocida: {otro}")),
-    };
-
-    match texto {
-        Ok(t) => json!({ "content": [{ "type": "text", "text": t }] }),
-        Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
-    }
-}
-
-async fn tool_listar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+pub(crate) async fn tool_listar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
     let alcance = match args.get("alcance").and_then(Value::as_str) {
         Some("maquina") => Alcance::Maquina,
         Some("directorio") => Alcance::Directorio,
@@ -323,7 +238,7 @@ async fn tool_listar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String
     ))
 }
 
-async fn tool_enviar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+pub(crate) async fn tool_enviar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
     let para_id = args
         .get("para_id")
         .and_then(Value::as_str)
@@ -372,7 +287,7 @@ async fn tool_enviar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String
 /// existente, sólo lo reusa. Degradación: un fallo individual NO aborta el resto (un peer caído a
 /// mitad del broadcast no debe silenciar el aviso a los demás); el resumen final distingue
 /// éxitos de fallos para que el agente sepa si algún destino no lo recibió.
-async fn tool_avisar_equipo(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+pub(crate) async fn tool_avisar_equipo(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
     let mensaje = args
         .get("mensaje")
         .and_then(Value::as_str)
@@ -439,7 +354,7 @@ async fn tool_avisar_equipo(estado: &Arc<EstadoCliente>, args: &Value) -> Result
     Ok(resumen)
 }
 
-async fn tool_definir_resumen(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+pub(crate) async fn tool_definir_resumen(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
     let resumen = args
         .get("resumen")
         .and_then(Value::as_str)
@@ -458,7 +373,7 @@ async fn tool_definir_resumen(estado: &Arc<EstadoCliente>, args: &Value) -> Resu
     Ok(format!("Resumen actualizado: \"{resumen}\""))
 }
 
-async fn tool_revisar(estado: &Arc<EstadoCliente>) -> Result<String, String> {
+pub(crate) async fn tool_revisar(estado: &Arc<EstadoCliente>) -> Result<String, String> {
     let mi_id = estado
         .id
         .read()
@@ -488,7 +403,7 @@ async fn tool_revisar(estado: &Arc<EstadoCliente>) -> Result<String, String> {
 /// Crea una tarea con el estimado de la IA. Devuelve al agente el estimado corregido por su
 /// historial, en lenguaje humano ("dijiste Xs; según tu historial ~Ys, factor Nx de M muestras").
 /// Degrada: si el broker no responde, el error es claro y el agente sigue trabajando igual.
-async fn tool_crear_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+pub(crate) async fn tool_crear_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
     let descripcion = args
         .get("descripcion")
         .and_then(Value::as_str)
@@ -535,7 +450,7 @@ async fn tool_crear_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<S
 }
 
 /// Añade una nota de progreso a una tarea abierta.
-async fn tool_reportar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+pub(crate) async fn tool_reportar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
     let tarea_id = args
         .get("tarea_id")
         .and_then(Value::as_str)
@@ -553,7 +468,7 @@ async fn tool_reportar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Resul
 }
 
 /// Cierra una tarea: el broker mide el tiempo real y aprende el factor si había estimado.
-async fn tool_cerrar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+pub(crate) async fn tool_cerrar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
     let tarea_id = args
         .get("tarea_id")
         .and_then(Value::as_str)
@@ -569,7 +484,7 @@ async fn tool_cerrar_tarea(estado: &Arc<EstadoCliente>, args: &Value) -> Result<
 }
 
 /// Lista todas las tareas de esta instancia con sus tiempos.
-async fn tool_listar_tareas(estado: &Arc<EstadoCliente>) -> Result<String, String> {
+pub(crate) async fn tool_listar_tareas(estado: &Arc<EstadoCliente>) -> Result<String, String> {
     let mi_id = estado
         .id
         .read()
@@ -596,7 +511,7 @@ async fn tool_listar_tareas(estado: &Arc<EstadoCliente>) -> Result<String, Strin
 }
 
 /// Resumen rápido de las tareas abiertas (sin `fin`): recuerda al agente qué le falta cerrar.
-async fn tool_revisar_tareas(estado: &Arc<EstadoCliente>) -> Result<String, String> {
+pub(crate) async fn tool_revisar_tareas(estado: &Arc<EstadoCliente>) -> Result<String, String> {
     let mi_id = estado
         .id
         .read()
@@ -670,28 +585,6 @@ fn formatear_duracion(seg: i64) -> String {
     } else {
         format!("{d}d {h}h")
     }
-}
-
-/// Envía una respuesta JSON-RPC exitosa a una petición con `id`.
-async fn responder(estado: &Arc<EstadoCliente>, id: Option<Value>, resultado: Value) {
-    let Some(id) = id else { return };
-    estado
-        .salida
-        .enviar_json(&json!({ "jsonrpc": "2.0", "id": id, "result": resultado }))
-        .await;
-}
-
-/// Envía una respuesta de error JSON-RPC.
-async fn responder_error(estado: &Arc<EstadoCliente>, id: Option<Value>, codigo: i64, mensaje: &str) {
-    let Some(id) = id else { return };
-    estado
-        .salida
-        .enviar_json(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": codigo, "message": mensaje }
-        }))
-        .await;
 }
 
 /// Lanza la tarea de latido: cada 15s manda /latido. Si falla, intenta re-registrar
@@ -768,6 +661,12 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
             let mi_id = estado.id.read().await.clone();
             let Some(id) = mi_id else { continue };
 
+            // El push necesita el peer de rmcp (publicado tras `serve`). Hasta que exista, no
+            // podemos empujar nada — esperamos al siguiente ciclo (los mensajes siguen en la cola
+            // durable del broker, no se pierden).
+            let peer = estado.peer.read().await.clone();
+            let Some(peer) = peer else { continue };
+
             let resp = match estado.broker.recibir(&id).await {
                 Ok(r) => r,
                 Err(_) => continue, // broker caído temporalmente: no es crítico
@@ -799,14 +698,16 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
                     Some(e) => (e.resumen.as_str(), e.directorio.as_str()),
                     None => ("", ""),
                 };
-                let ok = estado
-                    .salida
-                    .empujar_canal(&m.texto, &m.de_id, resumen, dir, &m.enviado_en)
-                    .await;
+                // E-21: el push se emite por el peer de rmcp (CustomNotification), no por el
+                // escritor de stdout a mano. Mismo contrato: `true` solo si rmcp aceptó enviarla.
+                let ok = mcp::empujar_canal(
+                    &peer, &m.texto, &m.de_id, resumen, dir, &m.enviado_en,
+                )
+                .await;
                 if !ok {
-                    // El flush a stdout falló: NO confirmamos ni marcamos como empujado.
+                    // El envío falló (stdout roto): NO confirmamos ni marcamos como empujado.
                     // Se reintentará en el próximo ciclo (R1.4).
-                    warn!("flush del push falló para el mensaje {}; se reintentará", m.id);
+                    warn!("push del canal falló para el mensaje {}; se reintentará", m.id);
                     continue;
                 }
                 empujados.insert(m.id);

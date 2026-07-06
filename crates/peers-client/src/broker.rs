@@ -92,6 +92,10 @@ impl ClienteBroker {
         self.post("/listar", p).await
     }
 
+    /// Envío SIN secreto de sesión. Tras E-10, las tools usan `enviar_verificado` (presenta el
+    /// header). Se conserva como API base del cliente (y por si un flujo sin identidad lo necesita);
+    /// `enviar_verificado(p, None)` es equivalente. `allow(dead_code)`: hoy no hay call-site directo.
+    #[allow(dead_code)]
     pub async fn enviar(&self, p: &PeticionEnviar) -> Result<RespuestaEnviar> {
         self.post("/enviar", p).await
     }

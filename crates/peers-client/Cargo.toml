@@ -19,3 +19,9 @@ tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 time = { version = "0.3", features = ["formatting"] }
+# E-21: SDK oficial de MCP. Reemplaza el JSON-RPC a mano de mcp.rs. El push del <channel> se
+# preserva vía CustomNotification (spike verificado: rmcp 1.8.0 lo modela idéntico al wire actual).
+rmcp = { workspace = true }
+# schemars: genera el inputSchema de cada tool desde el struct de args (lo exige el macro #[tool]).
+schemars = "1"
+futures = "0.3"
