@@ -360,8 +360,13 @@ pub fn render_tareas(datos: &EstadoPantalla) -> impl IntoElement {
     }
 
     if total == 0 {
-        // Sin tareas visibles (ninguna o todas filtradas por el proyecto activo): mensaje guía.
-        raiz = raiz.child(estado_vacio());
+        // Sin tareas: distinguir "aún no respondió el broker" (cargando) de "vacío genuino".
+        let mensaje = if datos.info.is_none() {
+            "Conectando con el broker…"
+        } else {
+            "No hay tareas abiertas en ningún peer todavía."
+        };
+        raiz = raiz.child(estado_vacio(mensaje));
         return raiz;
     }
 
@@ -421,16 +426,14 @@ fn banner_error(texto: &str) -> AnyElement {
 }
 
 /// Estado vacío: mensaje guía centrado en una card (espejo del banner vacío de la TUI).
-fn estado_vacio() -> AnyElement {
+fn estado_vacio(mensaje: &str) -> AnyElement {
     tema::superficie_card()
         .size_full()
         .flex()
         .items_center()
         .justify_center()
         .p_6()
-        .child(tema::texto_terciario(
-            "No hay tareas abiertas en ningún peer todavía.",
-        ))
+        .child(tema::texto_terciario(mensaje.to_string()))
         .into_any_element()
 }
 

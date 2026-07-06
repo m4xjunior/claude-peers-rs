@@ -503,7 +503,14 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
     }
 
     if total == 0 && datos.error_peers.is_none() {
-        // Sin datos y sin error: aún no llegó la primera respuesta o no hay peers vivos.
+        // Sin datos y sin error: distinguir "aún no llegó la primera respuesta" (cargando)
+        // de "no hay peers vivos" (vacío genuino). `datos.info` (GET /admin/info) es la
+        // primera respuesta que llega; si todavía no está, el broker aún no respondió.
+        let mensaje = if datos.info.is_none() {
+            "Conectando con el broker…"
+        } else {
+            "Sin peers vivos en esta máquina."
+        };
         return raiz.child(
             tema::superficie_card()
                 .v_flex()
@@ -511,7 +518,7 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
                 .justify_center()
                 .w_full()
                 .py_8()
-                .child(tema::texto_terciario("Sin peers vivos en esta máquina.")),
+                .child(tema::texto_terciario(mensaje)),
         );
     }
 
