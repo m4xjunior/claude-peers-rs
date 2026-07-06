@@ -86,6 +86,15 @@ struct Args {
     /// (funciona igual con Redis y con --db). Default: ~/.config/claude-peers/bitacora.db.
     #[arg(long, env = "CLAUDE_PEERS_BITACORA_DB")]
     bitacora_db: Option<String>,
+
+    /// Anti-spoofing del `de_id` (E-10): si está activo, `/enviar` RESUELVE el emisor real desde el
+    /// secreto de sesión (header `X-Peers-Secreto`) y sobrescribe el `de_id` declarado. Si está
+    /// desactivado (DEFAULT), el broker vuelve a CONFIAR en el `de_id` del payload tal cual (estado
+    /// pre-E-10) — reabre el vector de suplantación, decisión explícita de Max (2026-07-06). El
+    /// código de E-10 queda intacto: reactivar es solo poner esta flag a true y recargar. `/registrar`
+    /// sigue emitiendo secreto en ambos modos (inofensivo si no se usa; permite reactivar sin re-registro).
+    #[arg(long, env = "CLAUDE_PEERS_ANTISPOOF", default_value_t = false)]
+    antispoofing: bool,
 }
 
 /// Umbrales del supervisor (R8): configurables vía env/flags del broker, con los defaults
@@ -107,6 +116,7 @@ impl std::fmt::Debug for Args {
             // El token NUNCA se imprime en claro: se redacta a "<presente>"/"<ninguno>".
             .field("token", &self.token.as_ref().map(|_| "<presente>").unwrap_or("<ninguno>"))
             .field("bitacora_db", &self.bitacora_db)
+            .field("antispoofing", &self.antispoofing)
             .finish()
     }
 }
@@ -136,6 +146,11 @@ struct EstadoApp {
     /// transversal a ambos backends. `None` = desactivada (no se pudo abrir el fichero): el
     /// broker opera igual — la bitácora es observabilidad, nunca condición de negocio (R9).
     bitacora: Option<bitacora::Bitacora>,
+    /// Anti-spoofing del `de_id` (E-10) activo o no. `false` (default) = el broker confía en el
+    /// `de_id` del payload (pre-E-10); `true` = resuelve el emisor por el secreto de sesión. Es el
+    /// interruptor de la reversión (decisión de Max): apagado devuelve el comportamiento anterior
+    /// sin borrar el código de E-10.
+    antispoofing: bool,
 }
 
 type Estado = Arc<EstadoApp>;
@@ -523,6 +538,12 @@ async fn enviar(
     // Toma el secreto del header `X-Peers-Secreto`, RESUELVE la identidad real (búsqueda inversa
     // secreto→id) y SOBRESCRIBE `p.de_id` con ella. Así declararse `operador`/otro es inofensivo:
     // el `de_id` declarado nunca tiene efecto. Se hace ANTES de la política (que consume `de_id`).
+    //
+    // REVERSIÓN (decisión de Max, 2026-07-06): si el anti-spoofing está DESACTIVADO (flag
+    // `CLAUDE_PEERS_ANTISPOOF` off, default), se SALTA todo este bloque y el broker confía en el
+    // `de_id` declarado tal cual (comportamiento pre-E-10). El código de abajo queda intacto para
+    // reactivarlo con solo poner la flag. NOTA: apagado reabre el vector de suplantación a sabiendas.
+    if e.antispoofing {
     let presentado = headers
         .get(peers_core::HEADER_SECRETO)
         .and_then(|v| v.to_str().ok());
@@ -564,6 +585,7 @@ async fn enviar(
             }
         }
     }
+    } // fin `if e.antispoofing` — con la flag OFF, `p.de_id` queda tal como llegó (pre-E-10).
     // No descartar en silencio: si el destino no existe, error claro.
     if !e.almacen.instancia_existe(&p.para_id).await? {
         return Ok(Json(RespuestaEnviar {
@@ -1876,6 +1898,7 @@ async fn main() -> anyhow::Result<()> {
         registro_lock: tokio::sync::Mutex::new(()),
         politica: tokio::sync::RwLock::new(politica_inicial),
         bitacora,
+        antispoofing: args.antispoofing,
     });
 
     // Umbrales del supervisor (R8): resueltos una vez, copiados al spawn (Copy).
@@ -1996,6 +2019,12 @@ async fn main() -> anyhow::Result<()> {
     let direccion = format!("{}:{}", args.host, args.puerto);
     let listener = tokio::net::TcpListener::bind(&direccion).await?;
     info!("peers-broker escuchando en {direccion}");
+    // E-10: deja explícito en qué modo corre (auditoría). Apagado = confía en el de_id declarado.
+    if args.antispoofing {
+        info!("anti-spoofing del de_id (E-10): ACTIVO — el de_id se resuelve por secreto de sesión");
+    } else {
+        warn!("anti-spoofing del de_id (E-10): DESACTIVADO — el broker confía en el de_id declarado (pre-E-10). Activar con CLAUDE_PEERS_ANTISPOOF=true");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -2062,6 +2091,7 @@ mod pruebas {
             umbral_atasco: peers_core::UMBRAL_ATASCO_SEG,
             umbral_ghosteo: peers_core::UMBRAL_GHOSTEO_SEG,
             bitacora_db: None,
+            antispoofing: false,
         };
         let s = format!("{args:?}");
         assert!(!s.contains("secreto-super-sensible"), "el token NO debe aparecer en claro");
