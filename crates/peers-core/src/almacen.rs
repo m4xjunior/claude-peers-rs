@@ -38,6 +38,10 @@ pub trait Almacen: Send + Sync {
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
+        // E-10: secreto de sesión que el broker generó para este registro. Se persiste en la
+        // instancia y se ROTA en cada re-registro (una sesión nueva = un secreto nuevo; el viejo
+        // muere). El caller (broker) lo genera con CSPRNG; el store solo lo escribe.
+        secreto: &str,
     ) -> anyhow::Result<bool>;
 
     async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()>;
@@ -66,6 +70,14 @@ pub trait Almacen: Send + Sync {
     /// Lo usa el broker para resolver el repo_github de la instancia dueña de una tarea
     /// y abrir la issue en ESE repo (dinámico).
     async fn instancia_obtener(&self, id: &str) -> anyhow::Result<Option<Instancia>>;
+
+    /// E-10 (anti-spoofing, decisión C): RESUELVE el id de la instancia dueña de un secreto de
+    /// sesión (búsqueda inversa secreto→id), o None si ese secreto no es de nadie (inventado o de
+    /// una sesión ya muerta). Es la pieza central: `enviar` toma el secreto del header, resuelve el
+    /// emisor REAL con esto y SOBRESCRIBE el `de_id` declarado (el spoofing se vuelve inofensivo).
+    /// Los backends mantienen un índice inverso (`cprs:secreto:{secreto}`→id en Redis; consulta por
+    /// columna en SQLite) para que sea O(1) y no un escaneo de todas las instancias.
+    async fn id_por_secreto(&self, secreto: &str) -> anyhow::Result<Option<String>>;
 
     async fn listar(
         &self,

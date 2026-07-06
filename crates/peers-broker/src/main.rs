@@ -187,6 +187,26 @@ fn generar_id() -> String {
     id
 }
 
+/// Genera un secreto de sesión (E-10, anti-spoofing del `de_id`): `SECRETO_BYTES` bytes de un
+/// CSPRNG del SO (`getrandom`) codificados a base62 imprimible (apto para un header HTTP). A
+/// diferencia de `generar_id` (xorshift sembrado por nanos+pid, PREDECIBLE — vale para un id que
+/// NO es secreto), aquí la entropía DEBE ser criptográfica: un secreto adivinable no protege de
+/// nada. Si `getrandom` fallara (entorno sin fuente de entropía, extremadamente raro), degradamos
+/// al sembrado débil de `generar_id` repetido — es un fallback de disponibilidad, no de seguridad;
+/// se registra un `warn` porque un secreto débil es una anomalía que Max debe ver.
+fn generar_secreto() -> String {
+    let mut bytes = [0u8; peers_core::SECRETO_BYTES];
+    match getrandom::getrandom(&mut bytes) {
+        Ok(()) => peers_core::codificar_secreto(&bytes),
+        Err(err) => {
+            warn!("getrandom falló al generar el secreto de sesión ({err}); uso fallback DÉBIL");
+            // Fallback de disponibilidad: dos ids concatenados (16 chars xorshift). NO es seguro,
+            // pero mantiene el broker operativo; el warn deja rastro de la degradación.
+            format!("{}{}", generar_id(), generar_id())
+        }
+    }
+}
+
 /// Decide si una petición está autorizada. Pura y testeable.
 /// - Sin token configurado (None) → siempre autorizado (compat local).
 /// - Con token configurado → autorizado solo si el recibido coincide exacto.
@@ -328,6 +348,10 @@ async fn registrar(
     let _guard = e.registro_lock.lock().await;
     let id = resolver_id_sin_colision(&e, p.id_preferido.as_deref(), p.pid, &p.hostname).await;
     let ahora = ahora_iso();
+    // E-10: secreto de sesión CSPRNG para atar el `de_id` a esta instancia. Se genera en cada
+    // registro (alta y re-registro rotan credencial) y se devuelve UNA vez al peer, que lo
+    // presenta luego en el header `X-Peers-Secreto`. El store lo persiste; nunca sale en /listar.
+    let secreto = generar_secreto();
     let es_alta = e
         .almacen
         .registrar(
@@ -340,6 +364,7 @@ async fn registrar(
             p.tty.as_deref(),
             &p.resumen,
             &ahora,
+            &secreto,
         )
         .await?;
     // FIX sesiones fantasma: en un RE-registro (peer reconectando — SSH/VPN inestable, el mismo
@@ -364,7 +389,7 @@ async fn registrar(
         registrar_accion(&e, &id, TipoAccion::Registrar, None, Some(p.hostname.clone()), None, None).await;
     }
     info!("instancia registrada: {id}");
-    Ok(Json(RespuestaRegistrar { id }))
+    Ok(Json(RespuestaRegistrar { id, secreto: Some(secreto) }))
 }
 
 async fn latido(
@@ -491,8 +516,54 @@ async fn evaluar_politica(e: &Estado, de_id: &str, para_id: &str) -> DecisionPol
 
 async fn enviar(
     State(e): State<Estado>,
-    Json(p): Json<PeticionEnviar>,
+    headers: axum::http::HeaderMap,
+    Json(mut p): Json<PeticionEnviar>,
 ) -> Result<Json<RespuestaEnviar>, ErrorApp> {
+    // E-10 (anti-spoofing, decisión C de Max): el broker NUNCA confía en el `de_id` del payload.
+    // Toma el secreto del header `X-Peers-Secreto`, RESUELVE la identidad real (búsqueda inversa
+    // secreto→id) y SOBRESCRIBE `p.de_id` con ella. Así declararse `operador`/otro es inofensivo:
+    // el `de_id` declarado nunca tiene efecto. Se hace ANTES de la política (que consume `de_id`).
+    let presentado = headers
+        .get(peers_core::HEADER_SECRETO)
+        .and_then(|v| v.to_str().ok());
+    let id_del_secreto = match presentado {
+        Some(s) => e.almacen.id_por_secreto(s).await?,
+        None => None,
+    };
+    match peers_core::resolver_emisor(presentado, id_del_secreto) {
+        peers_core::ResolucionEmisor::Resuelto(id_real) => {
+            // Corrección silenciosa (decisión C): el de_id real es el dueño del secreto. Si venía
+            // desalineado, lo dejamos trazado en debug (no es un error de negocio, es lo esperado).
+            if p.de_id != id_real {
+                info!(
+                    "E-10: de_id declarado '{}' corregido a '{}' (resuelto por secreto)",
+                    p.de_id, id_real
+                );
+            }
+            p.de_id = id_real;
+        }
+        peers_core::ResolucionEmisor::Invalido => {
+            // Se presentó un secreto que no es de ninguna instancia: no hay emisor real que
+            // resolver. RECHAZO (ok:false), respuesta de negocio, nunca un 500. Queda trazado.
+            warn!("ENVÍO RECHAZADO (E-10): secreto presentado no corresponde a ninguna instancia → '{}'", p.para_id);
+            return Ok(Json(RespuestaEnviar {
+                ok: false,
+                error: Some("identidad no verificada: el secreto de sesión no corresponde a ninguna instancia".to_string()),
+            }));
+        }
+        peers_core::ResolucionEmisor::SinCredencial => {
+            // Ventana de compat: sin header (client pre-E-10, o un panel del operador que hoy no
+            // se registra con secreto). No hay secreto que resolver → se respeta el `de_id`
+            // declarado, como HOY. Se cierra cuando toda la flota reconecte (migración por
+            // re-registro). Rastro solo para remitentes no-exentos (los paneles son esperados).
+            if !peers_core::remitente_exento(&p.de_id) {
+                warn!(
+                    "envío de '{}' sin secreto (client pre-E-10): se respeta el de_id declarado en compat",
+                    p.de_id
+                );
+            }
+        }
+    }
     // No descartar en silencio: si el destino no existe, error claro.
     if !e.almacen.instancia_existe(&p.para_id).await? {
         return Ok(Json(RespuestaEnviar {

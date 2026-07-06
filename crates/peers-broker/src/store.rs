@@ -53,6 +53,11 @@ impl AlmacenRedis {
 fn k_instancia(id: &str) -> String {
     format!("{NS}instancia:{id}")
 }
+/// Índice inverso del secreto de sesión (E-10): `cprs:secreto:{secreto}` → id de la instancia.
+/// Permite resolver el emisor real desde el header en O(1) sin escanear todas las instancias.
+fn k_secreto(secreto: &str) -> String {
+    format!("{NS}secreto:{secreto}")
+}
 fn k_bandeja(para_id: &str) -> String {
     format!("{NS}bandeja:{para_id}")
 }
@@ -129,13 +134,25 @@ impl Almacen for AlmacenRedis {
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
+        secreto: &str,
     ) -> anyhow::Result<bool> {
         let mut conn = self.conn().await?;
         let clave = k_instancia(id);
         // ¿Existe? Si sí, re-registro: UPDATE sin tocar registrada_en ni resumen (FIX #1).
         let existe: bool = conn.exists(&clave).await?;
+        // E-10: si había un secreto anterior (re-registro que rota), invalidamos su índice inverso
+        // ANTES de escribir el nuevo — así el secreto viejo deja de resolver a este id (una sesión
+        // muerta no puede seguir enviando con la credencial vieja). Best-effort: se lee y borra; si
+        // no había, es un no-op.
+        let secreto_viejo: Option<String> = conn.hget(&clave, "secreto").await?;
+        if let Some(viejo) = secreto_viejo.filter(|s| !s.is_empty()) {
+            if viejo != secreto {
+                let _: () = conn.del(k_secreto(&viejo)).await?;
+            }
+        }
         if existe {
-            // Actualiza solo presencia; conserva registrada_en y resumen previos.
+            // Actualiza solo presencia; conserva registrada_en y resumen previos. E-10: el secreto
+            // SÍ se rota aquí — reiniciar la sesión (mismo id, hereda cola) emite credencial fresca.
             cmd("HSET")
                 .arg(&clave)
                 .arg("pid").arg(pid)
@@ -145,6 +162,7 @@ impl Almacen for AlmacenRedis {
                 .arg("repo_github").arg(repo_github.unwrap_or(""))
                 .arg("tty").arg(tty.unwrap_or(""))
                 .arg("visto_en").arg(ahora)
+                .arg("secreto").arg(secreto)
                 .query_async::<()>(&mut conn)
                 .await?;
         } else {
@@ -160,6 +178,7 @@ impl Almacen for AlmacenRedis {
                 .arg("resumen").arg(resumen)
                 .arg("registrada_en").arg(ahora)
                 .arg("visto_en").arg(ahora)
+                .arg("secreto").arg(secreto)
                 .query_async::<()>(&mut conn)
                 .await?;
         }
@@ -169,6 +188,9 @@ impl Almacen for AlmacenRedis {
         // vencidos a mitad), el re-registro repoblaba el HASH pero dejaba el id FUERA del SET
         // → instancia fantasma: con datos pero invisible en listar() (nadie la ve ni le envía).
         let _: () = conn.sadd(format!("{NS}instancias"), id).await?;
+        // E-10: índice inverso secreto→id, para resolver el emisor real desde el header en O(1).
+        // Se escribe SIEMPRE (alta y re-registro): tras rotar, el nuevo secreto apunta a este id.
+        let _: () = conn.set(k_secreto(secreto), id).await?;
         Ok(!existe)
     }
 
@@ -186,6 +208,12 @@ impl Almacen for AlmacenRedis {
 
     async fn salir(&self, id: &str) -> anyhow::Result<()> {
         let mut conn = self.conn().await?;
+        // E-10: limpia el índice inverso del secreto ANTES de borrar la instancia, para que su
+        // secreto deje de resolver a un id ya dado de baja (best-effort: si no había, no-op).
+        let secreto: Option<String> = conn.hget(k_instancia(id), "secreto").await?;
+        if let Some(s) = secreto.filter(|s| !s.is_empty()) {
+            let _: () = conn.del(k_secreto(&s)).await?;
+        }
         let _: () = conn.del(k_instancia(id)).await?;
         let _: () = conn.srem(format!("{NS}instancias"), id).await?;
         Ok(())
@@ -234,6 +262,13 @@ impl Almacen for AlmacenRedis {
     async fn instancia_obtener(&self, id: &str) -> anyhow::Result<Option<Instancia>> {
         let mut conn = self.conn().await?;
         leer_instancia(&mut conn, id).await
+    }
+
+    async fn id_por_secreto(&self, secreto: &str) -> anyhow::Result<Option<String>> {
+        let mut conn = self.conn().await?;
+        // GET del índice inverso: cprs:secreto:{secreto} → id. None si el secreto no es de nadie.
+        let id: Option<String> = conn.get(k_secreto(secreto)).await?;
+        Ok(id.filter(|v| !v.is_empty()))
     }
 
     async fn listar(
@@ -1093,5 +1128,7 @@ async fn leer_instancia(
         resumen: h.get("resumen").cloned().unwrap_or_default(),
         registrada_en: h.get("registrada_en").cloned().unwrap_or_default(),
         visto_en: h.get("visto_en").cloned().unwrap_or_default(),
+        // E-10: el secreto se lee del HASH (campo vacío/ausente → None, instancia pre-E-10).
+        secreto: opt("secreto"),
     }))
 }

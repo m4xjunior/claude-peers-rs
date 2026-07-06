@@ -96,6 +96,53 @@ impl ClienteBroker {
         self.post("/enviar", p).await
     }
 
+    /// Envía presentando el secreto de sesión (E-10) en el header `X-Peers-Secreto`, para que el
+    /// broker ate el `de_id` a esta instancia. `secreto = None` (broker viejo sin E-10) → cae al
+    /// `enviar` normal: sin header, el broker aplica su ventana de compat. Reusa `post_con_secreto`
+    /// para no duplicar el manejo de token/errores del `post` genérico.
+    pub async fn enviar_verificado(
+        &self,
+        p: &PeticionEnviar,
+        secreto: Option<&str>,
+    ) -> Result<RespuestaEnviar> {
+        match secreto {
+            Some(s) => self.post_con_secreto("/enviar", p, s).await,
+            None => self.post("/enviar", p).await,
+        }
+    }
+
+    /// Igual que `post` pero añade el header del secreto de sesión (E-10). Se mantiene separado del
+    /// `post` genérico para no cambiar la firma de las decenas de call-sites que no lo necesitan;
+    /// solo las rutas con identidad verificada (hoy `/enviar`) lo usan.
+    async fn post_con_secreto<B: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        ruta: &str,
+        cuerpo: &B,
+        secreto: &str,
+    ) -> Result<R> {
+        let url = format!("{}{}", self.base, ruta);
+        let mut req = self
+            .http
+            .post(&url)
+            .json(cuerpo)
+            .header(HEADER_SECRETO, secreto);
+        if let Some(t) = &self.token {
+            req = req.header("X-Peers-Token", t);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("broker no responde en {url} (¿está levantado?)"))?;
+        if !resp.status().is_success() {
+            let estado = resp.status();
+            let texto = resp.text().await.unwrap_or_default();
+            anyhow::bail!("error del broker ({ruta}): {estado} {texto}");
+        }
+        resp.json::<R>()
+            .await
+            .with_context(|| format!("respuesta inválida del broker en {ruta}"))
+    }
+
     pub async fn recibir(&self, id: &str) -> Result<RespuestaRecibir> {
         self.post("/recibir", &PeticionRecibir { id: id.to_string() }).await
     }

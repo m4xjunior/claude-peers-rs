@@ -47,6 +47,12 @@ struct Args {
 /// Estado compartido de la instancia: su id asignado por el broker.
 struct EstadoCliente {
     id: RwLock<Option<String>>,
+    /// Secreto de sesión emitido por el broker en `/registrar` (E-10, anti-spoofing). Se guarda
+    /// aquí (en memoria, nunca en disco) y se presenta en cada `/enviar` vía el header
+    /// `X-Peers-Secreto`, para que el broker ate el `de_id` a ESTA instancia. Se ROTA en cada
+    /// re-registro (el broker emite uno nuevo). `None` = broker viejo sin E-10 → se envía sin
+    /// header (degradación graciosa: el broker cae a la ventana de compat).
+    secreto: RwLock<Option<String>>,
     /// Id que ESTA instancia pidió al broker (derivado de la carpeta o de --id). Se le
     /// anuncia al agente en el initialize para que sepa con qué id deben responderle.
     /// OJO: si el broker detectó colisión puede haber asignado un sufijo (-2); el id REAL
@@ -122,16 +128,19 @@ async fn main() -> Result<()> {
     {
         Ok(r) => {
             info!("registrado como instancia '{}'", r.id);
-            Some(r.id)
+            // E-10: guardamos el secreto emitido (si el broker lo manda; broker viejo → None).
+            (Some(r.id), r.secreto)
         }
         Err(e) => {
             warn!("no se pudo registrar ahora ({e:#}); seguiré e intentaré por latido");
-            None
+            (None, None)
         }
     };
+    let (id_asignado, secreto_inicial) = id_asignado;
 
     let estado = Arc::new(EstadoCliente {
         id: RwLock::new(id_asignado),
+        secreto: RwLock::new(secreto_inicial),
         id_efectivo: id_efectivo.clone(),
         broker,
         directorio,
@@ -331,14 +340,19 @@ async fn tool_enviar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String
         .await
         .clone()
         .ok_or("Aún no registrado en el broker")?;
+    // E-10: presenta el secreto de sesión para que el broker verifique que este de_id es nuestro.
+    let secreto = estado.secreto.read().await.clone();
 
     let resp = estado
         .broker
-        .enviar(&PeticionEnviar {
-            de_id: mi_id,
-            para_id: para_id.to_string(),
-            texto: mensaje.to_string(),
-        })
+        .enviar_verificado(
+            &PeticionEnviar {
+                de_id: mi_id,
+                para_id: para_id.to_string(),
+                texto: mensaje.to_string(),
+            },
+            secreto.as_deref(),
+        )
         .await
         .map_err(|e| format!("Error al enviar el mensaje: {e}"))?;
 
@@ -386,16 +400,21 @@ async fn tool_avisar_equipo(estado: &Arc<EstadoCliente>, args: &Value) -> Result
         return Ok("No hay otras instancias vivas — nadie a quien avisar.".to_string());
     }
 
+    // E-10: el broadcast también presenta el secreto (cada envío del fan-out es un /enviar).
+    let secreto = estado.secreto.read().await.clone();
     let mut enviados: Vec<String> = Vec::new();
     let mut fallidos: Vec<String> = Vec::new();
     for inst in &instancias {
         let resultado = estado
             .broker
-            .enviar(&PeticionEnviar {
-                de_id: mi_id.clone(),
-                para_id: inst.id.clone(),
-                texto: mensaje.to_string(),
-            })
+            .enviar_verificado(
+                &PeticionEnviar {
+                    de_id: mi_id.clone(),
+                    para_id: inst.id.clone(),
+                    texto: mensaje.to_string(),
+                },
+                secreto.as_deref(),
+            )
             .await;
         match resultado {
             Ok(resp) if resp.ok => enviados.push(inst.id.clone()),
@@ -720,6 +739,12 @@ async fn reintentar_registro(estado: &Arc<EstadoCliente>, id_preferido: Option<S
         .await
     {
         *estado.id.write().await = Some(r.id.clone());
+        // E-10: el broker ROTA el secreto en cada re-registro; adoptamos el nuevo (el viejo ya
+        // no vale). Si el broker es viejo (r.secreto = None), conservamos el que teníamos para no
+        // perder la credencial vigente por un campo ausente.
+        if r.secreto.is_some() {
+            *estado.secreto.write().await = r.secreto.clone();
+        }
         info!("re-registrado como instancia '{}'", r.id);
     }
 }

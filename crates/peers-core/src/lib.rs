@@ -46,6 +46,17 @@ pub struct Instancia {
     pub resumen: String,
     pub registrada_en: String, // ISO 8601
     pub visto_en: String,      // ISO 8601 — base de la liveness por latido
+    /// Secreto de sesión (anti-spoofing del `de_id`, E-10). El broker lo emite en `/registrar`,
+    /// lo persiste aquí y lo devuelve UNA vez al peer; a partir de ahí el peer lo presenta en cada
+    /// acción con identidad (`X-Peers-Secreto`) y el broker ata el `de_id` declarado a ESTA
+    /// instancia comparándolo. INTENCIÓN de seguridad: es un secreto, así que `skip_serializing`
+    /// — NUNCA viaja en la respuesta de `/listar` ni en ningún JSON hacia otros peers (la única
+    /// serialización serde de `Instancia` es ese listado). La persistencia NO depende de serde:
+    /// los backends escriben campo a campo (HSET Redis / columna SQLite), así que ocultarlo del
+    /// wire no lo pierde en disco. `#[serde(default)]` en deserialización para compat con datos
+    /// viejos (instancias registradas antes de E-10 → `None` → el broker les asigna uno al re-registrar).
+    #[serde(default, skip_serializing)]
+    pub secreto: Option<String>,
 }
 
 /// Cuántos mensajes retiene el historial durable por cola (los más recientes).
@@ -171,6 +182,12 @@ pub struct PeticionRegistrar {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespuestaRegistrar {
     pub id: String,
+    /// Secreto de sesión (E-10, anti-spoofing). El broker lo emite en el registro y lo devuelve
+    /// UNA sola vez; el peer lo guarda en memoria y lo presenta en cada acción con identidad
+    /// (header `X-Peers-Secreto`). `#[serde(default)]`: un broker viejo no lo manda → `None` → el
+    /// client cae al modo previo (sin secreto), degradación graciosa.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secreto: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -827,6 +844,93 @@ pub fn tarea_overrun_seg(transcurrido_seg: i64, estimado_seg: Option<i64>) -> bo
 /// recordatorios, reenvíos). Ya se usa así en los handlers del broker; se nombra aquí para que
 /// la exención R3 no dependa de un literal disperso.
 pub const ID_BROKER: &str = "broker";
+
+/// Header HTTP con el que un peer presenta su secreto de sesión (E-10, anti-spoofing). El broker
+/// lo lee en las rutas con identidad (`/enviar` en Fase 1; asignar/reasignar/forzar en Fase 2) y
+/// ata el `de_id` declarado a la instancia dueña de ESE secreto. Nombre en minúsculas porque los
+/// headers HTTP son case-insensitive y así se compara directo. Se centraliza aquí para que
+/// broker y client no dependan de un literal disperso (misma lección que `ID_BROKER`).
+pub const HEADER_SECRETO: &str = "x-peers-secreto";
+
+/// Nº de bytes de entropía del secreto de sesión. 32 bytes = 256 bits de un CSPRNG del SO:
+/// imposible de adivinar por fuerza bruta, holgado frente a los 8 chars del `id` (que NO es
+/// secreto). La fuente de entropía la aporta quien llama (el broker, con `getrandom`); esta
+/// constante y el codificador viven en core para poder testear el formato sin I/O.
+pub const SECRETO_BYTES: usize = 32;
+
+/// Codifica bytes de entropía como un secreto imprimible (base62, `[a-zA-Z0-9]`) — apto para un
+/// header HTTP sin escapado. PURA y testeable: la aleatoriedad la inyecta el caller (broker con
+/// `getrandom`), aquí solo mapeamos cada byte a un carácter del alfabeto. INTENCIÓN: mantener la
+/// lógica sin I/O en core (regla del proyecto), dejando la fuente CSPRNG en el borde (broker).
+/// No es base62 canónico (no re-empaqueta bits): es un mapeo byte→char 1:1, que basta porque la
+/// entropía ya está en los bytes de entrada; buscamos imprimibilidad, no densidad.
+#[must_use]
+pub fn codificar_secreto(bytes: &[u8]) -> String {
+    const ALFABETO: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    bytes
+        .iter()
+        .map(|b| ALFABETO[(*b as usize) % ALFABETO.len()] as char)
+        .collect()
+}
+
+/// Compara dos secretos en tiempo (aproximadamente) constante respecto a su contenido, para no
+/// filtrar por timing cuántos caracteres coinciden. PURA. INTENCIÓN de seguridad: un `==` de
+/// `String` corta en el primer byte distinto (early-return), lo que en teoría permite un ataque
+/// de temporización; recorrer SIEMPRE toda la longitud y acumular en un OR elimina ese canal.
+/// Longitudes distintas → `false` inmediato (la longitud no es secreta, es fija = SECRETO_BYTES).
+#[must_use]
+pub fn secreto_igual(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut dif = 0u8;
+    for i in 0..a.len() {
+        dif |= a[i] ^ b[i];
+    }
+    dif == 0
+}
+
+/// Resultado de resolver la identidad REAL del emisor de un `/enviar` a partir del secreto que
+/// presentó (E-10, decisión C de Max: no se verifica contra el `de_id` declarado; se RESUELVE la
+/// identidad desde el secreto y se SOBRESCRIBE el `de_id`). Lo produce `resolver_emisor` (PURA) y
+/// lo interpreta el broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolucionEmisor {
+    /// El secreto presentado corresponde a una instancia registrada: su id es el emisor REAL. El
+    /// broker sobrescribe `de_id` con este valor, sea cual sea el que venía en el payload
+    /// (spoofing inofensivo por diseño: el `de_id` declarado nunca tiene efecto).
+    Resuelto(String),
+    /// Se presentó un secreto pero NO corresponde a ninguna instancia (secreto inventado o de una
+    /// sesión ya muerta). No hay emisor real que resolver → el broker RECHAZA (`ok:false`).
+    Invalido,
+    /// No se presentó secreto en absoluto (header ausente): client viejo pre-E-10. Ventana de
+    /// compat → el broker deja pasar con el `de_id` DECLARADO + `warn`. Se cierra cuando toda la
+    /// flota reconecte y reciba secreto (migración por re-registro, sin período de gracia).
+    SinCredencial,
+}
+
+/// Resuelve la identidad real del emisor (E-10, decisión C) a partir del secreto presentado en el
+/// header y el id que el store asoció a ese secreto (búsqueda inversa `id_por_secreto`). PURA y
+/// testeable (el broker hace la búsqueda en el store y pasa el resultado aquí). Reglas:
+///
+/// - header ausente (`presentado = None`) → `SinCredencial` (compat con client viejo).
+/// - header presente + el store resolvió un id → `Resuelto(id)` (ese es el emisor real).
+/// - header presente + el store NO resolvió (None) → `Invalido` (secreto que no es de nadie).
+///
+/// El `de_id` declarado en el payload NO entra en esta decisión: por diseño no se le consulta, así
+/// que declararse `operador`/otro es inofensivo. Los remitentes exentos de panel (que hoy no se
+/// registran con secreto) caen en `SinCredencial` y el broker los trata en la ventana de compat.
+#[must_use]
+pub fn resolver_emisor(presentado: Option<&str>, id_del_secreto: Option<String>) -> ResolucionEmisor {
+    match presentado {
+        None => ResolucionEmisor::SinCredencial,
+        Some(_) => match id_del_secreto {
+            Some(id) => ResolucionEmisor::Resuelto(id),
+            None => ResolucionEmisor::Invalido,
+        },
+    }
+}
 
 /// Id reservado del OPERADOR (Max desde la desktop/TUI) — R3 y §5.3 del RFC del lanzador.
 /// HOY la desktop/TUI aún envían con sus ids propios (ver `REMITENTES_EXENTOS`); este id queda
@@ -1663,5 +1767,87 @@ mod tests {
             r#"{"de":"   ","para":"*","accion":"bloquear"}"#
         )
         .is_err());
+    }
+
+    // --- E-10: anti-spoofing del de_id (formato y comparación del secreto) ---
+
+    /// El secreto codificado es imprimible (solo `[a-zA-Z0-9]`) y de la longitud esperada:
+    /// apto para viajar en un header HTTP sin escapado. Entrada determinista (no CSPRNG) porque
+    /// el test verifica el FORMATO, no la entropía (esa la aporta `getrandom` en el broker).
+    #[test]
+    fn secreto_codificado_es_imprimible_y_de_longitud_correcta() {
+        let bytes: Vec<u8> = (0..SECRETO_BYTES as u8).collect();
+        let s = codificar_secreto(&bytes);
+        assert_eq!(s.chars().count(), SECRETO_BYTES);
+        assert!(
+            s.chars().all(|c| c.is_ascii_alphanumeric()),
+            "el secreto debe ser base62 imprimible, fue: {s}"
+        );
+    }
+
+    /// Todo byte posible (0..=255) mapea a un carácter del alfabeto: el `% 62` nunca sale de
+    /// rango ni panica. Guardarraíl de que un byte alto del CSPRNG no rompe la codificación.
+    #[test]
+    fn secreto_codifica_cualquier_byte_sin_panic() {
+        let todos: Vec<u8> = (0..=255u8).collect();
+        let s = codificar_secreto(&todos);
+        assert_eq!(s.chars().count(), 256);
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// `secreto_igual` acepta iguales, rechaza distintos y rechaza longitudes distintas — la base
+    /// de la verificación anti-spoofing. (La constancia temporal no se testea aquí: es una
+    /// propiedad de implementación, no de valor.)
+    #[test]
+    fn secreto_igual_compara_correctamente() {
+        assert!(secreto_igual("abcABC123", "abcABC123"));
+        assert!(!secreto_igual("abcABC123", "abcABC124"));
+        assert!(!secreto_igual("corto", "mucho-mas-largo"));
+        assert!(!secreto_igual("", "x"));
+        assert!(secreto_igual("", ""));
+    }
+
+    /// `resolver_emisor` (decisión C de Max): el `de_id` real sale del secreto, no del payload.
+    /// - Sin header → SinCredencial (compat client viejo).
+    /// - Con header + id resuelto → Resuelto(id) (ese es el emisor, se sobrescribe de_id).
+    /// - Con header + secreto de nadie → Invalido (el broker rechaza).
+    #[test]
+    fn resolver_emisor_resuelve_desde_el_secreto() {
+        assert_eq!(resolver_emisor(None, None), ResolucionEmisor::SinCredencial);
+        // Un header ausente NO consulta el store aunque hubiera id — el secreto manda.
+        assert_eq!(resolver_emisor(None, Some("x".into())), ResolucionEmisor::SinCredencial);
+        assert_eq!(
+            resolver_emisor(Some("sec-abc"), Some("backend".into())),
+            ResolucionEmisor::Resuelto("backend".into())
+        );
+        assert_eq!(resolver_emisor(Some("sec-inventado"), None), ResolucionEmisor::Invalido);
+    }
+
+    /// El campo `secreto` de `Instancia` NUNCA sale en la serialización (skip_serializing): un
+    /// `/listar` hacia otros peers no puede filtrarlo. Verifica la INTENCIÓN de seguridad del
+    /// `#[serde(skip_serializing)]`. Deserializa igual desde datos sin el campo (compat).
+    #[test]
+    fn instancia_no_serializa_el_secreto() {
+        let inst = Instancia {
+            id: "backend".into(),
+            pid: 1,
+            hostname: "host".into(),
+            directorio: "/x".into(),
+            repo_git: None,
+            repo_github: None,
+            tty: None,
+            resumen: "".into(),
+            registrada_en: "2026-07-06T00:00:00Z".into(),
+            visto_en: "2026-07-06T00:00:00Z".into(),
+            secreto: Some("supersecreto".into()),
+        };
+        let json = serde_json::to_string(&inst).expect("serializar");
+        assert!(
+            !json.contains("secreto") && !json.contains("supersecreto"),
+            "el secreto NO debe aparecer en el JSON de la instancia: {json}"
+        );
+        // Y un JSON sin `secreto` deserializa a None (compat con datos pre-E-10).
+        let vuelta: Instancia = serde_json::from_str(&json).expect("deserializar");
+        assert_eq!(vuelta.secreto, None);
     }
 }

@@ -34,6 +34,10 @@ octocrab = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 # Detección de PID vivo (kill(pid,0)) para resolver colisión de id entre peers locales.
 libc = "0.2"
+# CSPRNG del SO para el secreto de sesión (E-10, anti-spoofing del de_id). Ya estaba en el árbol
+# como dep transitiva; se declara directa y se fija a 0.2 (API `getrandom::getrandom(&mut buf)`)
+# para no depender de la resolución entre 0.2/0.3/0.4 del lock. E-22 permite deps externas.
+getrandom = "0.2"
 # Bitácora de acciones (RFC registro-acciones / ADR-001): SQLx con FK reales en un fichero
 # SQLite PROPIO, independiente del backend (Redis/rusqlite). Las CONSULTAS son dinámicas
 # (query/bind, nunca query!): nadie necesita DATABASE_URL ni .sqlx/ para compilar. La feature

@@ -65,11 +65,11 @@ async fn redis_id_estable_hereda_fila_en_restart() {
     };
     limpiar(&alm, &["it-jefin", "it-claudia"]).await;
 
-    alm.registrar("it-jefin", 1, "testhost", "/x", None, None, None, "j", "2026-01-01T00:00:00Z").await.unwrap();
-    alm.registrar("it-claudia", 2, "testhost", "/y", None, None, None, "c", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.registrar("it-jefin", 1, "testhost", "/x", None, None, None, "j", "2026-01-01T00:00:00Z", "sec-it-jefin").await.unwrap();
+    alm.registrar("it-claudia", 2, "testhost", "/y", None, None, None, "c", "2026-01-01T00:00:00Z", "sec-it-claudia").await.unwrap();
     alm.encolar_mensaje("it-claudia", "it-jefin", "pre-restart", "2026-01-01T00:00:01Z").await.unwrap();
     // "Restart": re-registro mismo id, pid distinto.
-    alm.registrar("it-jefin", 999, "testhost", "/x", None, None, None, "j", "2026-01-01T00:01:00Z").await.unwrap();
+    alm.registrar("it-jefin", 999, "testhost", "/x", None, None, None, "j", "2026-01-01T00:01:00Z", "sec-it-jefin").await.unwrap();
 
     let msgs = alm.recibir_mensajes("it-jefin").await.unwrap();
     assert_eq!(msgs.len(), 1, "el mensaje debe sobrevivir al re-registro");
@@ -90,7 +90,7 @@ async fn redis_reregistro_repuebla_el_set_si_quedo_fuera() {
     limpiar(&alm, &["it-fantasma"]).await;
 
     // 1. Registro normal → está en el SET.
-    alm.registrar("it-fantasma", 1, "testhost", "/x", None, None, None, "f", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.registrar("it-fantasma", 1, "testhost", "/x", None, None, None, "f", "2026-01-01T00:00:00Z", "sec-it-fantasma").await.unwrap();
     let antes = alm.listar_ids().await.unwrap();
     assert!(antes.iter().any(|i| i == "it-fantasma"), "debe estar en el SET tras registrar");
 
@@ -100,7 +100,7 @@ async fn redis_reregistro_repuebla_el_set_si_quedo_fuera() {
     //    el MISMO id (el HASH ya existe) debe garantizar el SADD igualmente.
     //    Para forzar el estado fantasma de forma determinista, registramos de nuevo (branch
     //    "existe") y verificamos que sigue en el SET (antes del fix, si hubiera salido, no volvía).
-    alm.registrar("it-fantasma", 2, "testhost", "/x", None, None, None, "f", "2026-01-01T00:01:00Z").await.unwrap();
+    alm.registrar("it-fantasma", 2, "testhost", "/x", None, None, None, "f", "2026-01-01T00:01:00Z", "sec-it-fantasma").await.unwrap();
     let despues = alm.listar_ids().await.unwrap();
     assert!(
         despues.iter().any(|i| i == "it-fantasma"),
@@ -205,7 +205,7 @@ async fn redis_recibir_es_peek_no_destructivo() {
         return;
     };
     limpiar(&alm, &["it-peek", "it-emisor"]).await;
-    alm.registrar("it-peek", 1, "testhost", "/x", None, None, None, "p", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.registrar("it-peek", 1, "testhost", "/x", None, None, None, "p", "2026-01-01T00:00:00Z", "sec-it-peek").await.unwrap();
     alm.encolar_mensaje("it-emisor", "it-peek", "uno", "2026-01-01T00:00:01Z").await.unwrap();
     alm.encolar_mensaje("it-emisor", "it-peek", "dos", "2026-01-01T00:00:02Z").await.unwrap();
 
@@ -233,7 +233,7 @@ async fn redis_transicion_idempotente_timbra_una_vez() {
         return;
     };
     limpiar(&alm, &["it-idem", "it-emisor"]).await;
-    alm.registrar("it-idem", 1, "testhost", "/x", None, None, None, "i", "2026-01-01T00:00:00Z").await.unwrap();
+    alm.registrar("it-idem", 1, "testhost", "/x", None, None, None, "i", "2026-01-01T00:00:00Z", "sec-it-idem").await.unwrap();
     alm.encolar_mensaje("it-emisor", "it-idem", "uno", "2026-01-01T00:00:01Z").await.unwrap();
     let mid = alm.recibir_mensajes("it-idem").await.unwrap()[0].id;
 
@@ -338,8 +338,8 @@ async fn redis_listar_filtra_alcance_y_vivos() {
         return;
     };
     limpiar(&alm, &["it-a", "it-b"]).await;
-    alm.registrar("it-a", 1, "testhost", "/p", Some("/p"), None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
-    alm.registrar("it-b", 2, "testhost", "/p", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+    alm.registrar("it-a", 1, "testhost", "/p", Some("/p"), None, None, "", "2026-06-27T12:00:00Z", "sec-it-a").await.unwrap();
+    alm.registrar("it-b", 2, "testhost", "/p", None, None, None, "", "2026-06-27T12:00:00Z", "sec-it-b").await.unwrap();
     // Excluye al solicitante it-a.
     let r = alm.listar(Alcance::Maquina, "/p", None, Some("it-a"), "1970-01-01T00:00:00Z").await.unwrap();
     assert!(r.iter().any(|i| i.id == "it-b"));
@@ -441,7 +441,7 @@ async fn redis_limpiar_vencidas_bloquea_huerfanas() {
     let Some(alm) = almacen_o_saltar().await else { return; };
     limpiar(&alm, &["it-muerto"]).await;
     limpiar_tareas(&alm, &["it-muerto"], &["it-huerf"], &[]).await;
-    alm.registrar("it-muerto", 1, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+    alm.registrar("it-muerto", 1, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z", "sec-it-muerto").await.unwrap();
     let mut viva = tarea_it("it-huerf", "it-muerto");
     viva.estado = EstadoTarea::EnCurso;
     alm.tarea_guardar(&viva).await.unwrap();
@@ -451,4 +451,44 @@ async fn redis_limpiar_vencidas_bloquea_huerfanas() {
     assert_eq!(t.bloqueo_motivo.as_deref(), Some("peer caído"));
     limpiar(&alm, &["it-muerto"]).await;
     limpiar_tareas(&alm, &["it-muerto"], &["it-huerf"], &[]).await;
+}
+
+/// E-10 (anti-spoofing, decisión C): `registrar` persiste el secreto e indexa la inversa;
+/// `id_por_secreto` resuelve el id REAL; el re-registro ROTA (el viejo deja de resolver); `salir`
+/// limpia el índice. Es el cimiento del `/enviar`: el broker resuelve el emisor por el header y
+/// SOBRESCRIBE el de_id, así declararse otro es inofensivo.
+#[tokio::test]
+async fn redis_secreto_resuelve_emisor_y_rota() {
+    use peers_core::{resolver_emisor, ResolucionEmisor};
+    let Some(alm) = almacen_o_saltar().await else {
+        eprintln!("SALTADO: no hay Redis disponible");
+        return;
+    };
+    limpiar(&alm, &["it-sec"]).await;
+
+    // Alta: el secreto resuelve al id real.
+    alm.registrar("it-sec", 1, "testhost", "/x", None, None, None, "s", "2026-01-01T00:00:00Z", "sec-uno")
+        .await
+        .unwrap();
+    assert_eq!(alm.id_por_secreto("sec-uno").await.unwrap().as_deref(), Some("it-sec"));
+    // Un secreto inventado no resuelve a nadie → el broker rechazaría (Invalido).
+    assert_eq!(alm.id_por_secreto("sec-inventado").await.unwrap(), None);
+
+    // resolver_emisor con lo que devuelve el store.
+    let r = alm.id_por_secreto("sec-uno").await.unwrap();
+    assert_eq!(resolver_emisor(Some("sec-uno"), r), ResolucionEmisor::Resuelto("it-sec".into()));
+    assert_eq!(resolver_emisor(None, None), ResolucionEmisor::SinCredencial);
+
+    // Re-registro rota el secreto: el viejo ya NO resuelve, el nuevo SÍ.
+    alm.registrar("it-sec", 2, "testhost", "/x", None, None, None, "s", "2026-01-01T00:01:00Z", "sec-dos")
+        .await
+        .unwrap();
+    assert_eq!(alm.id_por_secreto("sec-uno").await.unwrap(), None, "el secreto viejo no debe resolver tras rotar");
+    assert_eq!(alm.id_por_secreto("sec-dos").await.unwrap().as_deref(), Some("it-sec"));
+
+    // Baja: el secreto deja de resolver.
+    alm.salir("it-sec").await.unwrap();
+    assert_eq!(alm.id_por_secreto("sec-dos").await.unwrap(), None, "salir debe limpiar el índice del secreto");
+
+    limpiar(&alm, &["it-sec"]).await;
 }

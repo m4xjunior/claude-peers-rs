@@ -125,7 +125,8 @@ impl AlmacenSqlite {
                 id TEXT PRIMARY KEY, pid INTEGER NOT NULL,
                 hostname TEXT NOT NULL DEFAULT '', directorio TEXT NOT NULL,
                 repo_git TEXT, repo_github TEXT, tty TEXT, resumen TEXT NOT NULL DEFAULT '',
-                registrada_en TEXT NOT NULL, visto_en TEXT NOT NULL
+                registrada_en TEXT NOT NULL, visto_en TEXT NOT NULL,
+                secreto TEXT
             );
             CREATE TABLE IF NOT EXISTS mensajes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, de_id TEXT NOT NULL, para_id TEXT NOT NULL,
@@ -232,6 +233,15 @@ impl AlmacenSqlite {
             [],
         );
         let _ = conexion.execute("ALTER TABLE tareas ADD COLUMN evidencia TEXT", []);
+        // E-10: `secreto` en bases YA existentes. Idempotente (ignora "duplicate column"). Filas
+        // viejas → NULL → None → el broker les emite un secreto al primer re-registro (compat).
+        let _ = conexion.execute("ALTER TABLE instancias ADD COLUMN secreto TEXT", []);
+        // Índice para la búsqueda inversa `id_por_secreto` (O(log n) en vez de escaneo). IF NOT
+        // EXISTS lo hace idempotente; la columna ya existe por el ALTER anterior.
+        let _ = conexion.execute(
+            "CREATE INDEX IF NOT EXISTS idx_instancias_secreto ON instancias(secreto)",
+            [],
+        );
         Ok(Self {
             conexion: Mutex::new(conexion),
         })
@@ -255,22 +265,24 @@ impl Almacen for AlmacenSqlite {
         tty: Option<&str>,
         resumen: &str,
         ahora: &str,
+        secreto: &str,
     ) -> anyhow::Result<bool> {
         let conexion = self.bloquear();
         let existe: bool = conexion
             .query_row("SELECT 1 FROM instancias WHERE id = ?1", params![id], |_| Ok(true))
             .unwrap_or(false);
         if existe {
-            // Re-registro: UPDATE sin tocar la fila de mensajes ni registrada_en/resumen.
+            // Re-registro: UPDATE sin tocar la fila de mensajes ni registrada_en/resumen. E-10: el
+            // secreto SÍ se rota (sesión nueva = credencial fresca), espejo de la impl Redis.
             conexion.execute(
-                "UPDATE instancias SET pid=?2, hostname=?3, directorio=?4, repo_git=?5, repo_github=?6, tty=?7, visto_en=?8 WHERE id=?1",
-                params![id, pid, hostname, directorio, repo_git, repo_github, tty, ahora],
+                "UPDATE instancias SET pid=?2, hostname=?3, directorio=?4, repo_git=?5, repo_github=?6, tty=?7, visto_en=?8, secreto=?9 WHERE id=?1",
+                params![id, pid, hostname, directorio, repo_git, repo_github, tty, ahora, secreto],
             )?;
         } else {
             conexion.execute(
-                "INSERT INTO instancias (id,pid,hostname,directorio,repo_git,repo_github,tty,resumen,registrada_en,visto_en)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
-                params![id, pid, hostname, directorio, repo_git, repo_github, tty, resumen, ahora],
+                "INSERT INTO instancias (id,pid,hostname,directorio,repo_git,repo_github,tty,resumen,registrada_en,visto_en,secreto)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
+                params![id, pid, hostname, directorio, repo_git, repo_github, tty, resumen, ahora, secreto],
             )?;
         }
         Ok(!existe)
@@ -347,6 +359,24 @@ impl Almacen for AlmacenSqlite {
                 fila_a_instancia,
             )
             .ok())
+    }
+
+    async fn id_por_secreto(&self, secreto: &str) -> anyhow::Result<Option<String>> {
+        // Búsqueda inversa por la columna `secreto` (índice SQL `idx_instancias_secreto` la hace
+        // O(log n)). `query_row` → Err si no hay fila → `.ok()` = None. Secreto vacío nunca matchea
+        // (no lo guardamos vacío), pero filtramos por si acaso.
+        if secreto.is_empty() {
+            return Ok(None);
+        }
+        let id: Option<String> = self
+            .bloquear()
+            .query_row(
+                "SELECT id FROM instancias WHERE secreto=?1",
+                params![secreto],
+                |f| f.get::<_, String>(0),
+            )
+            .ok();
+        Ok(id)
     }
 
     async fn listar(
@@ -1074,6 +1104,9 @@ fn fila_a_instancia(f: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
         resumen: f.get("resumen")?,
         registrada_en: f.get("registrada_en")?,
         visto_en: f.get("visto_en")?,
+        // E-10: `Option<String>` → NULL o columna ausente (BD pre-migración) → None. `ok()`
+        // absorbe ambos casos sin fallar la lectura de la instancia entera.
+        secreto: f.get("secreto").ok(),
     })
 }
 
@@ -1160,14 +1193,37 @@ mod pruebas {
     #[tokio::test]
     async fn id_estable_reregistro_hereda_la_fila() {
         let b = base();
-        b.registrar("jefin", 111, "testhost", "/x", None, None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
-        b.registrar("claudia", 222, "testhost", "/y", None, None, None, "papel", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("jefin", 111, "testhost", "/x", None, None, None, "papel", "2026-01-01T00:00:00Z", "sec-jefin").await.unwrap();
+        b.registrar("claudia", 222, "testhost", "/y", None, None, None, "papel", "2026-01-01T00:00:00Z", "sec-claudia").await.unwrap();
         b.encolar_mensaje("claudia", "jefin", "hola pre-restart", "2026-01-01T00:00:01Z").await.unwrap();
         // Restart: re-registro mismo id, pid distinto.
-        b.registrar("jefin", 999, "testhost", "/x", None, None, None, "papel", "2026-01-01T00:01:00Z").await.unwrap();
+        b.registrar("jefin", 999, "testhost", "/x", None, None, None, "papel", "2026-01-01T00:01:00Z", "sec-jefin").await.unwrap();
         let msgs = b.recibir_mensajes("jefin").await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].texto, "hola pre-restart");
+    }
+
+    /// E-10 (paridad SQLite): `id_por_secreto` resuelve el id real desde el secreto, el re-registro
+    /// lo ROTA (el viejo deja de resolver) y `salir` limpia. Espejo del test Redis (AC7). Sin la
+    /// columna/ALTER/índice, esto fallaría — guardarraíl de la migración SQLite del secreto.
+    #[tokio::test]
+    async fn secreto_resuelve_emisor_y_rota() {
+        let b = base();
+        b.registrar("s", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z", "sec-uno")
+            .await
+            .unwrap();
+        assert_eq!(b.id_por_secreto("sec-uno").await.unwrap().as_deref(), Some("s"));
+        // Secreto inventado → None (el broker rechazaría, Invalido).
+        assert_eq!(b.id_por_secreto("sec-inventado").await.unwrap(), None);
+        // Re-registro rota: el viejo ya no resuelve, el nuevo sí.
+        b.registrar("s", 2, "testhost", "/x", None, None, None, "", "2026-01-01T00:01:00Z", "sec-dos")
+            .await
+            .unwrap();
+        assert_eq!(b.id_por_secreto("sec-uno").await.unwrap(), None);
+        assert_eq!(b.id_por_secreto("sec-dos").await.unwrap().as_deref(), Some("s"));
+        // Baja limpia la resolución.
+        b.salir("s").await.unwrap();
+        assert_eq!(b.id_por_secreto("sec-dos").await.unwrap(), None);
     }
 
     /// Anti-colisión cross-host (fix 2026-06-30): el almacén debe persistir y devolver el
@@ -1176,11 +1232,11 @@ mod pruebas {
     #[tokio::test]
     async fn registrar_persiste_hostname_para_anticolision_crosshost() {
         let b = base();
-        b.registrar("aistudio", 555, "ai-studio", "/home/aistudio", None, None, None, "", "2026-06-30T10:00:00Z").await.unwrap();
+        b.registrar("aistudio", 555, "ai-studio", "/home/aistudio", None, None, None, "", "2026-06-30T10:00:00Z", "sec-aistudio").await.unwrap();
         let inst = b.instancia_obtener("aistudio").await.unwrap().unwrap();
         assert_eq!(inst.hostname, "ai-studio", "el hostname debe round-trippear");
         // Re-registro desde el MISMO host conserva el hostname actualizado.
-        b.registrar("aistudio", 777, "ai-studio", "/home/aistudio", None, None, None, "", "2026-06-30T10:01:00Z").await.unwrap();
+        b.registrar("aistudio", 777, "ai-studio", "/home/aistudio", None, None, None, "", "2026-06-30T10:01:00Z", "sec-aistudio").await.unwrap();
         let inst2 = b.instancia_obtener("aistudio").await.unwrap().unwrap();
         assert_eq!(inst2.hostname, "ai-studio");
         assert_eq!(inst2.pid, 777, "re-registro actualiza el pid");
@@ -1193,8 +1249,8 @@ mod pruebas {
         // registro del broker: la 1ª toma el id base; la 2ª (mismo dir, otro pid, ambas vivas)
         // se registra bajo el sufijo -2. Las dos deben coexistir en el índice, no pisarse.
         let b = base();
-        b.registrar("ejemplo", 1001, "host", "/proyecto/ejemplo", None, None, None, "primera", "2026-07-02T10:00:00Z").await.unwrap();
-        b.registrar("ejemplo-2", 1002, "host", "/proyecto/ejemplo", None, None, None, "segunda", "2026-07-02T10:00:01Z").await.unwrap();
+        b.registrar("ejemplo", 1001, "host", "/proyecto/ejemplo", None, None, None, "primera", "2026-07-02T10:00:00Z", "sec-ejemplo").await.unwrap();
+        b.registrar("ejemplo-2", 1002, "host", "/proyecto/ejemplo", None, None, None, "segunda", "2026-07-02T10:00:01Z", "sec-ejemplo-2").await.unwrap();
         // Ambas existen con identidad propia.
         let uno = b.instancia_obtener("ejemplo").await.unwrap().expect("ejemplo debe existir");
         let dos = b.instancia_obtener("ejemplo-2").await.unwrap().expect("ejemplo-2 debe existir");
@@ -1209,7 +1265,7 @@ mod pruebas {
         // R1.1: recibir NO borra. Dos peeks seguidos devuelven el mismo mensaje. Solo sale de
         // la bandeja activa al transicionar a Procesado (R1.5), pero queda en historial (R2.1).
         let b = base();
-        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z", "sec-a").await.unwrap();
         b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
         let primera = b.recibir_mensajes("a").await.unwrap();
         assert_eq!(primera.len(), 1);
@@ -1228,7 +1284,7 @@ mod pruebas {
     async fn transicion_idempotente_y_monotona() {
         // R1.2/R1.3: el timbre del tiempo es solo la primera vez; no retrocede.
         let b = base();
-        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z", "sec-a").await.unwrap();
         b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
         let mid = b.recibir_mensajes("a").await.unwrap()[0].id;
         // Primera transición a Entregado → true, timbra entregado_en.
@@ -1246,7 +1302,7 @@ mod pruebas {
     #[tokio::test]
     async fn historial_filtra_y_retencion_recorta() {
         let b = base();
-        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z", "sec-a").await.unwrap();
         for i in 0..5 {
             b.encolar_mensaje("b", "a", &format!("m{i}"), "2026-01-01T00:00:01Z").await.unwrap();
         }
@@ -1268,8 +1324,8 @@ mod pruebas {
     #[tokio::test]
     async fn reregistro_conserva_registrada_en_y_resumen() {
         let b = base();
-        b.registrar("x", 1, "testhost", "/d", None, None, None, "resumen original", "2026-01-01T00:00:00Z").await.unwrap();
-        b.registrar("x", 2, "testhost", "/d", None, None, None, "ignorado", "2026-02-02T00:00:00Z").await.unwrap();
+        b.registrar("x", 1, "testhost", "/d", None, None, None, "resumen original", "2026-01-01T00:00:00Z", "sec-x").await.unwrap();
+        b.registrar("x", 2, "testhost", "/d", None, None, None, "ignorado", "2026-02-02T00:00:00Z", "sec-x").await.unwrap();
         let inst = &b.listar(Alcance::Maquina, "/d", None, None, "1970-01-01T00:00:00Z").await.unwrap()[0];
         assert_eq!(inst.resumen, "resumen original");
         assert_eq!(inst.registrada_en, "2026-01-01T00:00:00Z");
@@ -1279,8 +1335,8 @@ mod pruebas {
     #[tokio::test]
     async fn liveness_filtra_vencidas() {
         let b = base();
-        b.registrar("viva", 1, "testhost", "/d", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
-        b.registrar("muerta", 2, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        b.registrar("viva", 1, "testhost", "/d", None, None, None, "", "2026-06-27T12:00:00Z", "sec-viva").await.unwrap();
+        b.registrar("muerta", 2, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z", "sec-muerta").await.unwrap();
         let vivas = b.listar(Alcance::Maquina, "/d", None, None, "2026-06-27T11:59:00Z").await.unwrap();
         assert_eq!(vivas.len(), 1);
         assert_eq!(vivas[0].id, "viva");
@@ -1289,7 +1345,7 @@ mod pruebas {
     #[tokio::test]
     async fn limpiar_purga_instancia_y_fila() {
         let b = base();
-        b.registrar("zombie", 1, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        b.registrar("zombie", 1, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z", "sec-zombie").await.unwrap();
         b.encolar_mensaje("otro", "zombie", "x", "2020-01-01T00:00:01Z").await.unwrap();
         assert_eq!(b.limpiar_vencidas("2026-01-01T00:00:00Z").await.unwrap(), 1);
         assert!(!b.instancia_existe("zombie").await.unwrap());
@@ -1299,8 +1355,8 @@ mod pruebas {
     #[tokio::test]
     async fn listar_excluye_solicitante() {
         let b = base();
-        b.registrar("yo", 1, "testhost", "/d", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
-        b.registrar("otro", 2, "testhost", "/d", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("yo", 1, "testhost", "/d", None, None, None, "", "2026-06-27T12:00:00Z", "sec-yo").await.unwrap();
+        b.registrar("otro", 2, "testhost", "/d", None, None, None, "", "2026-06-27T12:00:00Z", "sec-otro").await.unwrap();
         let r = b.listar(Alcance::Maquina, "/d", None, Some("yo"), "1970-01-01T00:00:00Z").await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].id, "otro");
@@ -1309,8 +1365,8 @@ mod pruebas {
     #[tokio::test]
     async fn repo_sin_git_cae_a_directorio() {
         let b = base();
-        b.registrar("a", 1, "testhost", "/proj", Some("/proj"), None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
-        b.registrar("b", 2, "testhost", "/proj", None, None, None, "", "2026-06-27T12:00:00Z").await.unwrap();
+        b.registrar("a", 1, "testhost", "/proj", Some("/proj"), None, None, "", "2026-06-27T12:00:00Z", "sec-a").await.unwrap();
+        b.registrar("b", 2, "testhost", "/proj", None, None, None, "", "2026-06-27T12:00:00Z", "sec-b").await.unwrap();
         let r = b.listar(Alcance::Repo, "/proj", None, None, "1970-01-01T00:00:00Z").await.unwrap();
         assert_eq!(r.len(), 2);
     }
@@ -1442,7 +1498,7 @@ mod pruebas {
     async fn mensajes_en_estado_filtra_leido() {
         // R4: el detector de ghosteo pide los Leido (no Procesado). Devuelve (para_id, Mensaje).
         let b = base();
-        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z").await.unwrap();
+        b.registrar("a", 1, "testhost", "/x", None, None, None, "", "2026-01-01T00:00:00Z", "sec-a").await.unwrap();
         b.encolar_mensaje("b", "a", "uno", "2026-01-01T00:00:01Z").await.unwrap();
         b.encolar_mensaje("b", "a", "dos", "2026-01-01T00:00:02Z").await.unwrap();
         let ids: Vec<i64> = b.recibir_mensajes("a").await.unwrap().iter().map(|m| m.id).collect();
@@ -1792,7 +1848,7 @@ mod pruebas {
         // #12: al limpiar un peer caído, sus tareas vivas pasan a Bloqueada('peer caído') y NO
         // se quedan con fin=None apuntando a un peer que ya no existe. Las terminales no se tocan.
         let b = base();
-        b.registrar("muerto", 1, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z").await.unwrap();
+        b.registrar("muerto", 1, "testhost", "/d", None, None, None, "", "2020-01-01T00:00:00Z", "sec-muerto").await.unwrap();
         let mut viva = tarea_base("viva");
         viva.instancia_id = "muerto".into();
         viva.estado = EstadoTarea::EnCurso;
