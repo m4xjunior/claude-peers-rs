@@ -388,6 +388,19 @@ impl ClienteBroker {
         Ok(r.mensajes)
     }
 
+    // --- Política de comunicación (R12: aislar proyecto) ---
+
+    /// `GET /admin/politica` → la política de comunicación vigente (reglas + acción por defecto).
+    pub async fn politica_leer(&self) -> ResultadoBroker<Politica> {
+        self.get("/admin/politica").await
+    }
+
+    /// `POST /admin/politica` → REEMPLAZA la política completa (idempotente). La ficha de Proyecto la
+    /// usa para añadir/quitar las reglas de aislamiento (`* → @X: bloquear` + `@X → @X: permitir`).
+    pub async fn politica_guardar(&self, politica: &Politica) -> ResultadoBroker<RespuestaOk> {
+        self.post("/admin/politica", politica).await
+    }
+
     // --- Acciones de gestión de tareas (Pantalla Tareas, R5/R6/R7/R8) ---
     // El jefe opera sobre las tareas de sus peers. Cada acción es un POST idempotente en el
     // broker; la desktop dispara y luego refresca la lista con `admin_tareas`.

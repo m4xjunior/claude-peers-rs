@@ -154,6 +154,85 @@ pub struct LanzarAgente {
     pub ruta: String,
 }
 
+/// Alterna el AISLAMIENTO del proyecto `id` (R12): activar/desactivar las reglas de política que
+/// impiden que agentes de OTROS proyectos le hablen. `AppDesktop` lee la política del broker, aplica
+/// `con_aislamiento` y la guarda. `aislar` = estado deseado (true = aislar, false = quitar).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct AlternarAislamientoProyecto {
+    pub id: String,
+    pub aislar: bool,
+}
+
+// --- Aislamiento de proyecto (R12): generación de reglas de política. PUROS y testeables. ---
+//
+// Semántica confirmada por Max: (B) SOLO ENTRADA. Aislar el proyecto X significa "nadie de afuera le
+// habla a X, pero X sí puede hablar hacia afuera". Se traduce a DOS reglas, en este orden (el motor
+// evalúa arriba-abajo, primera que casa gana — como un firewall):
+//   1. `@X → @X : permitir`  (los agentes del propio proyecto SÍ se comunican entre ellos)
+//   2. `*  → @X : bloquear`  (cualquier OTRO emisor hacia X queda bloqueado)
+// El orden importa: la de permitir-dentro va ANTES que la de bloquear-todo, si no, los propios
+// agentes de X quedarían bloqueados por la regla 2.
+
+/// Las dos reglas de aislamiento (entrada) del proyecto `proyecto`, en el orden correcto.
+fn reglas_aislamiento(proyecto: &str) -> Vec<peers_core::ReglaComunicacion> {
+    use peers_core::{AccionPolitica, Patron, ReglaComunicacion};
+    let grupo = Patron::Grupo(proyecto.to_string());
+    vec![
+        ReglaComunicacion {
+            de: grupo.clone(),
+            para: grupo.clone(),
+            accion: AccionPolitica::Permitir,
+            motivo: None,
+        },
+        ReglaComunicacion {
+            de: Patron::Cualquiera,
+            para: grupo,
+            accion: AccionPolitica::Bloquear,
+            motivo: Some(format!("proyecto '{proyecto}' aislado (necesidad de saber)")),
+        },
+    ]
+}
+
+/// ¿El proyecto `proyecto` está aislado en `politica`? (contiene la regla de bloqueo de entrada).
+#[must_use]
+pub fn proyecto_aislado(politica: &peers_core::Politica, proyecto: &str) -> bool {
+    use peers_core::{AccionPolitica, Patron};
+    let grupo = Patron::Grupo(proyecto.to_string());
+    politica.reglas.iter().any(|r| {
+        r.para == grupo && r.de == Patron::Cualquiera && r.accion == AccionPolitica::Bloquear
+    })
+}
+
+/// Devuelve una NUEVA política con el aislamiento de `proyecto` en el estado `aislar`. Idempotente:
+/// primero QUITA cualquier regla de aislamiento previa de ese proyecto (para no duplicar ni dejar
+/// restos), y si `aislar` es true, ANTEPONE las dos reglas nuevas (deben ir arriba para ganar sobre
+/// reglas más genéricas). Las reglas de OTROS proyectos y las manuales se conservan intactas.
+#[must_use]
+pub fn con_aislamiento(
+    politica: &peers_core::Politica,
+    proyecto: &str,
+    aislar: bool,
+) -> peers_core::Politica {
+    use peers_core::Patron;
+    let grupo = Patron::Grupo(proyecto.to_string());
+    // Quita las reglas cuyo `para` es este grupo (las de aislamiento de ESTE proyecto), conservando
+    // todo lo demás. Así togglear es idempotente y no acumula duplicados.
+    let mut reglas: Vec<_> = politica
+        .reglas
+        .iter()
+        .filter(|r| r.para != grupo)
+        .cloned()
+        .collect();
+    if aislar {
+        // Antepone (las reglas de aislamiento deben evaluarse antes que reglas `*` genéricas).
+        let mut nuevas = reglas_aislamiento(proyecto);
+        nuevas.extend(reglas);
+        reglas = nuevas;
+    }
+    peers_core::Politica { reglas, accion_por_defecto: politica.accion_por_defecto }
+}
+
 // --- Filtrado por proyecto activo (R11). PUROS y reutilizables por Peers/Tareas/Jornada/Alertas. ---
 
 /// ¿El id `id` pertenece al proyecto activo? (R11, aislamiento por convención de id). Con
@@ -384,17 +463,45 @@ fn ficha(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
         .child(ficha_cabecera(p))
         .child(barra_tabs(datos.proyecto_ficha_tab))
         .child(seccion_activa(datos, p))
-        // R12 (aislar proyecto) — DIFERIDO a v2 (decisión de Max): el hard-block cross-proyecto
-        // necesita extender el motor de política del broker con un patrón por `@proyecto` (hoy el
-        // `Patron` solo hace match exacto o `*`), que es backend. En v1 el aislamiento es por
-        // convención de id (el filtro de proyecto activo de esta pantalla). Se documenta aquí para
-        // que se vea que fue una decisión, no un olvido.
+        .child(control_aislamiento(datos, p))
+}
+
+/// Control de AISLAMIENTO del proyecto (R12): toggle que activa/desactiva las reglas de política
+/// (`* → @X: bloquear` + `@X → @X: permitir`). Aislado = nadie de otro proyecto puede escribirle a
+/// los agentes de X, ni por el canal normal ni por el chat privado (necesidad de saber). El estado
+/// se lee de `proyecto_politica`; el clic despacha `AlternarAislamientoProyecto` con el nuevo valor.
+fn control_aislamiento(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
+    let aislado = datos
+        .proyecto_politica
+        .as_ref()
+        .map(|pol| proyecto_aislado(pol, &p.id))
+        .unwrap_or(false);
+    let id = p.id.clone();
+    let (etiqueta, glosa) = if aislado {
+        ("Aislado ✓ — quitar aislamiento", "Nadie de otros proyectos puede escribirle a este equipo (ni chat normal ni privado).")
+    } else {
+        ("Aislar este proyecto", "Bloquea que agentes de otros proyectos le escriban a este equipo (necesidad de saber).")
+    };
+    let nuevo_estado = !aislado;
+    tema::superficie_card()
+        .v_flex()
+        .gap_2()
+        .p_4()
+        .child(tema::eyebrow("aislamiento (R12)"))
         .child(
-            tema::texto_terciario(
-                "Aislamiento estricto (bloquear comunicación cross-proyecto): v2 — hoy el proyecto \
-                 se aísla por convención de id + el filtro de proyecto activo.",
-            )
-            .text_color(tema::HUMO),
+            div()
+                .h_flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    tema::boton_secundario("proy-aislar", etiqueta).on_click(move |_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(AlternarAislamientoProyecto { id: id.clone(), aislar: nuevo_estado }),
+                            cx,
+                        )
+                    }),
+                )
+                .child(tema::texto_terciario(glosa)),
         )
 }
 
@@ -691,6 +798,62 @@ fn chip_tipo(etiqueta: &str, activo: bool, es_local: bool) -> impl IntoElement {
 mod tests {
     use super::*;
     use crate::app::Pantalla;
+    use peers_core::{AccionPolitica, Patron, Politica, ReglaComunicacion};
+
+    /// R12: `con_aislamiento` genera las 2 reglas en el orden correcto (permitir-dentro ANTES de
+    /// bloquear-todo), `proyecto_aislado` las detecta, y togglear off las quita sin tocar el resto.
+    #[test]
+    fn aislamiento_genera_reglas_correctas_e_idempotente() {
+        let vacia = Politica::default();
+        assert!(!proyecto_aislado(&vacia, "web"));
+
+        // Aislar "web": 2 reglas, permitir-dentro primero, bloquear-todo después.
+        let aislada = con_aislamiento(&vacia, "web", true);
+        assert!(proyecto_aislado(&aislada, "web"));
+        assert_eq!(aislada.reglas.len(), 2);
+        assert_eq!(aislada.reglas[0].de, Patron::Grupo("web".into()));
+        assert_eq!(aislada.reglas[0].para, Patron::Grupo("web".into()));
+        assert_eq!(aislada.reglas[0].accion, AccionPolitica::Permitir);
+        assert_eq!(aislada.reglas[1].de, Patron::Cualquiera);
+        assert_eq!(aislada.reglas[1].para, Patron::Grupo("web".into()));
+        assert_eq!(aislada.reglas[1].accion, AccionPolitica::Bloquear);
+
+        // Idempotente: volver a aislar no duplica (sigue con 2 reglas).
+        let re_aislada = con_aislamiento(&aislada, "web", true);
+        assert_eq!(re_aislada.reglas.len(), 2);
+
+        // Quitar el aislamiento: vuelve a 0 reglas de "web".
+        let quitada = con_aislamiento(&aislada, "web", false);
+        assert!(!proyecto_aislado(&quitada, "web"));
+        assert!(quitada.reglas.is_empty());
+    }
+
+    /// R12: aislar un proyecto NO toca las reglas de otro proyecto ni las manuales.
+    #[test]
+    fn aislamiento_no_pisa_otras_reglas() {
+        // Parte con "api" ya aislado + una regla manual.
+        let base = con_aislamiento(&Politica::default(), "api", true);
+        let manual = ReglaComunicacion {
+            de: Patron::Id("x".into()),
+            para: Patron::Id("y".into()),
+            accion: AccionPolitica::Bloquear,
+            motivo: None,
+        };
+        let mut base = base;
+        base.reglas.push(manual.clone());
+
+        // Aislar "web" además: "api" y la manual siguen; "web" se suma.
+        let con_web = con_aislamiento(&base, "web", true);
+        assert!(proyecto_aislado(&con_web, "web"));
+        assert!(proyecto_aislado(&con_web, "api"));
+        assert!(con_web.reglas.contains(&manual));
+
+        // Quitar "web" no afecta "api" ni la manual.
+        let sin_web = con_aislamiento(&con_web, "web", false);
+        assert!(!proyecto_aislado(&sin_web, "web"));
+        assert!(proyecto_aislado(&sin_web, "api"));
+        assert!(sin_web.reglas.contains(&manual));
+    }
 
     /// La pantalla Proyectos está cableada en el enum con título e id propios (guardarraíl del
     /// registro: si se quita del array o se duplica un título, esto lo detecta).

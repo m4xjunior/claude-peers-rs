@@ -1032,12 +1032,16 @@ pub fn remitente_exento(de_id: &str) -> bool {
     REMITENTES_EXENTOS.contains(&de_id)
 }
 
-/// Patrón de coincidencia de una regla (R1): `*` (cualquiera) o un id de instancia exacto.
+/// Patrón de coincidencia de una regla (R1): `*` (cualquiera), un id exacto, o un GRUPO por proyecto
+/// (R12 — aislamiento por jerarquía/necesidad-de-saber, RFC-proyectos §6.1).
 ///
-/// EN EL WIRE es una CADENA simple (`"*"` o el id), no un objeto: legible para la UI y para
-/// el JSON que edita Max. `try_from` valida en la frontera (parse, don't validate): un patrón
-/// vacío se rechaza al deserializar, así el motor nunca ve basura. El enum queda abierto a la
-/// variante futura `Grupo` (§5.4 — YAGNI en v1; una cadena `grupo:x` cabría sin romper el wire).
+/// EN EL WIRE es una CADENA simple, legible para la UI y el JSON que edita Max:
+///   - `"*"`         → `Cualquiera` (casa con todo).
+///   - `"@web"`      → `Grupo("web")` (casa con cualquier id que TERMINE en `@web` — la convención
+///                     `rol@proyecto` del aislamiento por proyecto).
+///   - `"backend@web"` u otro → `Id(...)` (casa solo con ese id exacto).
+/// `try_from` valida en la frontera (parse, don't validate): un patrón vacío o un `@` a secas se
+/// rechazan al deserializar, así el motor nunca ve basura.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Patron {
@@ -1045,6 +1049,10 @@ pub enum Patron {
     Cualquiera,
     /// Casa solo con el id exacto.
     Id(String),
+    /// Casa con cualquier id del proyecto `proyecto` (los que terminan en `@<proyecto>`). Wire:
+    /// `@<proyecto>`. Es la pieza de R12 que faltaba: el motor de política puede aislar un proyecto
+    /// entero sin enumerar cada agente (que además puede lanzarse DESPUÉS de escrita la regla).
+    Grupo(String),
 }
 
 impl Patron {
@@ -1054,6 +1062,9 @@ impl Patron {
         match self {
             Patron::Cualquiera => true,
             Patron::Id(p) => p == id,
+            // Casa si el id pertenece al proyecto: termina en `@<proyecto>`. Se compara contra el
+            // sufijo completo `@web` (no solo `web`) para que "web" no case con "@webapp".
+            Patron::Grupo(proyecto) => id.ends_with(&format!("@{proyecto}")),
         }
     }
 }
@@ -1064,13 +1075,19 @@ impl TryFrom<String> for Patron {
     fn try_from(s: String) -> Result<Self, Self::Error> {
         let s = s.trim();
         if s.is_empty() {
-            return Err("patrón vacío: usa \"*\" o un id de instancia".to_string());
+            return Err("patrón vacío: usa \"*\", un id o \"@proyecto\"".to_string());
         }
-        Ok(if s == "*" {
-            Patron::Cualquiera
-        } else {
-            Patron::Id(s.to_string())
-        })
+        if s == "*" {
+            return Ok(Patron::Cualquiera);
+        }
+        // `@proyecto` → grupo. `@` a secas (sin nombre) es inválido.
+        if let Some(proyecto) = s.strip_prefix('@') {
+            if proyecto.is_empty() {
+                return Err("grupo vacío: usa \"@<proyecto>\" con un nombre".to_string());
+            }
+            return Ok(Patron::Grupo(proyecto.to_string()));
+        }
+        Ok(Patron::Id(s.to_string()))
     }
 }
 
@@ -1079,6 +1096,7 @@ impl From<Patron> for String {
         match p {
             Patron::Cualquiera => "*".to_string(),
             Patron::Id(id) => id,
+            Patron::Grupo(proyecto) => format!("@{proyecto}"),
         }
     }
 }
@@ -1849,6 +1867,31 @@ mod tests {
             r#"{"de":"   ","para":"*","accion":"bloquear"}"#
         )
         .is_err());
+    }
+
+    /// R12: `Patron::Grupo` (`@proyecto`) — parse desde el wire, casa por sufijo y roundtrip.
+    #[test]
+    fn patron_grupo_por_proyecto() {
+        // Parse del wire.
+        let g = Patron::try_from("@web".to_string()).expect("@web válido");
+        assert_eq!(g, Patron::Grupo("web".to_string()));
+        // Casa con los del proyecto, no con otros ni con prefijos parecidos.
+        assert!(g.casa("backend@web"));
+        assert!(g.casa("qa@web"));
+        assert!(!g.casa("backend@otro"));
+        assert!(!g.casa("sin-sufijo"));
+        assert!(!g.casa("rol@webapp"), "@web NO debe casar @webapp (sufijo completo)");
+        // `@` a secas es inválido (grupo sin nombre).
+        assert!(Patron::try_from("@".to_string()).is_err());
+        // Roundtrip por el wire: Grupo("web") → "@web" → Grupo("web").
+        let json = serde_json::to_string(&g).expect("serializar");
+        assert_eq!(json, "\"@web\"");
+        assert_eq!(serde_json::from_str::<Patron>(&json).expect("deserializar"), g);
+        // Un id con @ pero declarado como Id exacto (no empieza con @) sigue siendo Id.
+        assert_eq!(
+            Patron::try_from("backend@web".to_string()).unwrap(),
+            Patron::Id("backend@web".to_string())
+        );
     }
 
     // --- E-10: anti-spoofing del de_id (formato y comparación del secreto) ---

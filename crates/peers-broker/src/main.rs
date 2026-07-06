@@ -662,6 +662,26 @@ async fn chat_privado_enviar(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(ID_OPERADOR);
+    // R12 (aislamiento): el chat privado TAMBIÉN respeta la política (decisión de Max — el
+    // aislamiento cubre AMBOS canales). Se evalúa `de → sesion_id` igual que en `enviar`: si un
+    // proyecto está aislado (`* → @X: bloquear`), un `de` ajeno no puede escribir a un peer de X ni
+    // por el canal privado. El `de` es el remitente aparente (si Max "aparenta ser" un id de X, ese
+    // id SÍ pasa — es parte del caso de uso). Bloqueado → no encola, se traza, ok:false.
+    if let DecisionPolitica::Bloqueada { motivo } =
+        evaluar_politica(&e, de, &p.sesion_id).await
+    {
+        let bloqueo = BloqueoComunicacion {
+            de_id: de.to_string(),
+            para_id: p.sesion_id.clone(),
+            motivo: motivo.clone(),
+            cuando: ahora_iso(),
+        };
+        if let Err(err) = e.almacen.registrar_bloqueo(&bloqueo).await {
+            warn!("no se pudo registrar el bloqueo de chat privado (se responde igual): {err:#}");
+        }
+        info!("chat privado bloqueado por política: '{de}' → '{}' ({motivo})", p.sesion_id);
+        return Ok(Json(RespuestaOk { ok: false }));
+    }
     // Operador→peer: encola en la cola de ENTRADA del peer (la que el peer drena).
     let msg = e
         .almacen

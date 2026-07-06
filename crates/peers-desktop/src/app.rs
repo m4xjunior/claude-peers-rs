@@ -186,6 +186,10 @@ pub struct EstadoPantalla {
     pub proyecto_form: Option<FormProyecto>,
     /// Error de validación de frontera del formulario de proyecto (nombre vacío, etc.).
     pub proyecto_form_error: Option<String>,
+    /// Política de comunicación vigente (R12): cacheada para saber si un proyecto está aislado y
+    /// para togglear su aislamiento sin perder las reglas de otros proyectos. Se carga al entrar a
+    /// Proyectos. `None` hasta la primera lectura (o si el broker no responde).
+    pub proyecto_politica: Option<peers_core::Politica>,
     /// Input del nombre del proyecto en el formulario. `Entity<InputState>` del kit.
     pub input_proyecto_nombre: Option<Entity<gpui_component::input::InputState>>,
     /// Input de la ruta (carpeta local o ruta remota) del proyecto en el formulario.
@@ -516,6 +520,7 @@ impl AppDesktop {
             Pantalla::Proyectos => {
                 self.cargar_peers(cx); // instancias + alertas (para equipo/alertas de la ficha)
                 self.cargar_tareas(cx); // tablero de la ficha
+                self.cargar_politica_proyectos(cx); // R12: para saber qué proyectos están aislados
             }
             // Config y Lanzador editan estado local (no consultan el broker en Fase 1).
             Pantalla::Config | Pantalla::Lanzador => {}
@@ -1672,6 +1677,49 @@ impl AppDesktop {
             });
         }
         self.ir_a(Pantalla::Lanzador, cx);
+    }
+
+    /// R12: carga la política de comunicación vigente (para saber qué proyectos están aislados). Red
+    /// en fondo (background_executor + bloquear_en, anti-SIGABRT). Silenciosa: si el broker no
+    /// responde, `proyecto_politica` queda como estaba (el toggle mostrará el último estado conocido).
+    fn cargar_politica_proyectos(&mut self, cx: &mut Context<Self>) {
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            cliente.bloquear_en(cliente.politica_leer())
+        });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                if let Ok(politica) = r {
+                    esta.datos.proyecto_politica = Some(politica);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// R12: alterna el aislamiento del proyecto `id`. Lee la política cacheada, aplica
+    /// `con_aislamiento` (añade/quita las reglas `@id`) y la guarda en el broker; al confirmar,
+    /// refresca la caché. Red en fondo. Si no hay política cacheada aún, parte de una vacía.
+    fn alternar_aislamiento_proyecto(&mut self, id: String, aislar: bool, cx: &mut Context<Self>) {
+        let base = self.datos.proyecto_politica.clone().unwrap_or_default();
+        let nueva = crate::vista::proyectos::con_aislamiento(&base, &id, aislar);
+        // Optimista: reflejamos el cambio en la caché ya (el toggle se ve al instante).
+        self.datos.proyecto_politica = Some(nueva.clone());
+        cx.notify();
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            cliente.bloquear_en(cliente.politica_guardar(&nueva))
+        });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            // Si falló el guardado, recargamos la política real del broker para no quedar desincronizados.
+            if r.is_err() {
+                let _ = esta.update(cx, |esta, cx| esta.cargar_politica_proyectos(cx));
+            }
+        })
+        .detach();
     }
 
     /// Confirma el formulario de Peers activo: valida la frontera y dispara el POST vía
@@ -3852,10 +3900,10 @@ impl Render for AppDesktop {
             ElegirChatDe, EnviarChatPrivado, RefrescarChatPrivado, SeleccionarChatPeer,
         };
         use crate::vista::proyectos::{
-            AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, ArchivarProyecto,
-            CambiarFichaTab, CerrarFichaProyecto, CerrarFormProyecto, ConfirmarFormProyecto,
-            DuplicarProyecto, ElegirCarpetaProyecto, ElegirTipoUbicacion, FijarProyectoActivo,
-            LanzarAgente,
+            AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, AlternarAislamientoProyecto,
+            ArchivarProyecto, CambiarFichaTab, CerrarFichaProyecto, CerrarFormProyecto,
+            ConfirmarFormProyecto, DuplicarProyecto, ElegirCarpetaProyecto, ElegirTipoUbicacion,
+            FijarProyectoActivo, LanzarAgente,
         };
         use crate::vista::peers::{
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
@@ -3981,6 +4029,9 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, a: &LanzarAgente, window, cx| {
                 esta.lanzar_agente(a.id_agente.clone(), a.ruta.clone(), window, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AlternarAislamientoProyecto, _window, cx| {
+                esta.alternar_aislamiento_proyecto(a.id.clone(), a.aislar, cx);
             }))
             // --- Peers: detalle + composer + kick (peers-01/02/03) ---
             .on_action(cx.listener(|esta, a: &AbrirDetallePeer, _window, cx| {
