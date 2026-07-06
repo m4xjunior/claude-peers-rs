@@ -71,13 +71,39 @@ struct EstadoCliente {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Logs SIEMPRE a stderr: stdout está reservado al protocolo MCP.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+    // Logs: SIEMPRE a stderr (stdout está reservado al protocolo MCP) Y, además, a un archivo en el
+    // temp del SO (`<tmp>/claude-peers-client.log`). El archivo es el canal de diagnóstico cuando el
+    // stderr se pierde (plugin en Windows: el .exe corre bajo un launcher y su stderr no es visible).
+    // Así podemos ver del lado del usuario si el push se intenta ("empujado mensaje de X") o falla
+    // ("push del canal falló"). Best-effort: si no se puede abrir el archivo, solo queda stderr.
+    use tracing_subscriber::prelude::*;
+    let filtro = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    let capa_stderr = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .init();
+        .with_filter(filtro());
+    let registro = tracing_subscriber::registry().with(capa_stderr);
+    // Capa de archivo (append). El path va al temp del SO — en Windows `%TEMP%\claude-peers-client.log`.
+    let ruta_log = std::env::temp_dir().join("claude-peers-client.log");
+    match std::fs::OpenOptions::new().create(true).append(true).open(&ruta_log) {
+        Ok(archivo) => {
+            // El archivo captura hasta DEBUG del propio client (diagnóstico del push), sin ensuciar
+            // el stderr (que queda en el nivel del env, típicamente info). `RUST_LOG` lo puede subir.
+            let filtro_archivo = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,peers_client=debug"));
+            let capa_archivo = tracing_subscriber::fmt::layer()
+                .with_ansi(false) // sin códigos de color en el archivo
+                .with_writer(archivo)
+                .with_filter(filtro_archivo);
+            registro.with(capa_archivo).init();
+        }
+        Err(_) => {
+            // No se pudo abrir el archivo (permisos, etc.): al menos queda el stderr.
+            registro.init();
+        }
+    }
 
     let args = Args::parse();
     let url = args

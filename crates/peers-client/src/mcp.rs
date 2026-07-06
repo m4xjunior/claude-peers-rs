@@ -290,8 +290,17 @@ pub async fn empujar_canal(
         })),
         extensions: Default::default(),
     };
+    // DIAGNÓSTICO (bug push Windows de Daniela): registramos el intento ANTES de enviar, para
+    // distinguir "ni se intenta" (no sale este log) de "se intenta y send_notification devuelve Ok
+    // pero no llega" (buffering/framing de rmcp en Windows) o "falla con Err". El `Ok(())` de rmcp
+    // significa que la notif se entregó al transporte; si aun así no aparece en la sesión, el fallo
+    // está por debajo (cómo rmcp escribe a stdout en Windows), no en nuestro código.
+    tracing::debug!("empujar_canal: enviando notificación de canal (de={de_id})");
     match peer.send_notification(ServerNotification::from(notif)).await {
-        Ok(()) => true,
+        Ok(()) => {
+            tracing::debug!("empujar_canal: send_notification devolvió Ok (entregado al transporte)");
+            true
+        }
         Err(e) => {
             warn!("fallo enviando la notificación de canal por rmcp: {e}");
             false
