@@ -19,6 +19,7 @@ use gpui_component::{input::Input, StyledExt};
 use crate::app::EstadoPantalla;
 use crate::config::Proyecto;
 use crate::tema;
+use peers_core::Instancia;
 
 // --- Sub-tab de la ficha de proyecto (R8) ---
 
@@ -163,6 +164,28 @@ pub struct AlternarAislamientoProyecto {
     pub id: String,
     pub aislar: bool,
 }
+
+/// Abre el overlay de "importar peers vivos" al equipo del proyecto abierto (ficha, sub-tab Equipo).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct AbrirImportarPeers;
+
+/// Cierra el overlay de importar sin aplicar.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct CerrarImportarPeers;
+
+/// Marca/desmarca el peer `id` en el overlay de importar (multi-select).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct AlternarPeerImport {
+    pub id: String,
+}
+
+/// Confirma: añade los peers marcados al equipo del proyecto abierto (`agregar_agentes_a_proyecto`).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct ConfirmarImportarPeers;
 
 // --- Aislamiento de proyecto (R12): generación de reglas de política. PUROS y testeables. ---
 //
@@ -464,6 +487,8 @@ fn ficha(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
         .child(barra_tabs(datos.proyecto_ficha_tab))
         .child(seccion_activa(datos, p))
         .child(control_aislamiento(datos, p))
+        // Overlay de importar peers (solo si está abierto; se monta sobre toda la ficha).
+        .when(datos.proyecto_import_abierto, |el| el.child(overlay_importar_peers(datos)))
 }
 
 /// Control de AISLAMIENTO del proyecto (R12): toggle que activa/desactiva las reglas de política
@@ -616,7 +641,116 @@ fn seccion_equipo(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
                 ),
         );
     }
-    cont
+    // Botón para importar peers vivos que NO se lanzaron desde el Lanzador con rol@proyecto.
+    cont.child(
+        tema::boton_secundario("proy-importar-peers", "+ Importar peers vivos").on_click(
+            |_, window, cx| window.dispatch_action(Box::new(AbrirImportarPeers), cx),
+        ),
+    )
+}
+
+/// Overlay de "importar peers vivos" (ficha, sub-tab Equipo): checkboxes de los peers vivos que aún
+/// NO están en el equipo del proyecto abierto. Confirmar → `agregar_agentes_a_proyecto`. Clic fuera
+/// cierra. Solo se monta cuando `proyecto_import_abierto`.
+fn overlay_importar_peers(datos: &EstadoPantalla) -> gpui::AnyElement {
+    use gpui::IntoElement as _;
+    if !datos.proyecto_import_abierto {
+        return div().into_any_element();
+    }
+    // Equipo actual del proyecto abierto (para no ofrecer los que ya están).
+    let ya_en_equipo: std::collections::HashSet<&str> = datos
+        .proyecto_abierto
+        .as_deref()
+        .and_then(|id| datos.proyectos.iter().find(|p| p.id == id))
+        .map(|p| p.agentes.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let candidatos: Vec<&Instancia> = datos
+        .instancias
+        .iter()
+        .filter(|i| !ya_en_equipo.contains(i.id.as_str()))
+        .collect();
+
+    let mut lista =
+        div().id("importar-peers-lista").v_flex().gap_1().max_h(tema::radio(360.0)).overflow_y_scroll();
+    if candidatos.is_empty() {
+        lista = lista.child(tema::texto_terciario(
+            "No hay peers vivos fuera de este equipo para importar.",
+        ));
+    } else {
+        for inst in candidatos {
+            let id = inst.id.clone();
+            let marcado = datos.proyecto_import_seleccion.contains(&id);
+            let id_click = id.clone();
+            lista = lista.child(
+                tema::fila_seleccionable(SharedString::from(format!("import-{id}")), marcado)
+                    .px_3()
+                    .py_1()
+                    .h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_color(if marcado { tema::BRASA } else { tema::HUMO })
+                            .child(if marcado { "☑" } else { "☐" }),
+                    )
+                    .child(
+                        div()
+                            .font_family(tema::FUENTE_MONO)
+                            .text_color(tema::PAPEL)
+                            .child(SharedString::from(id.clone())),
+                    )
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(AlternarPeerImport { id: id_click.clone() }),
+                            cx,
+                        )
+                    }),
+            );
+        }
+    }
+
+    let n = datos.proyecto_import_seleccion.len();
+    let tarjeta = tema::superficie_card()
+        .occlude()
+        .v_flex()
+        .gap_3()
+        .p_5()
+        .w(tema::radio(480.0))
+        .child(tema::titulo("Importar peers al equipo"))
+        .child(tema::texto_terciario(
+            "Marca los peers vivos que pertenecen a este proyecto (aunque no se lanzaron con rol@proyecto).",
+        ))
+        .child(lista)
+        .child(
+            div()
+                .h_flex()
+                .gap_2()
+                .justify_end()
+                .child(
+                    tema::boton_secundario("import-cancelar", "Cancelar").on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(CerrarImportarPeers), cx)
+                    }),
+                )
+                .child(
+                    tema::boton_primario("import-confirmar", format!("Añadir ({n})")).on_click(
+                        |_, window, cx| {
+                            window.dispatch_action(Box::new(ConfirmarImportarPeers), cx)
+                        },
+                    ),
+                ),
+        );
+
+    div()
+        .id("importar-peers-backdrop")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x00000099))
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(CerrarImportarPeers), cx))
+        .child(tarjeta)
+        .into_any_element()
 }
 
 /// Tablero: conteo de tareas del proyecto por estado (filtradas por el sufijo del id dueño).

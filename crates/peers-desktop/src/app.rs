@@ -194,6 +194,11 @@ pub struct EstadoPantalla {
     /// del equipo del proyecto abierto. Lo puebla `cargar_actividad_proyecto` al abrir la ficha; la
     /// vista lo pasa a `jornada::timeline_agregado`. Vacío = sin ficha o sin acciones.
     pub proyecto_actividad: Vec<(String, Vec<peers_core::AccionRegistrada>)>,
+    /// Importar peers al equipo (ficha, sub-tab Equipo): `true` = overlay de multi-select abierto.
+    pub proyecto_import_abierto: bool,
+    /// Ids de peers vivos MARCADOS en el overlay de importar (antes de confirmar). Se aplica al
+    /// equipo del proyecto abierto con `agregar_agentes_a_proyecto`. Se limpia al cerrar/confirmar.
+    pub proyecto_import_seleccion: std::collections::HashSet<String>,
     /// Input del nombre del proyecto en el formulario. `Entity<InputState>` del kit.
     pub input_proyecto_nombre: Option<Entity<gpui_component::input::InputState>>,
     /// Input de la ruta (carpeta local o ruta remota) del proyecto en el formulario.
@@ -1769,6 +1774,53 @@ impl AppDesktop {
             }
         })
         .detach();
+    }
+
+    /// Abre el overlay de importar peers vivos al equipo (ficha, sub-tab Equipo).
+    fn abrir_importar_peers(&mut self, cx: &mut Context<Self>) {
+        self.datos.proyecto_import_abierto = true;
+        self.datos.proyecto_import_seleccion.clear();
+        cx.notify();
+    }
+
+    /// Cierra el overlay de importar sin aplicar.
+    fn cerrar_importar_peers(&mut self, cx: &mut Context<Self>) {
+        self.datos.proyecto_import_abierto = false;
+        self.datos.proyecto_import_seleccion.clear();
+        cx.notify();
+    }
+
+    /// Marca/desmarca un peer en el overlay de importar (multi-select).
+    fn alternar_peer_import(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.datos.proyecto_import_seleccion.remove(&id) {
+            self.datos.proyecto_import_seleccion.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// Confirma: añade los peers marcados al equipo del proyecto abierto (config +
+    /// `agregar_agentes_a_proyecto` de s007), persiste y refresca. Cierra el overlay.
+    fn confirmar_importar_peers(&mut self, cx: &mut Context<Self>) {
+        let Some(id_proyecto) = self.datos.proyecto_abierto.clone() else {
+            return;
+        };
+        let ids: Vec<String> = self.datos.proyecto_import_seleccion.iter().cloned().collect();
+        if ids.is_empty() {
+            self.cerrar_importar_peers(cx);
+            return;
+        }
+        // Muta la config (cargar→mutar→guardar→sincronizar), reusando el helper de proyectos.
+        self.con_config_proyectos(
+            |cfg| {
+                cfg.agregar_agentes_a_proyecto(&id_proyecto, &ids);
+            },
+            cx,
+        );
+        self.datos.proyecto_import_abierto = false;
+        self.datos.proyecto_import_seleccion.clear();
+        // Recarga la actividad del proyecto (el equipo cambió → el timeline agregado también).
+        self.cargar_actividad_proyecto(id_proyecto, cx);
+        cx.notify();
     }
 
     /// Confirma el formulario de Peers activo: valida la frontera y dispara el POST vía
@@ -3949,9 +4001,10 @@ impl Render for AppDesktop {
             ElegirChatDe, EnviarChatPrivado, RefrescarChatPrivado, SeleccionarChatPeer,
         };
         use crate::vista::proyectos::{
-            AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, AlternarAislamientoProyecto,
-            ArchivarProyecto, CambiarFichaTab, CerrarFichaProyecto, CerrarFormProyecto,
-            ConfirmarFormProyecto, DuplicarProyecto, ElegirCarpetaProyecto, ElegirTipoUbicacion,
+            AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, AbrirImportarPeers,
+            AlternarAislamientoProyecto, AlternarPeerImport, ArchivarProyecto, CambiarFichaTab,
+            CerrarFichaProyecto, CerrarFormProyecto, CerrarImportarPeers, ConfirmarFormProyecto,
+            ConfirmarImportarPeers, DuplicarProyecto, ElegirCarpetaProyecto, ElegirTipoUbicacion,
             FijarProyectoActivo, LanzarAgente,
         };
         use crate::vista::peers::{
@@ -4081,6 +4134,18 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, a: &AlternarAislamientoProyecto, _window, cx| {
                 esta.alternar_aislamiento_proyecto(a.id.clone(), a.aislar, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &AbrirImportarPeers, _window, cx| {
+                esta.abrir_importar_peers(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarImportarPeers, _window, cx| {
+                esta.cerrar_importar_peers(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AlternarPeerImport, _window, cx| {
+                esta.alternar_peer_import(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &ConfirmarImportarPeers, _window, cx| {
+                esta.confirmar_importar_peers(cx);
             }))
             // --- Peers: detalle + composer + kick (peers-01/02/03) ---
             .on_action(cx.listener(|esta, a: &AbrirDetallePeer, _window, cx| {
