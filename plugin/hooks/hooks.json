@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/asegurar-broker.sh",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/asegurar-broker.js",
             "timeout": 10
           }
         ]
