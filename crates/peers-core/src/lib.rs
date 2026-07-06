@@ -1977,7 +1977,6 @@ mod tests {
             visto_en: "2026-07-06T00:00:00Z".into(),
             ultima_actividad_en: "2026-07-06T00:00:00Z".into(),
             secreto: Some("supersecreto".into()),
-            ultima_actividad_en: String::new(),
         };
         let json = serde_json::to_string(&inst).expect("serializar");
         assert!(

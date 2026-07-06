@@ -678,7 +678,8 @@ mod tests {
         let mk = |id: &str| Instancia {
             id: id.into(), pid: 1, hostname: String::new(), directorio: "/x".into(), repo_git: None,
             repo_github: None, tty: None, resumen: String::new(),
-            registrada_en: String::new(), visto_en: String::new(), secreto: None,
+            registrada_en: String::new(), visto_en: String::new(), ultima_actividad_en: String::new(),
+            secreto: None,
         };
         app.datos.peers = vec![mk("a"), mk("b"), mk("c")];
         app.seleccion = 2;
@@ -818,6 +819,7 @@ mod tests {
             resumen: "construyendo la TUI".to_string(),
             registrada_en: "2026-06-29T10:00:00Z".to_string(),
             visto_en: "2026-06-29T12:34:56.000Z".to_string(),
+            ultima_actividad_en: String::new(),
             secreto: None,
         };
         let fila = fila_peer(&i);
@@ -843,6 +845,7 @@ mod tests {
             resumen: largo,
             registrada_en: String::new(),
             visto_en: String::new(),
+            ultima_actividad_en: String::new(),
             secreto: None,
         };
         let fila = fila_peer(&i);
