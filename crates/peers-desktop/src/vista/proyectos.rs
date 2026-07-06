@@ -564,7 +564,7 @@ fn seccion_activa(datos: &EstadoPantalla, p: &Proyecto) -> gpui::AnyElement {
     match datos.proyecto_ficha_tab {
         FichaProyectoTab::Equipo => seccion_equipo(datos, p).into_any_element(),
         FichaProyectoTab::Tablero => seccion_tablero(datos, &sufijo).into_any_element(),
-        FichaProyectoTab::Actividad => seccion_actividad().into_any_element(),
+        FichaProyectoTab::Actividad => seccion_actividad(datos).into_any_element(),
         FichaProyectoTab::Alertas => seccion_alertas(datos, &sufijo).into_any_element(),
     }
 }
@@ -647,11 +647,19 @@ fn seccion_tablero(datos: &EstadoPantalla, sufijo: &str) -> impl IntoElement {
 
 /// Actividad: la bitácora del equipo. v1 = puntero (el detalle vive en Trazabilidad/Jornada por
 /// peer); aquí se remite ahí en vez de duplicar la carga de acciones por-proyecto.
-fn seccion_actividad() -> impl IntoElement {
-    tema::superficie_card().v_flex().gap_2().p_4().child(tema::texto_terciario(
-        "La actividad detallada del equipo está en Trazabilidad/Jornada por agente. (Vista agregada \
-         por proyecto: v2.)",
-    ))
+fn seccion_actividad(datos: &EstadoPantalla) -> impl IntoElement {
+    // Empalme: la actividad agregada del equipo (pares agente→acciones, cargados al abrir la ficha)
+    // se cruza cronológicamente con `jornada::timeline_agregado` (componente reusable de s007).
+    if datos.proyecto_actividad.is_empty() {
+        return tema::superficie_card().v_flex().gap_2().p_4().child(tema::texto_terciario(
+            "Sin actividad registrada para el equipo de este proyecto (o el equipo está vacío).",
+        ));
+    }
+    tema::superficie_card()
+        .v_flex()
+        .gap_2()
+        .p_4()
+        .child(crate::vista::jornada::timeline_agregado(&datos.proyecto_actividad))
 }
 
 /// Alertas del supervisor filtradas por el proyecto (sujeto termina en `@id`).

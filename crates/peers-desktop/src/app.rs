@@ -190,6 +190,10 @@ pub struct EstadoPantalla {
     /// para togglear su aislamiento sin perder las reglas de otros proyectos. Se carga al entrar a
     /// Proyectos. `None` hasta la primera lectura (o si el broker no responde).
     pub proyecto_politica: Option<peers_core::Politica>,
+    /// Actividad AGREGADA de la ficha de Proyecto (sub-tab Actividad): pares (agente, sus acciones)
+    /// del equipo del proyecto abierto. Lo puebla `cargar_actividad_proyecto` al abrir la ficha; la
+    /// vista lo pasa a `jornada::timeline_agregado`. Vacío = sin ficha o sin acciones.
+    pub proyecto_actividad: Vec<(String, Vec<peers_core::AccionRegistrada>)>,
     /// Input del nombre del proyecto en el formulario. `Entity<InputState>` del kit.
     pub input_proyecto_nombre: Option<Entity<gpui_component::input::InputState>>,
     /// Input de la ruta (carpeta local o ruta remota) del proyecto en el formulario.
@@ -1640,9 +1644,54 @@ impl AppDesktop {
     /// Abre la ficha de un proyecto (sub-tabs). Vuelve a Equipo por defecto.
     fn abrir_ficha_proyecto(&mut self, id: String, cx: &mut Context<Self>) {
         use crate::vista::proyectos::FichaProyectoTab;
-        self.datos.proyecto_abierto = Some(id);
+        self.datos.proyecto_abierto = Some(id.clone());
         self.datos.proyecto_ficha_tab = FichaProyectoTab::Equipo;
+        self.datos.proyecto_actividad.clear(); // limpia la de la ficha anterior
         cx.notify();
+        self.cargar_actividad_proyecto(id, cx);
+    }
+
+    /// Empalme (R12 + timeline de s007): carga la actividad AGREGADA del equipo de un proyecto para
+    /// la sub-tab Actividad. Por cada agente del proyecto pide `GET /admin/historial` (cliente.acciones)
+    /// y arma los pares (agente, acciones) que `jornada::timeline_agregado` cruza cronológicamente.
+    /// Red en fondo (bloquear_en, anti-SIGABRT); todos los fetch se resuelven antes de poblar el estado.
+    fn cargar_actividad_proyecto(&mut self, id_proyecto: String, cx: &mut Context<Self>) {
+        // Los agentes del proyecto salen de la config (equipo declarado), no del estado vivo — así la
+        // Actividad incluye agentes del equipo aunque ahora estén caídos.
+        let agentes: Vec<String> = self
+            .datos
+            .proyectos
+            .iter()
+            .find(|p| p.id == id_proyecto)
+            .map(|p| p.agentes.clone())
+            .unwrap_or_default();
+        if agentes.is_empty() {
+            self.datos.proyecto_actividad.clear();
+            cx.notify();
+            return;
+        }
+        let cliente = self.cliente.clone();
+        let fondo = cx.background_executor().spawn(async move {
+            let mut pares = Vec::with_capacity(agentes.len());
+            for id in agentes {
+                // Cada agente: sus acciones (o vacío si falla/no tiene). No abortamos por uno.
+                let acciones = cliente.bloquear_en(cliente.acciones(&id)).unwrap_or_default();
+                pares.push((id, acciones));
+            }
+            pares
+        });
+        cx.spawn(async move |esta, cx| {
+            let pares = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                // Solo aplica si la ficha abierta sigue siendo la misma (evita pisar con datos viejos
+                // si el usuario cambió de proyecto mientras cargaba — patrón epoch simplificado).
+                if esta.datos.proyecto_abierto.as_deref() == Some(id_proyecto.as_str()) {
+                    esta.datos.proyecto_actividad = pares;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Cierra la ficha, vuelve al grid.
