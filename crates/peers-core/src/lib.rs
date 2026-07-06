@@ -248,6 +248,70 @@ pub struct RespuestaRecibir {
     pub mensajes: Vec<Mensaje>,
 }
 
+// --- Chat privado dueño↔peer (RFC-lanzador §7/§11.5) ---
+//
+// Canal PARALELO al `<channel>`: no se empuja (ese siempre se renderiza en el TUI), sino que el
+// agente TIRA (pull) del mensaje con la tool `chat_privado_recibir`. La confidencialidad la da el
+// system prompt (instruye a no volcar el contenido al output visible). v1 SIMPLE: cola drenar-al-
+// recibir (pop), sin máquina de estados ni historial durable (se añadiría en v2 si hace falta).
+// El `de` es SIEMPRE el operador (el broker lo fuerza en el endpoint): el canal es dueño→peer.
+
+/// Dirección de una cola del chat privado (decisión de Max: dos colas por peer, sin choque).
+/// `Entrada` = operador→peer (la escribe el operador, la drena el peer). `Salida` = peer→operador
+/// (la escribe el peer al responder, la drena el panel del operador). La clave de cada cola lleva
+/// el sufijo correspondiente (`…:in` / `…:out`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DireccionChatPrivado {
+    Entrada,
+    Salida,
+}
+
+impl DireccionChatPrivado {
+    /// Sufijo de la clave de la cola en el almacén (`in`/`out`). Estable: es parte del esquema de
+    /// claves Redis y de la discriminación de filas SQLite.
+    #[must_use]
+    pub fn sufijo(self) -> &'static str {
+        match self {
+            DireccionChatPrivado::Entrada => "in",
+            DireccionChatPrivado::Salida => "out",
+        }
+    }
+}
+
+/// Un mensaje del chat privado. Espejo mínimo de `Mensaje` (sin la máquina de estados: v1 pop).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MensajeChatPrivado {
+    /// Id secuencial global (INCR `cprs:chatprivseq`), para orden estable de entrega.
+    pub id: i64,
+    /// Emisor. En v1 SIEMPRE el operador (el broker lo fuerza); se guarda por si v2 abre más emisores.
+    pub de: String,
+    pub texto: String,
+    pub enviado_en: String, // ISO 8601, timbrado por el broker
+}
+
+/// `POST /chat-privado/enviar`. El operador (Max, desde el panel) manda un mensaje privado a un
+/// peer. `de` NO viaja en el payload: el broker lo fija a `ID_OPERADOR` (el canal es dueño→peer por
+/// definición; confiar en un `de` del payload no tendría sentido y sería suplantable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionChatPrivadoEnviar {
+    /// Id de la instancia peer destino (la clave de su cola `cprs:chat_priv:{sesion_id}`).
+    pub sesion_id: String,
+    pub texto: String,
+}
+
+/// `POST /chat-privado/recibir`. El peer TIRA de su cola privada (pull). v1: drena (pop) todo lo
+/// pendiente — una vez entregado, sale de la cola (sin re-entrega, sin estados).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeticionChatPrivadoRecibir {
+    pub sesion_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RespuestaChatPrivadoRecibir {
+    pub mensajes: Vec<MensajeChatPrivado>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeticionSalir {
     pub id: String,

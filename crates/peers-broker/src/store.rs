@@ -27,8 +27,8 @@ use deadpool_redis::redis::{cmd, AsyncCommands};
 use deadpool_redis::{Config, Pool, Runtime};
 use peers_core::{
     aplicar_media_movil, transicion_valida, Alcance, Alerta, Almacen, BloqueoComunicacion,
-    EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox, Mensaje, Politica,
-    Sesion, Tarea, TipoAlerta, MAX_ALERTAS, MAX_BLOQUEOS,
+    DireccionChatPrivado, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia, ItemOutbox,
+    Mensaje, MensajeChatPrivado, Politica, Sesion, Tarea, TipoAlerta, MAX_ALERTAS, MAX_BLOQUEOS,
 };
 
 const NS: &str = "cprs:";
@@ -57,6 +57,16 @@ fn k_instancia(id: &str) -> String {
 /// Permite resolver el emisor real desde el header en O(1) sin escanear todas las instancias.
 fn k_secreto(secreto: &str) -> String {
     format!("{NS}secreto:{secreto}")
+}
+/// Cola del chat privado dueño↔peer (RFC-lanzador §7): `cprs:chat_priv:{sesion_id}:{in|out}` (ZSET
+/// de ids por secuencia). Dos colas por peer: `in` (operador→peer) y `out` (peer→operador). v1
+/// SIMPLE: se drena (pop) al recibir, no persiste el hilo.
+fn k_chat_priv(sesion_id: &str, direccion: DireccionChatPrivado) -> String {
+    format!("{NS}chat_priv:{sesion_id}:{}", direccion.sufijo())
+}
+/// HASH fuente de verdad de un mensaje privado: `cprs:chat_priv_msg:{id}`.
+fn k_chat_priv_msg(id: i64) -> String {
+    format!("{NS}chat_priv_msg:{id}")
 }
 fn k_bandeja(para_id: &str) -> String {
     format!("{NS}bandeja:{para_id}")
@@ -362,6 +372,68 @@ impl Almacen for AlmacenRedis {
                 }
             }
         }
+        Ok(msgs)
+    }
+
+    async fn chat_privado_encolar(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+        de: &str,
+        texto: &str,
+        ahora: &str,
+    ) -> anyhow::Result<MensajeChatPrivado> {
+        let mut conn = self.conn().await?;
+        // Secuencia global propia (espejo de msgseq) → orden estable entre mensajes privados.
+        let id: i64 = conn.incr(format!("{NS}chatprivseq"), 1).await?;
+        let msg = MensajeChatPrivado {
+            id,
+            de: de.to_string(),
+            texto: texto.to_string(),
+            enviado_en: ahora.to_string(),
+        };
+        // HASH fuente de verdad + ZADD del id a la cola direccional del peer (score = id).
+        cmd("HSET")
+            .arg(k_chat_priv_msg(id))
+            .arg("id").arg(id)
+            .arg("de").arg(de)
+            .arg("texto").arg(texto)
+            .arg("enviado_en").arg(ahora)
+            .query_async::<()>(&mut conn)
+            .await?;
+        let _: () = conn.zadd(k_chat_priv(sesion_id, direccion), id, id as f64).await?;
+        Ok(msg)
+    }
+
+    async fn chat_privado_drenar(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+    ) -> anyhow::Result<Vec<MensajeChatPrivado>> {
+        let mut conn = self.conn().await?;
+        let clave = k_chat_priv(sesion_id, direccion);
+        // Lee todos los ids por orden de score (secuencia). v1: entrega única → se borran al drenar.
+        let ids: Vec<i64> = conn.zrangebyscore(&clave, "-inf", "+inf").await?;
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut msgs = Vec::with_capacity(ids.len());
+        for mid in &ids {
+            let clave_msg = k_chat_priv_msg(*mid);
+            let h: std::collections::HashMap<String, String> = conn.hgetall(&clave_msg).await?;
+            if !h.is_empty() {
+                msgs.push(MensajeChatPrivado {
+                    id: *mid,
+                    de: h.get("de").cloned().unwrap_or_default(),
+                    texto: h.get("texto").cloned().unwrap_or_default(),
+                    enviado_en: h.get("enviado_en").cloned().unwrap_or_default(),
+                });
+            }
+            // Borra el HASH del mensaje (entrega única).
+            let _: () = conn.del(clave_msg).await?;
+        }
+        // Borra la cola entera (todos los ids drenados de una vez).
+        let _: () = conn.del(&clave).await?;
         Ok(msgs)
     }
 

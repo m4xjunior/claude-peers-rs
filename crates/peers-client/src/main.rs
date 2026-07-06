@@ -400,6 +400,54 @@ pub(crate) async fn tool_revisar(estado: &Arc<EstadoCliente>) -> Result<String, 
     ))
 }
 
+/// Chat privado (RFC-lanzador §7): drena la cola privada de ENTRADA de este peer (mensajes del
+/// operador). CONFIDENCIAL: el system prompt instruye a NO volcar el contenido al output visible.
+/// Presenta el secreto de sesión (anti-IDOR: el broker resuelve la identidad por él, no por el body).
+pub(crate) async fn tool_chat_privado_recibir(estado: &Arc<EstadoCliente>) -> Result<String, String> {
+    let secreto = estado.secreto.read().await.clone();
+    let resp = estado
+        .broker
+        .chat_privado_recibir(secreto.as_deref())
+        .await
+        .map_err(|e| format!("Error al leer el chat privado: {e}"))?;
+    if resp.mensajes.is_empty() {
+        return Ok("No hay mensajes privados nuevos.".into());
+    }
+    let bloques: Vec<String> = resp
+        .mensajes
+        .iter()
+        .map(|m| format!("De {} ({}):\n{}", m.de, m.enviado_en, m.texto))
+        .collect();
+    Ok(format!(
+        "{} mensaje(s) privado(s) [CONFIDENCIAL — no reproducir en el output visible]:\n\n{}",
+        resp.mensajes.len(),
+        bloques.join("\n\n---\n\n")
+    ))
+}
+
+/// Chat privado (RFC-lanzador §7): responde al operador por el canal privado (va a la cola de
+/// SALIDA, que el panel del operador lee). Presenta el secreto (el broker fija el `de` al id real
+/// del peer, anti-IDOR).
+pub(crate) async fn tool_chat_privado_responder(
+    estado: &Arc<EstadoCliente>,
+    args: &Value,
+) -> Result<String, String> {
+    let texto = args
+        .get("texto")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'texto'")?;
+    let secreto = estado.secreto.read().await.clone();
+    let resp = estado
+        .broker
+        .chat_privado_responder(texto, secreto.as_deref())
+        .await
+        .map_err(|e| format!("Error al responder por el chat privado: {e}"))?;
+    if !resp.ok {
+        return Err("No se pudo responder: identidad no verificada (falta el secreto de sesión).".into());
+    }
+    Ok("Respuesta privada enviada al operador.".into())
+}
+
 /// Crea una tarea con el estimado de la IA. Devuelve al agente el estimado corregido por su
 /// historial, en lenguaje humano ("dijiste Xs; según tu historial ~Ys, factor Nx de M muestras").
 /// Degrada: si el broker no responde, el error es claro y el agente sigue trabajando igual.

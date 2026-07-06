@@ -151,6 +151,37 @@ impl ClienteBroker {
         self.post("/recibir", &PeticionRecibir { id: id.to_string() }).await
     }
 
+    /// Chat privado (RFC-lanzador §7): el peer drena (pull) su cola de ENTRADA (mensajes del
+    /// operador). El broker resuelve la identidad por el SECRETO (anti-IDOR), no por el body — por
+    /// eso hay que presentarlo. `sesion_id` en el body es informativo (el broker lo ignora). Sin
+    /// secreto no se puede leer: `None` → el broker devuelve vacío (no filtra).
+    pub async fn chat_privado_recibir(
+        &self,
+        secreto: Option<&str>,
+    ) -> Result<RespuestaChatPrivadoRecibir> {
+        // El broker resuelve el sesion_id por el secreto; mandamos "" como placeholder (se ignora).
+        let cuerpo = PeticionChatPrivadoRecibir { sesion_id: String::new() };
+        match secreto {
+            Some(s) => self.post_con_secreto("/chat-privado/recibir", &cuerpo, s).await,
+            None => self.post("/chat-privado/recibir", &cuerpo).await,
+        }
+    }
+
+    /// Chat privado (RFC-lanzador §7): el peer responde al operador (va a su cola de SALIDA). El
+    /// broker fija el `de` al id real del peer resuelto por el secreto (anti-IDOR). Sin secreto,
+    /// el broker responde ok:false (no se puede atribuir la respuesta).
+    pub async fn chat_privado_responder(
+        &self,
+        texto: &str,
+        secreto: Option<&str>,
+    ) -> Result<RespuestaOk> {
+        let cuerpo = PeticionChatPrivadoEnviar { sesion_id: String::new(), texto: texto.to_string() };
+        match secreto {
+            Some(s) => self.post_con_secreto("/chat-privado/responder", &cuerpo, s).await,
+            None => self.post("/chat-privado/responder", &cuerpo).await,
+        }
+    }
+
     pub async fn salir(&self, id: &str) -> Result<RespuestaOk> {
         self.post("/salir", &PeticionSalir { id: id.to_string() }).await
     }

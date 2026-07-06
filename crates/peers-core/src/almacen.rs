@@ -10,7 +10,7 @@
 
 use crate::{
     Alcance, Alerta, BloqueoComunicacion, EstadoMensaje, EstadoTarea, FactorEstimacion, Instancia,
-    ItemOutbox, Mensaje, Politica, Sesion, Tarea,
+    DireccionChatPrivado, ItemOutbox, Mensaje, MensajeChatPrivado, Politica, Sesion, Tarea,
 };
 use async_trait::async_trait;
 
@@ -103,6 +103,30 @@ pub trait Almacen: Send + Sync {
     /// El borrado de la bandeja activa solo ocurre al confirmar `Procesado` (R1.5). Idempotente:
     /// `recibir` repetido devuelve los mismos mensajes hasta que se procesen.
     async fn recibir_mensajes(&self, id: &str) -> anyhow::Result<Vec<Mensaje>>;
+
+    // --- Chat privado dueño↔peer (RFC-lanzador §7/§11.5). DOS colas por peer (decisión de Max):
+    // `Entrada` (operador→peer, la drena el peer) y `Salida` (peer→operador, la drena el panel del
+    // operador). Simétrico, sin choque de lecturas. v1 SIMPLE: encolar + drenar (pop). ---
+
+    /// Encola un mensaje privado en la cola `direccion` de `sesion_id` (el peer). `de` lo fija el
+    /// broker (operador para Entrada, el propio peer para Salida). Devuelve el mensaje ya creado.
+    async fn chat_privado_encolar(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+        de: &str,
+        texto: &str,
+        ahora: &str,
+    ) -> anyhow::Result<MensajeChatPrivado>;
+
+    /// DRENA (pop) todos los mensajes de la cola `direccion` de `sesion_id`, ordenados por id, y los
+    /// BORRA (v1: entrega única). Vacío si no hay. El peer drena su `Entrada`; el panel del operador
+    /// drena la `Salida` de cada peer.
+    async fn chat_privado_drenar(
+        &self,
+        sesion_id: &str,
+        direccion: DireccionChatPrivado,
+    ) -> anyhow::Result<Vec<MensajeChatPrivado>>;
 
     /// Transiciona un mensaje a `nuevo` estado timbrando el tiempo con `ahora` (R1.2/R1.3).
     /// Idempotente y monótona: solo avanza si el nuevo rango es mayor que el actual (ver
