@@ -187,6 +187,24 @@ pub struct AlternarPeerImport {
 #[action(namespace = proyectos, no_json)]
 pub struct ConfirmarImportarPeers;
 
+/// Pide BORRAR el proyecto `id` (R6, acción destructiva): abre la confirmación en 2 pasos. El borrado
+/// real solo ocurre al confirmar. NO toca la bitácora del broker, solo la config local.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct PedirBorrarProyecto {
+    pub id: String,
+}
+
+/// Cancela la confirmación de borrado (vuelve a la ficha normal).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct CancelarBorrarProyecto;
+
+/// Confirma el borrado del proyecto en confirmación (`Config::borrar_proyecto`) y vuelve al grid.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = proyectos, no_json)]
+pub struct ConfirmarBorrarProyecto;
+
 // --- Aislamiento de proyecto (R12): generación de reglas de política. PUROS y testeables. ---
 //
 // Semántica confirmada por Max: (B) SOLO ENTRADA. Aislar el proyecto X significa "nadie de afuera le
@@ -489,6 +507,54 @@ fn ficha(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
         .child(control_aislamiento(datos, p))
         // Overlay de importar peers (solo si está abierto; se monta sobre toda la ficha).
         .when(datos.proyecto_import_abierto, |el| el.child(overlay_importar_peers(datos)))
+        // Overlay de confirmación de borrado (destructivo, 2 pasos).
+        .when_some(datos.proyecto_borrar_confirmar.clone(), |el, id| {
+            el.child(overlay_borrar(&id))
+        })
+}
+
+/// Overlay de confirmación de BORRADO de proyecto (R6, destructivo, 2 pasos). Clic fuera = cancelar.
+fn overlay_borrar(id: &str) -> impl IntoElement {
+    let id = id.to_string();
+    let tarjeta = tema::superficie_card()
+        .occlude()
+        .v_flex()
+        .gap_3()
+        .p_5()
+        .w(tema::radio(440.0))
+        .child(tema::titulo("¿Borrar este proyecto?"))
+        .child(tema::texto_terciario(
+            "Se elimina de tu config local (nombre, ubicación, equipo declarado). NO borra la \
+             bitácora del broker ni afecta a los agentes vivos. No se puede deshacer.",
+        ))
+        .child(
+            div()
+                .h_flex()
+                .gap_2()
+                .justify_end()
+                .child(
+                    tema::boton_secundario("borrar-cancelar", "Cancelar").on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(CancelarBorrarProyecto), cx)
+                    }),
+                )
+                .child(
+                    tema::boton_primario("borrar-confirmar", "Sí, borrar")
+                        .text_color(tema::SALMO)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(ConfirmarBorrarProyecto), cx)
+                        }),
+                ),
+        );
+    div()
+        .id(SharedString::from(format!("borrar-backdrop-{id}")))
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x00000099))
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(CancelarBorrarProyecto), cx))
+        .child(tarjeta)
 }
 
 /// Control de AISLAMIENTO del proyecto (R12): toggle que activa/desactiva las reglas de política
@@ -532,6 +598,7 @@ fn control_aislamiento(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement
 
 /// Cabecera de la ficha: botón volver + nombre BRASA + ubicación mono.
 fn ficha_cabecera(p: &Proyecto) -> impl IntoElement {
+    let id_borrar = p.id.clone();
     div()
         .h_flex()
         .items_center()
@@ -544,6 +611,7 @@ fn ficha_cabecera(p: &Proyecto) -> impl IntoElement {
             div()
                 .v_flex()
                 .gap_1()
+                .flex_1()
                 .child(
                     div()
                         .text_color(tema::BRASA)
@@ -555,6 +623,14 @@ fn ficha_cabecera(p: &Proyecto) -> impl IntoElement {
                         .text_color(tema::HUMO)
                         .child(SharedString::from(p.ubicacion.etiqueta())),
                 ),
+        )
+        // Borrar (R6, destructivo): abre confirmación en 2 pasos. A la derecha, separado.
+        .child(
+            tema::boton_secundario("proy-borrar", "Borrar")
+                .text_color(tema::SALMO)
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(Box::new(PedirBorrarProyecto { id: id_borrar.clone() }), cx)
+                }),
         )
 }
 
@@ -603,9 +679,12 @@ fn seccion_equipo(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
         _ => String::new(),
     };
     let mut cont = tema::superficie_card().v_flex().gap_2().p_4();
+    // Equipo vacío: mensaje guía como fila (NO early-return — el botón "+ Importar" debe seguir
+    // visible, que es justo el caso de uso de un proyecto recién creado sin equipo).
     if p.agentes.is_empty() {
-        return cont.child(tema::texto_terciario(
-            "Este proyecto aún no tiene equipo. Lánzalo desde el Lanzador con id rol@proyecto.",
+        cont = cont.child(tema::texto_terciario(
+            "Este proyecto aún no tiene equipo. Impórtale un peer vivo abajo, o lánzalo desde el \
+             Lanzador con id rol@proyecto.",
         ));
     }
     for id in &p.agentes {

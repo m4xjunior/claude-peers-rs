@@ -194,6 +194,9 @@ pub struct EstadoPantalla {
     /// del equipo del proyecto abierto. Lo puebla `cargar_actividad_proyecto` al abrir la ficha; la
     /// vista lo pasa a `jornada::timeline_agregado`. Vacío = sin ficha o sin acciones.
     pub proyecto_actividad: Vec<(String, Vec<peers_core::AccionRegistrada>)>,
+    /// Proyecto en confirmación de BORRADO (R6, destructivo): `Some(id)` = modal de confirmación
+    /// abierto para ese proyecto. `None` = sin confirmación pendiente.
+    pub proyecto_borrar_confirmar: Option<String>,
     /// Importar peers al equipo (ficha, sub-tab Equipo): `true` = overlay de multi-select abierto.
     pub proyecto_import_abierto: bool,
     /// Ids de peers vivos MARCADOS en el overlay de importar (antes de confirmar). Se aplica al
@@ -1820,6 +1823,40 @@ impl AppDesktop {
         self.datos.proyecto_import_seleccion.clear();
         // Recarga la actividad del proyecto (el equipo cambió → el timeline agregado también).
         self.cargar_actividad_proyecto(id_proyecto, cx);
+        cx.notify();
+    }
+
+    /// Pide borrar un proyecto (R6): abre la confirmación en 2 pasos.
+    fn pedir_borrar_proyecto(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.proyecto_borrar_confirmar = Some(id);
+        cx.notify();
+    }
+
+    /// Cancela la confirmación de borrado.
+    fn cancelar_borrar_proyecto(&mut self, cx: &mut Context<Self>) {
+        self.datos.proyecto_borrar_confirmar = None;
+        cx.notify();
+    }
+
+    /// Confirma el borrado (R6, destructivo): borra el proyecto de la config y vuelve al grid.
+    fn confirmar_borrar_proyecto(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.datos.proyecto_borrar_confirmar.take() else {
+            return;
+        };
+        self.con_config_proyectos(
+            |cfg| {
+                cfg.borrar_proyecto(&id);
+            },
+            cx,
+        );
+        // Si la ficha abierta era la del proyecto borrado, vuelve al grid.
+        if self.datos.proyecto_abierto.as_deref() == Some(id.as_str()) {
+            self.datos.proyecto_abierto = None;
+        }
+        // Si era el proyecto activo global, limpia el filtro.
+        if self.datos.proyecto_activo.as_deref() == Some(id.as_str()) {
+            self.datos.proyecto_activo = None;
+        }
         cx.notify();
     }
 
@@ -4003,9 +4040,10 @@ impl Render for AppDesktop {
         use crate::vista::proyectos::{
             AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, AbrirImportarPeers,
             AlternarAislamientoProyecto, AlternarPeerImport, ArchivarProyecto, CambiarFichaTab,
-            CerrarFichaProyecto, CerrarFormProyecto, CerrarImportarPeers, ConfirmarFormProyecto,
-            ConfirmarImportarPeers, DuplicarProyecto, ElegirCarpetaProyecto, ElegirTipoUbicacion,
-            FijarProyectoActivo, LanzarAgente,
+            CancelarBorrarProyecto, CerrarFichaProyecto, CerrarFormProyecto, CerrarImportarPeers,
+            ConfirmarBorrarProyecto, ConfirmarFormProyecto, ConfirmarImportarPeers, DuplicarProyecto,
+            ElegirCarpetaProyecto, ElegirTipoUbicacion, FijarProyectoActivo, LanzarAgente,
+            PedirBorrarProyecto,
         };
         use crate::vista::peers::{
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
@@ -4146,6 +4184,15 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, _a: &ConfirmarImportarPeers, _window, cx| {
                 esta.confirmar_importar_peers(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &PedirBorrarProyecto, _window, cx| {
+                esta.pedir_borrar_proyecto(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CancelarBorrarProyecto, _window, cx| {
+                esta.cancelar_borrar_proyecto(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &ConfirmarBorrarProyecto, _window, cx| {
+                esta.confirmar_borrar_proyecto(cx);
             }))
             // --- Peers: detalle + composer + kick (peers-01/02/03) ---
             .on_action(cx.listener(|esta, a: &AbrirDetallePeer, _window, cx| {
