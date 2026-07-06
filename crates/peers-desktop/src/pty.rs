@@ -72,7 +72,7 @@ pub enum EventoPty {
 
 /// Dimensiones del terminal en celdas (no en píxeles: aquí no se conoce fuente/línea). El caller
 /// mide la fuente monoespaciada elegida y calcula filas/columnas antes de abrir la sesión.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DimensionesCeldas {
     pub filas: u16,
     pub columnas: u16,

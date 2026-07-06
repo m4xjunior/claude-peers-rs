@@ -239,9 +239,8 @@ pub fn render_trazabilidad(datos: &EstadoPantalla) -> impl IntoElement {
 
     // El timeline ya NO se pinta inline (trazabilidad-01): vive en un MODAL que `AppDesktop`
     // monta en su render raíz leyendo `traza_timeline` (ver `render_modal_timeline`).
-    let mut columna = div()
+    let mut columna = tema::raiz_scrollable()
         .v_flex()
-        .size_full()
         .gap_4()
         .p_6()
         .child(cabecera);

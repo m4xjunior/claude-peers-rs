@@ -46,6 +46,17 @@ pub struct Instancia {
     pub resumen: String,
     pub registrada_en: String, // ISO 8601
     pub visto_en: String,      // ISO 8601 — base de la liveness por latido
+    /// ISO 8601 — última vez que el peer llamó una tool REAL contra el broker (crear_tarea,
+    /// enviar, listar…), a diferencia de `visto_en` (el latido automático cada ~15s, que solo
+    /// prueba que el PROCESO sigue vivo, no que el LLM está haciendo algo). Reemplaza la
+    /// inferencia falsa de "trabajando/ocioso/atascado" que hacía `peers-desktop::vista::peers`
+    /// (derivada de si el peer se acordó de llamar crear_tarea/cerrar_tarea — opcional, poco
+    /// confiable). Se fija a `registrada_en` al alta (recién llegado, se asume activo) y la
+    /// actualiza el middleware del broker en cada request autenticado (`Almacen::actualizar_actividad`).
+    /// `#[serde(default)]`: un broker/dato viejo sin este campo deserializa a `""`, degradando a
+    /// "sin dato" en vez de romper — el detector de ociosos trata `""` como "nunca visto activo".
+    #[serde(default)]
+    pub ultima_actividad_en: String,
     /// Secreto de sesión (anti-spoofing del `de_id`, E-10). El broker lo emite en `/registrar`,
     /// lo persiste aquí y lo devuelve UNA vez al peer; a partir de ahí el peer lo presenta en cada
     /// acción con identidad (`X-Peers-Secreto`) y el broker ata el `de_id` declarado a ESTA
@@ -1964,7 +1975,9 @@ mod tests {
             resumen: "".into(),
             registrada_en: "2026-07-06T00:00:00Z".into(),
             visto_en: "2026-07-06T00:00:00Z".into(),
+            ultima_actividad_en: "2026-07-06T00:00:00Z".into(),
             secreto: Some("supersecreto".into()),
+            ultima_actividad_en: String::new(),
         };
         let json = serde_json::to_string(&inst).expect("serializar");
         assert!(

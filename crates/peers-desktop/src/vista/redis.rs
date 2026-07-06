@@ -168,10 +168,13 @@ pub fn render_redis(datos: &EstadoPantalla) -> impl IntoElement {
     let seleccion = datos.redis_seleccion_cola;
 
     // Cuerpo: dos tablas al 50/50 (colas seleccionable con acción purgar | outbox solo lectura).
+    // `flex_1` + `min_h_0` para que las tablas ocupen el alto restante y scrolleen internamente;
+    // sin `size_full` que fijaría el alto y rompería el scroll del contenedor padre.
     raiz = raiz.child(
         div()
             .h_flex()
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .gap_4()
             .child(div().flex_1().min_w_0().child(tabla_colas(colas, seleccion)))
             .child(div().flex_1().min_w_0().child(tabla_outbox(outbox))),
@@ -224,8 +227,16 @@ fn tabla_colas(colas: &[ColaResumen], seleccion: Option<usize>) -> AnyElement {
         .child(div().flex_1().min_w_0().child(tema::eyebrow("peer")))
         .child(celda_num_eyebrow("mensajes"));
 
-    // Cuerpo: una fila seleccionable por cola, o aviso atenuado si no hay ninguna.
-    let mut cuerpo = div().v_flex().w_full().gap_1();
+    // Cuerpo scrollable: `flex_1` + `min_h_0` + `overflow_y_scroll` para que con muchos peers
+    // las filas scrolleen dentro de la card sin desbordar (bug verificado 06/07/2026).
+    let mut cuerpo = div()
+        .id("redis-colas-scroll")
+        .v_flex()
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .gap_1();
     if colas.is_empty() {
         cuerpo = cuerpo.child(
             div()
@@ -348,7 +359,14 @@ fn tabla_outbox(outbox: &[ColaResumen]) -> AnyElement {
         .child(div().flex_1().min_w_0().child(tema::eyebrow("peer")))
         .child(celda_num_eyebrow("outbox"));
 
-    let mut cuerpo = div().v_flex().w_full().gap_1();
+    let mut cuerpo = div()
+        .id("redis-outbox-scroll")
+        .v_flex()
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .gap_1();
     if outbox.is_empty() {
         cuerpo = cuerpo.child(
             div()

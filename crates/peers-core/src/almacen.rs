@@ -45,6 +45,15 @@ pub trait Almacen: Send + Sync {
     ) -> anyhow::Result<bool>;
 
     async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()>;
+
+    /// Timbra `ultima_actividad_en` (RFC actividad-real): a diferencia de `latido` (pulso
+    /// automático del cliente cada ~15s, prueba solo que el PROCESO sigue vivo), este método lo
+    /// llama el middleware del broker en CADA request autenticado de una tool real — es la señal
+    /// de que el LLM está haciendo algo, no solo que el proceso no murió. Si `id` no existe (la
+    /// instancia ya salió, carrera con el middleware), NO-OP silencioso: no es un error, el
+    /// caller no necesita saberlo.
+    async fn actualizar_actividad(&self, id: &str, ahora: &str) -> anyhow::Result<()>;
+
     async fn definir_resumen(&self, id: &str, resumen: &str) -> anyhow::Result<()>;
     async fn salir(&self, id: &str) -> anyhow::Result<()>;
     async fn instancia_existe(&self, id: &str) -> anyhow::Result<bool>;

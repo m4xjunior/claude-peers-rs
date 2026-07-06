@@ -177,8 +177,8 @@ fn estado_peer(id: &str, alertas: &[Alerta]) -> EstadoPeer {
 // es la flexible (`flex_1`); las demás llevan ancho fijo para que los chips de estado se alineen.
 // -------------------------------------------------------------------------------------------------
 
-const COL_ID: f32 = 150.0;
-const COL_DIR: f32 = 260.0;
+const COL_ID: f32 = 110.0;
+// COL_DIR abolido — el directorio ahora es flexible (flex_1), ocupa el espacio sobrante.
 const COL_VISTO: f32 = 96.0;
 const COL_ESTADO: f32 = 120.0;
 
@@ -186,17 +186,6 @@ const COL_ESTADO: f32 = 120.0;
 // HELPERS DE CELDA — reparten con el vocabulario del tema. Los datos van en Inter (heredado del
 // fondo); los timestamps en mono (`tema::FUENTE_MONO`) para alineación de dígitos.
 // -------------------------------------------------------------------------------------------------
-
-/// Celda de texto de ancho fijo (directorio). Texto PAPEL, tamaño base. `.truncate()` (craft P2):
-/// mismo fix que la celda de id — un directorio/anotación de repo largo no debe partirse por wrap.
-fn celda(texto: impl Into<SharedString>, ancho: f32) -> impl IntoElement {
-    div()
-        .w(px(ancho))
-        .truncate()
-        .px_1()
-        .text_color(tema::PAPEL)
-        .child(texto.into())
-}
 
 /// Celda flexible (ocupa el espacio sobrante) para `resumen`. Se atenúa a HUMO por ser metadato
 /// secundario, y recorta con `overflow_hidden` para no romper el layout con resúmenes largos.
@@ -232,7 +221,7 @@ fn encabezado() -> impl IntoElement {
         .border_b_1()
         .border_color(tema::LINEA)
         .child(div().w(px(COL_ID)).px_1().child(tema::eyebrow("id")))
-        .child(div().w(px(COL_DIR)).px_1().child(tema::eyebrow("directorio")))
+        .child(div().flex_1().px_1().child(tema::eyebrow("directorio")))
         .child(div().flex_1().px_1().child(tema::eyebrow("resumen")))
         .child(div().w(px(COL_VISTO)).px_1().child(tema::eyebrow("visto")))
         .child(div().w(px(COL_ESTADO)).px_1().child(tema::eyebrow("estado")))
@@ -271,7 +260,14 @@ fn fila(indice: usize, inst: &Instancia, estado: EstadoPeer, activa: bool) -> im
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child(SharedString::from(inst.id.clone())),
         )
-        .child(celda(dir, COL_DIR))
+        .child(
+            div()
+                .flex_1()
+                .truncate()
+                .px_1()
+                .text_color(tema::PAPEL)
+                .child(SharedString::from(dir)),
+        )
         .child(celda_flex(inst.resumen.clone()))
         .child(celda_hora(visto))
         .child(
@@ -470,9 +466,8 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
 
     // Raíz: fondo/tipografía heredados del contenedor raíz de la app; aquí sólo el espaciado y la
     // cabecera. Se compone dentro del `fondo_app` del `AppDesktop`, así que no repite `.bg(TINTA)`.
-    let mut raiz = div()
+    let mut raiz = tema::raiz_scrollable()
         .v_flex()
-        .size_full()
         .gap_4()
         .p_6();
 

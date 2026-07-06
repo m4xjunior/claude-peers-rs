@@ -131,10 +131,16 @@ fn hilo(datos: &EstadoPantalla) -> impl IntoElement {
             "Sin mensajes todavía. Escribe abajo para iniciar la conversación privada.",
         ));
     }
+    let mut lista = div()
+        .id("chat-hilo-scroll")
+        .v_flex()
+        .gap_2()
+        .max_h(tema::radio(400.0))
+        .overflow_y_scroll();
     for m in &datos.chat_privado_hilo {
-        cont = cont.child(burbuja(m));
+        lista = lista.child(burbuja(m));
     }
-    cont
+    cont.child(lista)
 }
 
 /// Una burbuja de mensaje. `de == operador` → derecha, BRASA-tenue; si no → izquierda, TINTA2.

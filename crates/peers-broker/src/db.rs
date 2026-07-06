@@ -126,6 +126,7 @@ impl AlmacenSqlite {
                 hostname TEXT NOT NULL DEFAULT '', directorio TEXT NOT NULL,
                 repo_git TEXT, repo_github TEXT, tty TEXT, resumen TEXT NOT NULL DEFAULT '',
                 registrada_en TEXT NOT NULL, visto_en TEXT NOT NULL,
+                ultima_actividad_en TEXT NOT NULL DEFAULT '',
                 secreto TEXT
             );
             CREATE TABLE IF NOT EXISTS mensajes (
@@ -245,6 +246,13 @@ impl AlmacenSqlite {
         // E-10: `secreto` en bases YA existentes. Idempotente (ignora "duplicate column"). Filas
         // viejas → NULL → None → el broker les emite un secreto al primer re-registro (compat).
         let _ = conexion.execute("ALTER TABLE instancias ADD COLUMN secreto TEXT", []);
+        // RFC actividad-real: `ultima_actividad_en` en bases YA existentes. Idempotente (ignora
+        // "duplicate column"). Filas viejas → "" → el detector de ociosos las trata como "sin
+        // actividad conocida" (degrada a solo mirar tarea abierta, no rompe).
+        let _ = conexion.execute(
+            "ALTER TABLE instancias ADD COLUMN ultima_actividad_en TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         // Índice para la búsqueda inversa `id_por_secreto` (O(log n) en vez de escaneo). IF NOT
         // EXISTS lo hace idempotente; la columna ya existe por el ALTER anterior.
         let _ = conexion.execute(
@@ -281,16 +289,20 @@ impl Almacen for AlmacenSqlite {
             .query_row("SELECT 1 FROM instancias WHERE id = ?1", params![id], |_| Ok(true))
             .unwrap_or(false);
         if existe {
-            // Re-registro: UPDATE sin tocar la fila de mensajes ni registrada_en/resumen. E-10: el
-            // secreto SÍ se rota (sesión nueva = credencial fresca), espejo de la impl Redis.
+            // Re-registro: UPDATE sin tocar la fila de mensajes ni registrada_en/resumen/
+            // ultima_actividad_en — el re-registro (reconexión SSH/VPN) no es en sí una llamada de
+            // tool, así que no cuenta como "actividad" (mismo criterio que no tocar registrada_en).
+            // E-10: el secreto SÍ se rota (sesión nueva = credencial fresca), espejo de la impl Redis.
             conexion.execute(
                 "UPDATE instancias SET pid=?2, hostname=?3, directorio=?4, repo_git=?5, repo_github=?6, tty=?7, visto_en=?8, secreto=?9 WHERE id=?1",
                 params![id, pid, hostname, directorio, repo_git, repo_github, tty, ahora, secreto],
             )?;
         } else {
+            // Alta nueva: ultima_actividad_en arranca en `ahora` (== registrada_en) — recién
+            // llegado, se asume activo (decisión de Max/s000).
             conexion.execute(
-                "INSERT INTO instancias (id,pid,hostname,directorio,repo_git,repo_github,tty,resumen,registrada_en,visto_en,secreto)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
+                "INSERT INTO instancias (id,pid,hostname,directorio,repo_git,repo_github,tty,resumen,registrada_en,visto_en,ultima_actividad_en,secreto)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9,?10)",
                 params![id, pid, hostname, directorio, repo_git, repo_github, tty, resumen, ahora, secreto],
             )?;
         }
@@ -300,6 +312,16 @@ impl Almacen for AlmacenSqlite {
     async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()> {
         self.bloquear()
             .execute("UPDATE instancias SET visto_en=?2 WHERE id=?1", params![id, ahora])?;
+        Ok(())
+    }
+
+    async fn actualizar_actividad(&self, id: &str, ahora: &str) -> anyhow::Result<()> {
+        // `UPDATE ... WHERE id=?1` ya es no-op silencioso si `id` no existe (0 filas afectadas,
+        // sin error) — cubre el contrato de "instancia ya dada de baja" sin lógica extra.
+        self.bloquear().execute(
+            "UPDATE instancias SET ultima_actividad_en=?2 WHERE id=?1",
+            params![id, ahora],
+        )?;
         Ok(())
     }
 
@@ -1180,6 +1202,9 @@ fn fila_a_instancia(f: &rusqlite::Row<'_>) -> rusqlite::Result<Instancia> {
         resumen: f.get("resumen")?,
         registrada_en: f.get("registrada_en")?,
         visto_en: f.get("visto_en")?,
+        // Mismo criterio que `hostname`: BD migrada de un schema sin la columna → "" en vez de
+        // fallar la lectura completa.
+        ultima_actividad_en: f.get("ultima_actividad_en").unwrap_or_default(),
         // E-10: `Option<String>` → NULL o columna ausente (BD pre-migración) → None. `ok()`
         // absorbe ambos casos sin fallar la lectura de la instancia entera.
         secreto: f.get("secreto").ok(),

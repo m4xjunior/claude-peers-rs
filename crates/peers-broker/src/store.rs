@@ -188,6 +188,10 @@ impl Almacen for AlmacenRedis {
                 .arg("resumen").arg(resumen)
                 .arg("registrada_en").arg(ahora)
                 .arg("visto_en").arg(ahora)
+                // Alta nueva: ultima_actividad_en arranca en `ahora` (== registrada_en) — recién
+                // llegado, se asume activo (decisión de Max/s000). El re-registro NO la toca
+                // (mismo criterio que registrada_en): reconectar no es en sí una llamada de tool.
+                .arg("ultima_actividad_en").arg(ahora)
                 .arg("secreto").arg(secreto)
                 .query_async::<()>(&mut conn)
                 .await?;
@@ -207,6 +211,15 @@ impl Almacen for AlmacenRedis {
     async fn latido(&self, id: &str, ahora: &str) -> anyhow::Result<()> {
         let mut conn = self.conn().await?;
         let _: () = conn.hset(k_instancia(id), "visto_en", ahora).await?;
+        Ok(())
+    }
+
+    async fn actualizar_actividad(&self, id: &str, ahora: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn().await?;
+        // Mismo patrón que `latido`: HSET sobre el hash de la instancia. Si `id` no existe, Redis
+        // crea el hash de todas formas (comportamiento heredado de `latido`, no nuevo de aquí) —
+        // no es el caso real (el middleware solo llama esto para ids ya autenticados/existentes).
+        let _: () = conn.hset(k_instancia(id), "ultima_actividad_en", ahora).await?;
         Ok(())
     }
 
@@ -1211,6 +1224,7 @@ async fn leer_instancia(
         resumen: h.get("resumen").cloned().unwrap_or_default(),
         registrada_en: h.get("registrada_en").cloned().unwrap_or_default(),
         visto_en: h.get("visto_en").cloned().unwrap_or_default(),
+        ultima_actividad_en: h.get("ultima_actividad_en").cloned().unwrap_or_default(),
         // E-10: el secreto se lee del HASH (campo vacío/ausente → None, instancia pre-E-10).
         secreto: opt("secreto"),
     }))

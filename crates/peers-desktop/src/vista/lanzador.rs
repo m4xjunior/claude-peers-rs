@@ -813,6 +813,17 @@ const ROJO_ERROR: gpui::Rgba = gpui::Rgba {
 
 impl Render for PanelLanzador {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // dim_pty se medía solo al abrir el PTY y nunca se actualizaba con la ventana → crash al redimensionar.
+        if self.sesion_pty.is_some() {
+            let dim_actual = medir_dimensiones_ventana(window, cx);
+            if dim_actual != self.dim_pty {
+                self.dim_pty = dim_actual;
+                if let Some(sesion) = &mut self.sesion_pty {
+                    sesion.redimensionar(dim_actual);
+                }
+            }
+        }
+
         // --- R1/R1.1: fila del directorio (ruta en mono BRASA + Elegir/Revelar/recientes) ---
         let dir_texto = self
             .dir
