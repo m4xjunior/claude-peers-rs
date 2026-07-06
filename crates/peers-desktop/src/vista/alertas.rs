@@ -124,14 +124,19 @@ pub struct AlternarFiltroTipo {
 // `tipo_desde_serializado`, `alertas_visibles`).
 // -------------------------------------------------------------------------------------------------
 
-/// Color de una alerta según su tipo (R6). Mapeo idéntico a la TUI: ocioso→amarillo,
-/// atascado→naranja, ghosteo→rojo, y las dos de accountability→magenta (graves, destacan). Es
-/// SEMÁNTICA de gravedad, no decoración: por eso se conserva la paleta de severidad y no se
-/// sustituye por el acento de marca.
+/// Color de una alerta según su tipo (R6): ocioso→amarillo, atascado→ÁMBAR, ghosteo→rojo, y las
+/// dos de accountability→magenta (graves, destacan). Es SEMÁNTICA de gravedad, no decoración: por
+/// eso se conserva la paleta de severidad y no se sustituye por el acento de marca.
+///
+/// `Atascado` YA NO es naranja (`0xFF8C00`, como en la TUI): pivote de paleta LexusFX Financeiro
+/// (2026-07-06) — el nuevo acento de marca (BRASA) pasa a naranja `#FF6A1A`, y `#FF8C00` quedaba
+/// casi indistinguible de él en pantalla (confirmado por contraste: 8.35:1 vs 6.8:1 contra fondo,
+/// mismo rango, matiz casi igual). Aprobado por Max: libera el naranja como EXCLUSIVO del acento
+/// de marca. La TUI (`peers-tui`) NO se toca — frontend aparte, fuera de este pivote.
 fn color_alerta(tipo: TipoAlerta) -> Rgba {
     match tipo {
         TipoAlerta::Ocioso => rgb(0xEAB308),              // amarillo
-        TipoAlerta::Atascado => rgb(0xFF8C00),            // naranja (RGB, como en la TUI)
+        TipoAlerta::Atascado => rgb(0xF59E0B),            // ámbar (antes naranja 0xFF8C00)
         TipoAlerta::Ghosteo => rgb(0xEF4444),             // rojo
         TipoAlerta::CierreSospechoso => rgb(0xD946EF),    // magenta
         TipoAlerta::CancelacionExcesiva => rgb(0xD946EF), // magenta

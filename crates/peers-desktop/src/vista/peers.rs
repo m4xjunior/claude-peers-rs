@@ -138,13 +138,19 @@ impl EstadoPeer {
     }
 
     /// Color del chip. Es SEMÁNTICA DE DOMINIO (severidad del estado), no un token del tema, por eso
-    /// vive aquí y no en `tema`. Se afinan al fondo cálido del Ethos: ámbar/naranja/verde apagados
-    /// que armonizan con el dorado brasa sin gritar. El texto del chip es SALMO (lo pone `tema`).
+    /// vive aquí y no en `tema`. El texto del chip es SALMO (lo pone `tema`).
+    ///
+    /// `Atascado` YA NO es naranja-rojo (`0xD9542B`): ese tono se calibró para "no competir con
+    /// BRASA" cuando el acento de marca era dorado (Ethos). Pivote de paleta LexusFX Financeiro
+    /// (2026-07-06): BRASA pasa a naranja `#FF6A1A`, así que `#D9542B` (naranja-rojo, primo
+    /// cercano) volvería a competir con el acento en vez de distinguirse de él. Retonado a un rojo
+    /// más puro, separado de la familia naranja, coherente con `EF4444`/`C04A3E` ya usados como
+    /// rojo de alerta/peligro en el resto de la app. Aprobado por Max.
     fn color(self) -> Rgba {
         match self {
             EstadoPeer::Ocioso => rgba(0xD9A021FF),     // ámbar (atención suave)
-            EstadoPeer::Atascado => rgba(0xD9542BFF),   // naranja-rojo (más severo)
-            EstadoPeer::Trabajando => rgba(0x7FA86AFF), // verde apagado (normal, no compite con brasa)
+            EstadoPeer::Atascado => rgba(0xE04040FF),   // rojo puro (antes naranja-rojo 0xD9542B)
+            EstadoPeer::Trabajando => rgba(0x7FA86AFF), // verde apagado (normal)
         }
     }
 }

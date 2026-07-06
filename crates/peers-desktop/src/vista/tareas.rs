@@ -274,13 +274,18 @@ fn etiqueta_estado(estado: EstadoTarea) -> &'static str {
     }
 }
 
-/// Color semántico del estado (R11), mismos valores que la TUI. Se usa como fondo del chip; el
-/// texto del chip va en SALMO (oscuro) para contraste, como en `tema::chip_estado`.
+/// Color semántico del estado (R11). `Bloqueada` en ÁMBAR (no naranja, a diferencia de la TUI):
+/// pivote de paleta LexusFX Financeiro (2026-07-06) — el nuevo acento de marca (BRASA) pasa a
+/// naranja, y `#ff8c00` quedaba casi indistinguible de él en pantalla (confirmado por contraste:
+/// 8.35:1 vs 6.8:1 contra fondo, mismo rango, matiz casi igual). Unificado con `jornada.rs`, que
+/// ya usaba ámbar para el mismo estado — eran dos colores para un solo estado antes de este fix.
+/// La TUI (`peers-tui`) NO se toca: es un frontend aparte, fuera del alcance de este pivote.
+/// El texto del chip va en SALMO (oscuro) para contraste, como en `tema::chip_estado`.
 fn color_estado(estado: EstadoTarea) -> gpui::Rgba {
     match estado {
         EstadoTarea::Abierta => rgb(0x9ca3af),   // gris neutro
         EstadoTarea::EnCurso => rgb(0x22d3ee),   // cian
-        EstadoTarea::Bloqueada => rgb(0xff8c00), // naranja
+        EstadoTarea::Bloqueada => rgb(0xF59E0B), // ámbar (antes naranja 0xff8c00)
         EstadoTarea::Hecha => rgb(0x22c55e),     // verde
         EstadoTarea::Cancelada => rgb(0xef4444), // rojo
     }
