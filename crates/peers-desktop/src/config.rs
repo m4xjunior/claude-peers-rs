@@ -45,6 +45,12 @@ pub struct Config {
     /// `lanzador`: `#[serde(default)]` para que un `config.toml` viejo sin `[acceso]` cargue igual.
     #[serde(default)]
     pub acceso: ConfigAcceso,
+    /// Proyectos del operador (RFC-proyectos R1). Sección `[[proyecto]]` del TOML. `#[serde(default)]`
+    /// + `skip_serializing_if` vacío → un `config.toml` viejo SIN proyectos deserializa igual y la
+    /// app opera como hoy, lista plana (AC7). `rename = "proyecto"` para que el TOML sea `[[proyecto]]`
+    /// (idiomático: array de tablas en singular).
+    #[serde(default, rename = "proyecto", skip_serializing_if = "Vec::is_empty")]
+    pub proyectos: Vec<Proyecto>,
 }
 
 fn refresh_ms_defecto() -> u64 {
@@ -123,6 +129,7 @@ impl Default for Config {
             refresh_ms: REFRESH_MS_DEFECTO,
             lanzador: ConfigLanzador::default(),
             acceso: ConfigAcceso::default(),
+            proyectos: Vec::new(),
         }
     }
 }
@@ -176,6 +183,91 @@ impl ConfigAcceso {
     pub fn registrar_evento(&mut self, evento: EventoConexion) {
         self.historial.insert(0, evento);
         self.historial.truncate(MAX_HISTORIAL_ACCESO);
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// PROYECTOS (RFC-proyectos R1–R7) — workspaces aislados de la empresa. Un proyecto es CONFIG del
+// operador (no del broker): vive en `config.toml` sección `[[proyecto]]`, y el aislamiento es por
+// CONVENCIÓN de id (`rol@proyecto`, filtro en cliente, v1 sin backend nuevo). El "estado vivo"
+// (agentes vivos/ociosos, tablero, alertas) NO se persiste: se cruza contra el broker al pintar.
+// -------------------------------------------------------------------------------------------------
+
+/// Dónde arranca/corre el equipo de un proyecto (R3). v1: una ubicación por proyecto (los agentes
+/// la heredan; override por agente = v2). `#[serde(tag)]` da un TOML legible (`tipo = "local"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "tipo", rename_all = "lowercase")]
+pub enum Ubicacion {
+    /// Carpeta local (elegida con el picker nativo, `cx.prompt_for_paths`). Ruta absoluta.
+    Local { ruta: String },
+    /// Host SSH (de la lista de RFC Acceso) + ruta remota donde arranca la sesión.
+    Ssh { host: String, ruta: String },
+    /// Sesión tmux (nombre) — opcionalmente sobre un host SSH. `host = None` → tmux local.
+    Tmux {
+        nombre: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ruta: Option<String>,
+    },
+}
+
+impl Ubicacion {
+    /// Etiqueta corta y legible para la card/cabecera del proyecto (mono en la UI).
+    /// `local:/Users/max/px`, `ssh:otus:/srv/app`, `tmux:equipo@otus`.
+    pub fn etiqueta(&self) -> String {
+        match self {
+            Ubicacion::Local { ruta } => format!("local:{ruta}"),
+            Ubicacion::Ssh { host, ruta } => format!("ssh:{host}:{ruta}"),
+            Ubicacion::Tmux { nombre, host, .. } => match host {
+                Some(h) => format!("tmux:{nombre}@{h}"),
+                None => format!("tmux:{nombre}"),
+            },
+        }
+    }
+}
+
+/// Un proyecto: contenedor organizativo de la empresa (R1). Su equipo es una lista de ids de
+/// agente (v1 simple; el organigrama con cargos es RFC aparte). `creado_en` se timbra al crear
+/// (ISO 8601 UTC local — la desktop no tiene el reloj del broker para config propia).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Proyecto {
+    /// Slug estable (identidad; el sufijo `@<id>` de los ids de agente cuelga de aquí). `[a-z0-9-]`.
+    pub id: String,
+    /// Nombre visible (libre, editable).
+    pub nombre: String,
+    /// Dónde vive el equipo (R3).
+    pub ubicacion: Ubicacion,
+    /// Ids de los agentes del proyecto (el "equipo", R1). Vacío = proyecto sin equipo aún.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agentes: Vec<String>,
+    /// Cuándo se creó (RFC 3339 UTC), para orden/auditoría.
+    pub creado_en: String,
+    /// `true` lo saca de la vista activa sin borrar su historia (R6). Reactivable.
+    #[serde(default)]
+    pub archivado: bool,
+}
+
+impl Proyecto {
+    /// Sanea un nombre libre a un slug de id (`[a-z0-9-]`): minúsculas, espacios→`-`, quita el
+    /// resto. Evita ids inválidos como sufijo `@proyecto` (que viaja en ids de red). Vacío tras
+    /// sanear → el caller debe rechazar (no hay proyecto sin id).
+    pub fn slug(nombre: &str) -> String {
+        let mut s = String::with_capacity(nombre.len());
+        let mut guion_pendiente = false;
+        for c in nombre.trim().to_lowercase().chars() {
+            if c.is_ascii_alphanumeric() {
+                if guion_pendiente && !s.is_empty() {
+                    s.push('-');
+                }
+                guion_pendiente = false;
+                s.push(c);
+            } else {
+                // Cualquier separador (espacio, _, /, …) colapsa a UN guion, sin guiones dobles.
+                guion_pendiente = true;
+            }
+        }
+        s
     }
 }
 
@@ -245,6 +337,127 @@ impl Config {
         }
         Ok(())
     }
+
+    // --- CRUD de proyectos (RFC-proyectos R4–R7). Mutan `self.proyectos` en memoria; el caller
+    // (AppDesktop) persiste con `guardar()` después, igual que registrar_reciente/registrar_evento. ---
+
+    /// Crea un proyecto (R4). Deriva el id (slug) del nombre; si colisiona con uno existente,
+    /// sufija `-2`, `-3`… (dos proyectos "Web" → `web`, `web-2`). Timbra `creado_en` ahora.
+    /// Devuelve el id asignado, o `Err` si el nombre saneado queda vacío (no hay proyecto sin id).
+    pub fn crear_proyecto(&mut self, nombre: &str, ubicacion: Ubicacion) -> Result<String> {
+        let base = Proyecto::slug(nombre);
+        if base.is_empty() {
+            anyhow::bail!("el nombre del proyecto no puede quedar vacío tras sanear a slug");
+        }
+        let id = self.id_proyecto_libre(&base);
+        self.proyectos.push(Proyecto {
+            id: id.clone(),
+            nombre: nombre.trim().to_string(),
+            ubicacion,
+            agentes: Vec::new(),
+            creado_en: ahora_iso(),
+            archivado: false,
+        });
+        Ok(id)
+    }
+
+    /// Primer id libre a partir de `base`: `base`, o `base-2`, `base-3`… si ya existe (cota 99).
+    fn id_proyecto_libre(&self, base: &str) -> String {
+        if !self.proyectos.iter().any(|p| p.id == base) {
+            return base.to_string();
+        }
+        for n in 2..=99 {
+            let cand = format!("{base}-{n}");
+            if !self.proyectos.iter().any(|p| p.id == cand) {
+                return cand;
+            }
+        }
+        // Improbable: 98 colisiones. Cae a un id con el timestamp para no bloquear.
+        format!("{base}-{}", ahora_iso().replace([':', '-', 'T', 'Z', '.'], ""))
+    }
+
+    /// Edita nombre y/o ubicación de un proyecto por id (R5). El `id` (slug) NO cambia — renombrar
+    /// el id rompería el sufijo `@proyecto` de los agentes ya lanzados. `None` deja el campo intacto.
+    /// Devuelve `true` si el proyecto existía y se editó.
+    pub fn editar_proyecto(
+        &mut self,
+        id: &str,
+        nombre: Option<&str>,
+        ubicacion: Option<Ubicacion>,
+    ) -> bool {
+        let Some(p) = self.proyectos.iter_mut().find(|p| p.id == id) else {
+            return false;
+        };
+        if let Some(n) = nombre {
+            let n = n.trim();
+            if !n.is_empty() {
+                p.nombre = n.to_string();
+            }
+        }
+        if let Some(u) = ubicacion {
+            p.ubicacion = u;
+        }
+        true
+    }
+
+    /// Archiva o reactiva un proyecto (R6): `archivado` a `valor`. No borra nada (preserva la
+    /// historia). Devuelve `true` si el proyecto existía.
+    pub fn archivar_proyecto(&mut self, id: &str, valor: bool) -> bool {
+        match self.proyectos.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.archivado = valor;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Borra un proyecto de la config (R6, borrado real). Acción destructiva: el caller confirma
+    /// antes. NO toca la bitácora del broker (esa historia es del broker, no de esta config).
+    /// Devuelve `true` si existía y se borró.
+    pub fn borrar_proyecto(&mut self, id: &str) -> bool {
+        let antes = self.proyectos.len();
+        self.proyectos.retain(|p| p.id != id);
+        self.proyectos.len() != antes
+    }
+
+    /// Duplica un proyecto como plantilla (R7): copia nombre (con " (copia)") y EQUIPO (cargos/ids),
+    /// pero con NUEVA ubicación e id fresco. Acelera montar proyectos parecidos. `None` si el origen
+    /// no existe. OJO: los ids de agente copiados llevan el sufijo del proyecto VIEJO; el caller/UI
+    /// debe reasignarlos al nuevo sufijo al lanzar (aquí se copian como semilla editable).
+    pub fn duplicar_proyecto(&mut self, id_origen: &str, ubicacion: Ubicacion) -> Option<String> {
+        let origen = self.proyectos.iter().find(|p| p.id == id_origen)?.clone();
+        let nombre = format!("{} (copia)", origen.nombre);
+        let nuevo_id = self.id_proyecto_libre(&Proyecto::slug(&nombre));
+        self.proyectos.push(Proyecto {
+            id: nuevo_id.clone(),
+            nombre,
+            ubicacion,
+            agentes: origen.agentes.clone(),
+            creado_en: ahora_iso(),
+            archivado: false,
+        });
+        Some(nuevo_id)
+    }
+
+    /// Busca un proyecto por id (lectura). None si no existe.
+    pub fn proyecto(&self, id: &str) -> Option<&Proyecto> {
+        self.proyectos.iter().find(|p| p.id == id)
+    }
+
+    /// Proyectos NO archivados (los de la vista activa, R6).
+    pub fn proyectos_activos(&self) -> impl Iterator<Item = &Proyecto> {
+        self.proyectos.iter().filter(|p| !p.archivado)
+    }
+}
+
+/// Timestamp ISO 8601 UTC para timbrar `creado_en` de un proyecto (config local del operador; la
+/// desktop no tiene el reloj del broker para su propia config). Reusa `time` (ya dependencia).
+fn ahora_iso() -> String {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_default()
 }
 
 /// Enmascara un token para mostrarlo en pantalla sin revelarlo: deja los primeros 5 y los
@@ -441,6 +654,92 @@ mod tests {
         assert!(!leido.acceso.historial[0].ok);
         assert_eq!(leido.acceso.historial[1].tipo, TipoEventoConexion::Aplicar);
         assert!(leido.acceso.historial[1].ok);
+        let _ = std::fs::remove_file(&ruta);
+    }
+
+    // --- Proyectos (RFC-proyectos R1–R7) ---
+
+    #[test]
+    fn slug_sanea_nombre_a_id_valido() {
+        assert_eq!(Proyecto::slug("Web Frontend"), "web-frontend");
+        assert_eq!(Proyecto::slug("  proyecto X  "), "proyecto-x");
+        assert_eq!(Proyecto::slug("API_v2 / core"), "api-v2-core");
+        // Los acentos (no ASCII alfanumérico) se descartan; sin guion final colgante.
+        assert_eq!(Proyecto::slug("acentos-áéí"), "acentos");
+        assert_eq!(Proyecto::slug("web-"), "web"); // separador final no deja guion colgante
+        assert_eq!(Proyecto::slug("!!!"), ""); // solo símbolos → vacío (el caller rechaza)
+        // El slug es apto como sufijo @proyecto: solo [a-z0-9-].
+        assert!(Proyecto::slug("Mi Proyecto 2026").chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn crear_proyecto_deriva_id_y_sufija_en_colision() {
+        let mut cfg = Config::default();
+        let id1 = cfg.crear_proyecto("Web", Ubicacion::Local { ruta: "/tmp/web".into() }).unwrap();
+        let id2 = cfg.crear_proyecto("web", Ubicacion::Local { ruta: "/tmp/web2".into() }).unwrap();
+        assert_eq!(id1, "web");
+        assert_eq!(id2, "web-2"); // colisión → sufijo
+        assert_eq!(cfg.proyectos.len(), 2);
+        // Nombre vacío tras sanear → error, no crea.
+        assert!(cfg.crear_proyecto("###", Ubicacion::Local { ruta: "/x".into() }).is_err());
+        assert_eq!(cfg.proyectos.len(), 2);
+    }
+
+    #[test]
+    fn editar_archivar_borrar_proyecto() {
+        let mut cfg = Config::default();
+        let id = cfg.crear_proyecto("Alpha", Ubicacion::Local { ruta: "/a".into() }).unwrap();
+        // Editar nombre y ubicación; el id NO cambia.
+        assert!(cfg.editar_proyecto(&id, Some("Alpha 2"), Some(Ubicacion::Ssh {
+            host: "otus".into(), ruta: "/srv/a".into(),
+        })));
+        let p = cfg.proyecto(&id).unwrap();
+        assert_eq!(p.id, "alpha"); // slug intacto
+        assert_eq!(p.nombre, "Alpha 2");
+        assert!(matches!(&p.ubicacion, Ubicacion::Ssh { host, .. } if host == "otus"));
+        // Archivar lo saca de activos sin borrarlo.
+        assert!(cfg.archivar_proyecto(&id, true));
+        assert_eq!(cfg.proyectos_activos().count(), 0);
+        assert_eq!(cfg.proyectos.len(), 1); // sigue ahí
+        assert!(cfg.archivar_proyecto(&id, false)); // reactivar
+        assert_eq!(cfg.proyectos_activos().count(), 1);
+        // Borrado real lo elimina.
+        assert!(cfg.borrar_proyecto(&id));
+        assert!(cfg.proyecto(&id).is_none());
+        assert!(!cfg.borrar_proyecto(&id)); // ya no existe
+    }
+
+    #[test]
+    fn duplicar_proyecto_copia_equipo_con_nueva_ubicacion() {
+        let mut cfg = Config::default();
+        let id = cfg.crear_proyecto("Base", Ubicacion::Local { ruta: "/base".into() }).unwrap();
+        // Sembramos un equipo en el origen.
+        cfg.proyectos.iter_mut().find(|p| p.id == id).unwrap().agentes =
+            vec!["backend@base".into(), "qa@base".into()];
+        let nuevo = cfg
+            .duplicar_proyecto(&id, Ubicacion::Ssh { host: "otus".into(), ruta: "/base2".into() })
+            .unwrap();
+        let dup = cfg.proyecto(&nuevo).unwrap();
+        assert_eq!(dup.nombre, "Base (copia)");
+        assert_eq!(dup.agentes, vec!["backend@base".to_string(), "qa@base".to_string()]);
+        assert!(matches!(&dup.ubicacion, Ubicacion::Ssh { .. }));
+        assert_ne!(dup.id, id); // id fresco
+    }
+
+    #[test]
+    fn config_vieja_sin_proyectos_deserializa_y_roundtrip() {
+        // AC7: un config.toml SIN sección [[proyecto]] deserializa (lista vacía = comportamiento hoy).
+        let cfg = Config::desde_toml("broker_url = \"http://127.0.0.1:7899\"").unwrap();
+        assert!(cfg.proyectos.is_empty());
+        // Roundtrip con proyectos: crear, guardar, cargar, comparar.
+        let mut c2 = Config::default();
+        c2.crear_proyecto("Proyecto X", Ubicacion::Local { ruta: "/px".into() }).unwrap();
+        c2.crear_proyecto("Remoto", Ubicacion::Ssh { host: "otus".into(), ruta: "/r".into() }).unwrap();
+        let ruta = std::env::temp_dir().join("peers-desktop-test-proyectos.toml");
+        c2.guardar_en(&ruta).unwrap();
+        let leido = Config::cargar_desde(&ruta).unwrap();
+        assert_eq!(c2, leido);
+        assert_eq!(leido.proyectos.len(), 2);
         let _ = std::fs::remove_file(&ruta);
     }
 }
