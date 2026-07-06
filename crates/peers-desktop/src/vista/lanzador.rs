@@ -1264,11 +1264,15 @@ impl Render for PanelLanzador {
             .child(card_terminal);
 
         // Raíz de la pantalla: fondo Ethos + cabecera FIJA + cuerpo scrollable.
-        // `raiz_scrollable()` (NO `fondo_app()`, sin `size_full`): el contenedor `contenido-scroll`
-        // de app.rs necesita que esta vista NO fije su propio alto para poder medirla y scrollearla
-        // — sin este cambio, el `size_full` de `fondo_app()` competiría con el `overflow_y_scroll`
-        // interno del cuerpo de esta misma pantalla (doble contenedor con alto fijo anidado).
-        tema::raiz_scrollable()
+        // USA `fondo_app()` (`size_full`), NO `raiz_scrollable()`. Esta pantalla tiene su PROPIO
+        // cuerpo scrollable interno (`flex_1` + `min_h_0` + `overflow_y_scroll`), con la cabecera
+        // FIJA fuera — el patrón "header fijo + cuerpo scroll" de `alertas.rs`/`tareas.rs`. Ese patrón
+        // EXIGE que el raíz tenga alto acotado (`size_full`) para que el `flex_1` del cuerpo reparta
+        // el espacio restante; con `raiz_scrollable()` (sin alto), el `flex_1` no tenía referencia y
+        // el scroll interno NO se activaba (bug: las últimas cards inalcanzables). Las vistas que SÍ
+        // delegan al scroll de app (broker/config/jornada…) NO tienen cuerpo scrollable propio y por
+        // eso usan `raiz_scrollable()`; el Lanzador sí lo tiene, así que va como alertas.
+        tema::fondo_app()
             .v_flex()
             .child(
                 div()
