@@ -8,3 +8,6 @@
 /.specs/desktop/.obsidian/
 /.specs/.obsidian/
 
+
+# Repos de referencia externa clonados para consulta (no forman parte del proyecto)
+/referencias/

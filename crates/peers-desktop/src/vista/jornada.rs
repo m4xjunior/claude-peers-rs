@@ -1031,6 +1031,111 @@ fn recortar_texto(texto: &str, max: usize) -> String {
     format!("{recortado}…")
 }
 
+// -------------------------------------------------------------------------------------------------
+// TIMELINE AGREGADO (multi-peer) — cruza la bitácora de VARIOS peers a la vez en un único timeline
+// cronológico, cada fila con un chip que identifica al AUTOR (`AccionRegistrada::quien`), que hoy
+// la vista de un solo peer no necesita mostrar porque ya se sabe de quién es la jornada. Pensado
+// para la sub-tab "Actividad" de la ficha de Proyecto (R12, s002): recibe el resultado YA cargado
+// de `cliente.acciones(id)` para cada peer del equipo — esta función es pura, no hace fetch ni
+// conoce `cx`, así que quien la enchufe decide cómo obtener los pares (id, acciones).
+// -------------------------------------------------------------------------------------------------
+
+/// Timeline cruzado: intercala la bitácora de cada `(peer_id, acciones)` en un único orden
+/// cronológico DESCENDENTE (más reciente primero, mismo criterio que `/acciones` por peer).
+/// Cada fila lleva el chip de tipo (igual que la Jornada de un peer) MÁS un chip de autor a la
+/// izquierda para poder distinguir "quién hizo qué" cuando se mezclan varios agentes. Sin
+/// `cx`/Actions: es de sólo lectura, no hay selección ni detalle clicable (a diferencia de
+/// `fila_accion`, que sí abre el modal de tarea) — el timeline agregado es un vistazo del equipo,
+/// no un punto de entrada a otra pantalla.
+pub fn timeline_agregado(pares: &[(String, Vec<AccionRegistrada>)]) -> impl IntoElement {
+    let filas = aplanar_y_ordenar(pares);
+    let total = filas.len();
+    let mut cuerpo = div().v_flex().gap_1();
+    if filas.is_empty() {
+        cuerpo = cuerpo.child(tema::texto_terciario("Sin actividad registrada para este equipo."));
+    } else {
+        for (idx, (peer_id, a)) in filas.into_iter().enumerate() {
+            cuerpo = cuerpo.child(fila_accion_agregada(idx, peer_id, a));
+        }
+    }
+
+    tema::superficie_card()
+        .v_flex()
+        .gap_2()
+        .p_4()
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .child(tema::eyebrow("Actividad del equipo"))
+                .child(tema::texto_terciario(format!("({total}) · horas en UTC"))),
+        )
+        .child(cuerpo)
+}
+
+/// Aplana los `(peer_id, acciones)` de todos los peers y ordena por `cuando` DESCENDENTE (más
+/// reciente primero). `cuando` es ISO 8601 (RFC3339, siempre UTC — timbrado por el broker), así
+/// que el orden lexicográfico de la cadena coincide con el orden cronológico sin parsear fechas.
+fn aplanar_y_ordenar<'a>(
+    pares: &'a [(String, Vec<AccionRegistrada>)],
+) -> Vec<(&'a str, &'a AccionRegistrada)> {
+    let mut filas: Vec<(&str, &AccionRegistrada)> = pares
+        .iter()
+        .flat_map(|(id, acciones)| acciones.iter().map(move |a| (id.as_str(), a)))
+        .collect();
+    filas.sort_by(|a, b| b.1.cuando.cmp(&a.1.cuando));
+    filas
+}
+
+/// Una fila del timeline agregado: hora · chip de AUTOR (brasa tenue, id del peer) · chip de tipo
+/// · sujeto · detalle. Estática (no clicable): mezclar sujetos de tareas de distintos peers en una
+/// sola tabla haría ambiguo a qué "detalle de tarea" saltar sin conocer también el `instancia_id`
+/// de esa tarea, que esta función no recibe (ver nota de cabecera). Layout compartido con
+/// `celdas_accion` para que el timeline de un peer y el agregado se lean igual.
+fn fila_accion_agregada(idx: usize, peer_id: &str, a: &AccionRegistrada) -> AnyElement {
+    let hora = tema::formatear_fecha(&a.cuando);
+    let etiqueta = etiqueta_accion(a.accion);
+    let sujeto = a.sujeto.clone().unwrap_or_default();
+    let detalle = a.detalle.clone().unwrap_or_default();
+
+    let fila = div()
+        .id(SharedString::from(format!("jornada-agregado-{idx}")))
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .px_3()
+        .py_2()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .px_2()
+                .py(px(1.0))
+                .rounded(px(tema::RADIO_PILL))
+                .bg(tema::TINTA2)
+                .border_1()
+                .border_color(tema::LINEA)
+                .font_family(tema::FUENTE_MONO)
+                .text_xs()
+                .text_color(tema::PAPEL)
+                .child(SharedString::from(peer_id.to_string())),
+        );
+    let fila = celdas_accion(fila, &hora, etiqueta, &sujeto, &detalle);
+
+    match &a.evidencia {
+        Some(ev) => div()
+            .v_flex()
+            .w_full()
+            .gap_0()
+            .child(fila)
+            .child(fila_evidencia(ev))
+            .into_any_element(),
+        None => fila.into_any_element(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,5 +1151,42 @@ mod tests {
         assert_eq!(formatear_duracion(Some(45)), "45s");
         assert_eq!(formatear_duracion(Some(600)), "10min");
         assert_eq!(formatear_duracion(Some(3720)), "1h02");
+    }
+
+    fn accion(cuando: &str) -> AccionRegistrada {
+        AccionRegistrada {
+            quien: "x".into(),
+            accion: TipoAccion::CrearTarea,
+            sujeto: None,
+            detalle: None,
+            cuando: cuando.into(),
+            evidencia: None,
+        }
+    }
+
+    /// R12/timeline agregado: acciones de peers distintos se intercalan por `cuando`, más
+    /// reciente primero, sin importar el orden de llegada de cada peer en `pares`.
+    #[test]
+    fn aplanar_y_ordenar_intercala_por_fecha_desc() {
+        let pares = vec![
+            (
+                "claudia".to_string(),
+                vec![accion("2026-07-06T09:00:00Z"), accion("2026-07-06T12:00:00Z")],
+            ),
+            ("max".to_string(), vec![accion("2026-07-06T10:30:00Z")]),
+        ];
+        let filas = aplanar_y_ordenar(&pares);
+        let horas: Vec<&str> = filas.iter().map(|(_, a)| a.cuando.as_str()).collect();
+        assert_eq!(
+            horas,
+            vec!["2026-07-06T12:00:00Z", "2026-07-06T10:30:00Z", "2026-07-06T09:00:00Z"]
+        );
+        assert_eq!(filas[0].0, "claudia");
+        assert_eq!(filas[1].0, "max");
+    }
+
+    #[test]
+    fn aplanar_y_ordenar_vacio_da_vacio() {
+        assert!(aplanar_y_ordenar(&[]).is_empty());
     }
 }

@@ -400,6 +400,29 @@ impl Config {
         true
     }
 
+    /// Agrega ids de agente EXISTENTES al equipo de un proyecto (feature "importar peers a
+    /// Proyectos"). DECISIÓN DE DISEÑO: un peer puede pertenecer a MÁS DE UN proyecto — no hay
+    /// exclusividad. Igual que el filtro por sufijo `@proyecto` (R12/Patron::Grupo) no asume que
+    /// un id calce con un único proyecto, esta capa de datos tampoco lo fuerza; quitar esa regla
+    /// after-the-fact sería un cambio de contrato, así que se decide multi-proyecto desde el
+    /// origen. Dedup SOLO contra el equipo de ESTE proyecto (`agentes` no es un `Vec` con
+    /// invariante de unicidad global): agregar un id ya presente en él es no-op silencioso; el
+    /// mismo id en OTRO proyecto no se toca ni se valida aquí. Ids vacíos/blancos se descartan
+    /// (mismo criterio que `crear_proyecto` con el nombre). Devuelve `true` si el proyecto existía
+    /// (haya agregado algo nuevo o no); `false` si el id de proyecto no existe.
+    pub fn agregar_agentes_a_proyecto(&mut self, id_proyecto: &str, ids_agente: &[String]) -> bool {
+        let Some(p) = self.proyectos.iter_mut().find(|p| p.id == id_proyecto) else {
+            return false;
+        };
+        for id in ids_agente {
+            let id = id.trim();
+            if !id.is_empty() && !p.agentes.iter().any(|existente| existente == id) {
+                p.agentes.push(id.to_string());
+            }
+        }
+        true
+    }
+
     /// Archiva o reactiva un proyecto (R6): `archivado` a `valor`. No borra nada (preserva la
     /// historia). Devuelve `true` si el proyecto existía.
     pub fn archivar_proyecto(&mut self, id: &str, valor: bool) -> bool {
@@ -724,6 +747,43 @@ mod tests {
         assert_eq!(dup.agentes, vec!["backend@base".to_string(), "qa@base".to_string()]);
         assert!(matches!(&dup.ubicacion, Ubicacion::Ssh { .. }));
         assert_ne!(dup.id, id); // id fresco
+    }
+
+    #[test]
+    fn agregar_agentes_a_proyecto_dedup_y_descarta_vacios() {
+        let mut cfg = Config::default();
+        let id = cfg.crear_proyecto("Alpha", Ubicacion::Local { ruta: "/a".into() }).unwrap();
+        assert!(cfg.agregar_agentes_a_proyecto(
+            &id,
+            &["backend@alpha".into(), "  ".into(), "qa@alpha".into()]
+        ));
+        let p = cfg.proyecto(&id).unwrap();
+        assert_eq!(p.agentes, vec!["backend@alpha".to_string(), "qa@alpha".to_string()]);
+        // Re-agregar uno ya presente + uno nuevo: no duplica, solo suma el nuevo.
+        assert!(cfg.agregar_agentes_a_proyecto(&id, &["backend@alpha".into(), "front@alpha".into()]));
+        let p = cfg.proyecto(&id).unwrap();
+        assert_eq!(
+            p.agentes,
+            vec!["backend@alpha".to_string(), "qa@alpha".to_string(), "front@alpha".to_string()]
+        );
+    }
+
+    #[test]
+    fn agregar_agentes_a_proyecto_inexistente_devuelve_false() {
+        let mut cfg = Config::default();
+        assert!(!cfg.agregar_agentes_a_proyecto("no-existe", &["x@no-existe".into()]));
+    }
+
+    #[test]
+    fn agregar_agentes_permite_multi_proyecto() {
+        // DECISIÓN de diseño: un peer puede estar en más de un proyecto a la vez.
+        let mut cfg = Config::default();
+        let id1 = cfg.crear_proyecto("Alpha", Ubicacion::Local { ruta: "/a".into() }).unwrap();
+        let id2 = cfg.crear_proyecto("Beta", Ubicacion::Local { ruta: "/b".into() }).unwrap();
+        assert!(cfg.agregar_agentes_a_proyecto(&id1, &["claudia".into()]));
+        assert!(cfg.agregar_agentes_a_proyecto(&id2, &["claudia".into()]));
+        assert_eq!(cfg.proyecto(&id1).unwrap().agentes, vec!["claudia".to_string()]);
+        assert_eq!(cfg.proyecto(&id2).unwrap().agentes, vec!["claudia".to_string()]);
     }
 
     #[test]
