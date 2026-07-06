@@ -38,59 +38,86 @@ use gpui::{
 // -------------------------------------------------------------------------------------------------
 
 /// Fondo principal de la app — negro cálido casi puro. Base de todo.
+// PALETA "LexusFX Financeiro" (pivote 2026-07-06, acordado por los 3 agentes UI + Max). Reemplaza
+// la paleta "Ethos" cálida (dorado) por la fría de LexusFX (acento naranja). Los valores vienen del
+// design system de LexusFX (src/styles/global.css + componentes). Cambio de temperatura: cálido→frío.
 pub const TINTA: Rgba = Rgba {
-    r: 0x10 as f32 / 255.0,
-    g: 0x0D as f32 / 255.0,
-    b: 0x0A as f32 / 255.0,
+    r: 0x07 as f32 / 255.0,
+    g: 0x09 as f32 / 255.0,
+    b: 0x0b as f32 / 255.0,
     a: 1.0,
 };
 
 /// Superficie elevada (cards, paneles) — un paso por encima de TINTA.
 pub const TINTA2: Rgba = Rgba {
-    r: 0x1A as f32 / 255.0,
-    g: 0x16 as f32 / 255.0,
-    b: 0x11 as f32 / 255.0,
+    r: 0x0e as f32 / 255.0,
+    g: 0x11 as f32 / 255.0,
+    b: 0x15 as f32 / 255.0,
     a: 1.0,
 };
 
-/// Texto principal — pergamino cálido. Sustituye al blanco puro para bajar el contraste duro.
+/// Texto principal — casi blanco frío (LexusFX #f4f5f6). Mejor contraste WCAG que el pergamino.
 pub const PAPEL: Rgba = Rgba {
-    r: 0xEC as f32 / 255.0,
-    g: 0xE5 as f32 / 255.0,
-    b: 0xD7 as f32 / 255.0,
+    r: 0xf4 as f32 / 255.0,
+    g: 0xf5 as f32 / 255.0,
+    b: 0xf6 as f32 / 255.0,
     a: 1.0,
 };
 
-/// ACENTO de marca — dorado "brasa". Úsese CON MODERACIÓN: estado activo, labels, acentos.
+/// ACENTO de marca — NARANJA LexusFX (#FF6A1A). MUY saturado: úsese con MÁS moderación que el
+/// dorado anterior (acción principal, estado activo del sidebar) — para bordes de selección de
+/// tablas usar `ACENTO_BORDE`, no este, o el naranja fatiga repetido (decisión de la auditoría UI).
 pub const BRASA: Rgba = Rgba {
-    r: 0xC9 as f32 / 255.0,
-    g: 0xA9 as f32 / 255.0,
-    b: 0x6E as f32 / 255.0,
+    r: 0xFF as f32 / 255.0,
+    g: 0x6A as f32 / 255.0,
+    b: 0x1A as f32 / 255.0,
     a: 1.0,
 };
 
-/// Texto SOBRE dorado (p.ej. label de `boton_primario`) — casi negro cálido, alto contraste.
+/// Texto SOBRE el acento naranja (label de `boton_primario`, chips `bg(BRASA)`) — negro frío. En
+/// LexusFX el texto sobre fondo #FF6A1A sólido es #0a0d10 (Login.tsx/VistaPagar.tsx), no blanco.
 pub const SALMO: Rgba = Rgba {
-    r: 0x17 as f32 / 255.0,
-    g: 0x13 as f32 / 255.0,
-    b: 0x09 as f32 / 255.0,
+    r: 0x0a as f32 / 255.0,
+    g: 0x0d as f32 / 255.0,
+    b: 0x10 as f32 / 255.0,
     a: 1.0,
 };
 
-/// Texto terciario / labels / placeholders — humo apagado.
+/// Texto terciario / labels / placeholders — gris frío apagado (LexusFX #646b75).
 pub const HUMO: Rgba = Rgba {
-    r: 0x93 as f32 / 255.0,
-    g: 0x8B as f32 / 255.0,
-    b: 0x7B as f32 / 255.0,
+    r: 0x64 as f32 / 255.0,
+    g: 0x6b as f32 / 255.0,
+    b: 0x75 as f32 / 255.0,
     a: 1.0,
 };
 
-/// Bordes y separadores — línea tenue sobre el fondo oscuro.
+/// Bordes y separadores — gris oscuro frío (LexusFX #16191d).
 pub const LINEA: Rgba = Rgba {
-    r: 0x2B as f32 / 255.0,
-    g: 0x27 as f32 / 255.0,
-    b: 0x1F as f32 / 255.0,
+    r: 0x16 as f32 / 255.0,
+    g: 0x19 as f32 / 255.0,
+    b: 0x1d as f32 / 255.0,
     a: 1.0,
+};
+
+/// ACENTO tenue con alfa controlado (helper): el acento de marca a la opacidad `alpha`. Evita
+/// dispersar literales hex del naranja con alfa por las vistas (el bug que tenía acceso.rs, que
+/// hardcodeaba el dorado viejo y quedaba desincronizado al cambiar la paleta). Un solo cambio de
+/// BRASA reajusta todos los tenues. Ej.: `acento_tenue(0.13)` = naranja al 13%.
+#[must_use]
+pub fn acento_tenue(alpha: f32) -> Rgba {
+    Rgba { a: alpha, ..BRASA }
+}
+
+/// Borde de SELECCIÓN de filas (`fila_seleccionable`). Es un naranja MÁS TENUE que BRASA puro, para
+/// que en las 5 pantallas con tablas seleccionables (Alertas/Tareas/Trazabilidad/Peers/…) la barra
+/// de selección no "grite" en cada fila activa como lo haría el naranja pleno (decisión de la
+/// auditoría UI: el dorado toleraba repetición, el naranja saturado no). Separado de BRASA a
+/// propósito, para no reusar el acento de acción como decoración omnipresente.
+pub const ACENTO_BORDE: Rgba = Rgba {
+    r: 0xFF as f32 / 255.0,
+    g: 0x6A as f32 / 255.0,
+    b: 0x1A as f32 / 255.0,
+    a: 0.55,
 };
 
 // -------------------------------------------------------------------------------------------------
@@ -156,10 +183,10 @@ pub const FUENTE_MONO: &str = "IBM Plex Mono";
 /// `pub`: lo reutiliza el sidebar de `AppDesktop` para marcar el ítem de la pantalla activa con el
 /// mismo lenguaje que las filas seleccionables (coherencia visual).
 pub const BRASA_TENUE: Rgba = Rgba {
-    r: 0xC9 as f32 / 255.0,
-    g: 0xA9 as f32 / 255.0,
-    b: 0x6E as f32 / 255.0,
-    a: 0.14,
+    r: 0xFF as f32 / 255.0,
+    g: 0x6A as f32 / 255.0,
+    b: 0x1A as f32 / 255.0,
+    a: 0.12,
 };
 
 // -------------------------------------------------------------------------------------------------
@@ -285,7 +312,7 @@ pub fn boton_primario(id: impl Into<SharedString>, label: impl Into<SharedString
         .text_color(SALMO)
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .hover(|s| s.bg(rgba(0xD9BC85FF))) // brasa un punto más claro
+        .hover(|s| s.bg(rgba(0xFF8A3DFF))) // naranja un punto más claro (hover del acento)
         .child(label.into())
 }
 
@@ -335,8 +362,9 @@ pub fn fila_seleccionable(id: impl Into<SharedString>, activa: bool) -> gpui::St
         .cursor_pointer();
 
     if activa {
-        // Seleccionada: fondo dorado tenue + borde izquierdo BRASA sólido.
-        base.bg(BRASA_TENUE).border_color(BRASA)
+        // Seleccionada: fondo acento tenue + borde izquierdo ACENTO_BORDE (naranja atenuado, NO
+        // BRASA puro: en tablas con muchas filas el naranja saturado fatigaría — decisión auditoría).
+        base.bg(BRASA_TENUE).border_color(ACENTO_BORDE)
     } else {
         // En reposo: borde izquierdo transparente (reserva el espacio) y hover a TINTA2.
         base.border_color(rgba(0x00000000)).hover(|s| s.bg(TINTA2))

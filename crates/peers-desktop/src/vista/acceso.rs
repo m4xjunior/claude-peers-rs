@@ -837,7 +837,7 @@ fn banner_expuesto() -> impl IntoElement {
         .rounded(tema::radio(tema::RADIO_CONTROL))
         .border_1()
         .border_color(AVISO)
-        .bg(rgba(0xC9A96E22)) // brasa muy tenue
+        .bg(tema::acento_tenue(0.13)) // acento de marca muy tenue (helper: se reajusta si cambia BRASA)
         .child(div().text_color(AVISO).text_size(px(18.0)).child(SharedString::from("🛡")))
         .child(
             div()
