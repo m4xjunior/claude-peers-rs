@@ -806,7 +806,7 @@ fn banner_diagnostico(err: &crate::cliente::ErrorBroker) -> impl IntoElement {
         .rounded(tema::radio(tema::RADIO_CONTROL))
         .border_1()
         .border_color(color)
-        .bg(rgba(0xC04A3E22)) // rojo terroso muy tenue sobre la tinta
+        .bg(tema::rojo_peligro_tenue(0.13)) // centralizado (s002, 08ceba8)
         .child(
             div()
                 .h_flex()

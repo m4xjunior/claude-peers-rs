@@ -131,28 +131,7 @@ fn estilo_estado(estado: EstadoMensaje) -> (&'static str, gpui::Rgba) {
     }
 }
 
-/// Extrae `HH:MM:SS` de un timestamp ISO 8601 para la columna "enviado". Espejo de
-/// `peers_tui::app::hora_iso`: si no hay patrón reconocible, devuelve el texto tal cual (no falla).
-fn hora_iso(iso: &str) -> String {
-    if let Some(pos) = iso.find('T') {
-        let resto = &iso[pos + 1..];
-        let fin = resto.find(['.', 'Z', '+']).unwrap_or(resto.len());
-        return resto[..fin].to_string();
-    }
-    iso.to_string()
-}
-
-/// Recorta un texto a `max` caracteres añadiendo `…` si sobra, respetando fronteras de carácter
-/// (no de byte) para no partir un multibyte. Espejo de `peers_tui::app::recortar`.
-fn recortar(texto: &str, max: usize) -> String {
-    if texto.chars().count() <= max {
-        return texto.to_string();
-    }
-    // Reservamos un hueco para el '…' final.
-    let corte = max.saturating_sub(1);
-    let recortado: String = texto.chars().take(corte).collect();
-    format!("{recortado}…")
-}
+// hora_iso y recortar migrados a tema (s002, 08ceba8).
 
 // Anchos fijos (px) de las columnas no flexibles, espejo de los Constraint de la TUI. "texto" es la
 // flexible (`flex_1`).
@@ -423,7 +402,7 @@ fn fila_mensaje(idx: usize, m: &Mensaje, activa: bool) -> impl IntoElement {
                 .w(gpui::px(COL_DE))
                 .text_color(tema::HUMO)
                 .text_sm()
-                .child(SharedString::from(recortar(&m.de_id, 16))),
+                .child(SharedString::from(tema::recortar(&m.de_id, 16))),
         )
         // "texto" es columna flexible: recorte generoso; el layout la envuelve al ancho real.
         .child(
@@ -431,7 +410,7 @@ fn fila_mensaje(idx: usize, m: &Mensaje, activa: bool) -> impl IntoElement {
                 .flex_1()
                 .overflow_hidden()
                 .text_color(tema::PAPEL)
-                .child(SharedString::from(recortar(&m.texto, 80))),
+                .child(SharedString::from(tema::recortar(&m.texto, 80))),
         )
         .child(
             div()
@@ -446,7 +425,7 @@ fn fila_mensaje(idx: usize, m: &Mensaje, activa: bool) -> impl IntoElement {
                 .font_family(tema::FUENTE_MONO)
                 .text_color(tema::HUMO)
                 .text_sm()
-                .child(SharedString::from(hora_iso(&m.enviado_en))),
+                .child(SharedString::from(tema::hora_hms(&m.enviado_en))),
         )
         // Acción rápida de REENVÍO (trazabilidad-05): botón ↻ al final de la fila que pide la
         // confirmación SIN abrir el modal (espejo de la tecla `r`). `.occlude()` evita que el clic
@@ -631,7 +610,7 @@ pub fn render_modal_confirmar_reenvio(msg_id: i64, mensaje: Option<&Mensaje>) ->
         Some(m) => format!(
             "Se re-encola para «{}» como un mensaje NUEVO: «{}»",
             m.para_id,
-            recortar(&m.texto, 70)
+            tema::recortar(&m.texto, 70)
         ),
         None => "Se re-encola como un mensaje nuevo en la bandeja del destino original.".to_string(),
     };

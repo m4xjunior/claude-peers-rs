@@ -441,28 +441,7 @@ fn celda_num_eyebrow(texto: &str) -> impl IntoElement {
 // no se inventa el endpoint.
 // -------------------------------------------------------------------------------------------------
 
-/// Rojo terroso destructivo (mismo tono que el resto de confirmaciones de la app).
-const ROJO_PURGA: u32 = 0xC0_4A_3E;
-const ROJO_PURGA_HOVER: u32 = 0xD0_5A_4E;
-
-/// Extrae `HH:MM:SS` de un ISO 8601 (copia local del helper de las demás vistas).
-fn hora_iso(iso: &str) -> String {
-    if let Some(pos) = iso.find('T') {
-        let resto = &iso[pos + 1..];
-        let fin = resto.find(['.', 'Z', '+']).unwrap_or(resto.len());
-        return resto[..fin].to_string();
-    }
-    iso.to_string()
-}
-
-/// Recorta a `max` caracteres con elipsis, respetando fronteras de carácter.
-fn recortar(texto: &str, max: usize) -> String {
-    if texto.chars().count() <= max {
-        return texto.to_string();
-    }
-    let recortado: String = texto.chars().take(max.saturating_sub(1)).collect();
-    format!("{recortado}…")
-}
+// ROJO_PURGA, hora_iso y recortar migrados a tema (s002, 08ceba8).
 
 /// Contenido del pop-up "Cola de {peer}" (redis-01): los mensajes PENDIENTES de la bandeja del
 /// peer, aproximados con `GET /admin/historial?estado=enviado` (el endpoint EXISTENTE que marca la
@@ -554,7 +533,7 @@ pub fn render_modal_cola(id: &str, mensajes: &[Mensaje], cargando: bool) -> AnyE
                             .overflow_hidden()
                             .text_xs()
                             .text_color(tema::HUMO)
-                            .child(SharedString::from(recortar(&m.de_id, 16))),
+                            .child(SharedString::from(tema::recortar(&m.de_id, 16))),
                     )
                     .child(
                         div()
@@ -562,7 +541,7 @@ pub fn render_modal_cola(id: &str, mensajes: &[Mensaje], cargando: bool) -> AnyE
                             .overflow_hidden()
                             .text_sm()
                             .text_color(tema::PAPEL)
-                            .child(SharedString::from(recortar(&m.texto, 56))),
+                            .child(SharedString::from(tema::recortar(&m.texto, 56))),
                     )
                     .child(
                         div()
@@ -571,7 +550,7 @@ pub fn render_modal_cola(id: &str, mensajes: &[Mensaje], cargando: bool) -> AnyE
                             .font_family(tema::FUENTE_MONO)
                             .text_xs()
                             .text_color(tema::HUMO)
-                            .child(SharedString::from(hora_iso(&m.enviado_en))),
+                            .child(SharedString::from(tema::hora_hms(&m.enviado_en))),
                     )
                     // redis-03: reenviar el ítem — REUTILIZA la confirmación de Trazabilidad.
                     .child(
@@ -653,11 +632,11 @@ pub fn render_modal_purga(id: &str, en_cola: usize, en_outbox: usize) -> AnyElem
                         .px_4()
                         .py_2()
                         .rounded(px(tema::RADIO_CONTROL))
-                        .bg(rgb(ROJO_PURGA))
+                        .bg(tema::ROJO_PELIGRO)
                         .text_color(tema::PAPEL)
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(ROJO_PURGA_HOVER)))
+                        .hover(|s| s.bg(tema::ROJO_PELIGRO_HOVER))
                         .child(SharedString::from("Sí, purgar"))
                         .on_click(|_e, window, cx| {
                             window.dispatch_action(Box::new(ConfirmarPurga), cx);

@@ -232,7 +232,7 @@ fn encabezado() -> impl IntoElement {
 /// `indice` viaja en la Action para que `AppDesktop` sepa qué peer marcar sin re-buscar por id.
 fn fila(indice: usize, inst: &Instancia, estado: EstadoPeer, activa: bool) -> impl IntoElement {
     // Espejo de `fila_peer` de la TUI: mismos campos y misma extracción de la hora del `visto_en`.
-    let visto = hora_iso(&inst.visto_en);
+    let visto = tema::hora_hms(&inst.visto_en);
     let repo = inst.repo_git.as_deref().unwrap_or("");
 
     // El directorio se muestra tal cual; si hay repo git DISTINTO del directorio, se anota entre
@@ -352,7 +352,7 @@ fn identificador_peer(inst: &Instancia) -> String {
         } else {
             &inst.resumen
         },
-        hora_iso(&inst.visto_en),
+        tema::hora_hms(&inst.visto_en),
     )
 }
 
@@ -466,7 +466,16 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
 
     // Raíz: fondo/tipografía heredados del contenedor raíz de la app; aquí sólo el espaciado y la
     // cabecera. Se compone dentro del `fondo_app` del `AppDesktop`, así que no repite `.bg(TINTA)`.
-    let mut raiz = tema::raiz_scrollable()
+    // Raíz: fondo/tipografía del tema + `size_full()` para que el scroll interno de la tabla
+    // tenga un límite de altura contra el cual scrollear (mismo patrón que Alertas, validado).
+    // NO usa `raiz_scrollable()` porque el scroll delegado al padre no funcionó en esta vista
+    // (las filas desbordaban sin activar el scroll del contenedor).
+    let mut raiz = div()
+        .size_full()
+        .bg(tema::TINTA)
+        .text_color(tema::PAPEL)
+        .font_family(tema::FUENTE_UI)
+        .text_size(px(14.0))
         .v_flex()
         .gap_4()
         .p_6();
@@ -524,13 +533,27 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
         })
         .collect::<Vec<_>>();
 
-    // La tabla va dentro de una superficie_card: encabezado (eyebrows) + cuerpo de filas.
+    // La tabla va dentro de una superficie_card con scroll interno: encabezado fijo +
+    // cuerpo scrollable. Mismo patrón que Alertas (validado): la card ocupa el alto restante
+    // (`flex_1` + `min_h_0`) y el cuerpo scrollea internamente cuando hay muchos peers.
     let tabla = tema::superficie_card()
         .v_flex()
         .w_full()
+        .flex_1()
+        .min_h_0()
         .p_2()
         .child(encabezado())
-        .child(div().v_flex().w_full().py_1().children(filas));
+        .child(
+            div()
+                .id("peers-tabla-scroll")
+                .v_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .py_1()
+                .children(filas),
+        );
 
     raiz = raiz.child(tabla);
 
@@ -553,10 +576,7 @@ pub fn render_peers(datos: &EstadoPantalla) -> impl IntoElement {
 // (backdrop, clic-fuera, Esc) lo aporta la app; aquí sólo se compone el interior Ethos.
 // -------------------------------------------------------------------------------------------------
 
-/// Rojo terroso para las acciones DESTRUCTIVAS (kick). Mismo tono que el confirmar destructivo de
-/// Tareas/Alertas: semántica de peligro calibrada a la paleta cálida, nunca el dorado de marca.
-const ROJO_PELIGRO: u32 = 0xC0_4A_3E;
-const ROJO_PELIGRO_HOVER: u32 = 0xD0_5A_4E;
+/// Rojo terroso para las acciones DESTRUCTIVAS (kick). Centralizado en `tema` (s002, 08ceba8).
 
 /// Botón de acción PELIGROSA (variante roja apagada de la RFC): mismo formato que los botones del
 /// tema pero en rojo terroso. Vive aquí (no en `tema`) hasta que otra pestaña lo necesite.
@@ -572,11 +592,11 @@ fn boton_peligro(
         .px_4()
         .py_2()
         .rounded(px(tema::RADIO_CONTROL))
-        .bg(rgb(ROJO_PELIGRO))
+        .bg(tema::ROJO_PELIGRO)
         .text_color(tema::PAPEL)
         .font_weight(gpui::FontWeight::MEDIUM)
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(ROJO_PELIGRO_HOVER)))
+        .hover(|s| s.bg(tema::ROJO_PELIGRO_HOVER))
         .child(label.into())
 }
 
@@ -933,17 +953,7 @@ pub fn render_modal_form_peers(form: &FormPeers, datos: &EstadoPantalla) -> AnyE
         .into_any_element()
 }
 
-/// Extrae `HH:MM:SS` de un ISO 8601 para la columna "visto". Espejo de `hora_iso` de la TUI
-/// (`peers-tui/src/app.rs`), replicado local porque `peers-core` no lo expone como función pública
-/// y duplicar 6 líneas es más barato que acoplar crates. Sin patrón `T` → cadena tal cual.
-fn hora_iso(iso: &str) -> String {
-    if let Some(pos) = iso.find('T') {
-        let resto = &iso[pos + 1..];
-        let fin = resto.find(['.', 'Z', '+']).unwrap_or(resto.len());
-        return resto[..fin].to_string();
-    }
-    iso.to_string()
-}
+// hora_iso migrado a tema::hora_hms (s002, 08ceba8) — fuente única para los 3 archivos que lo duplicaban.
 
 #[cfg(test)]
 mod tests {
@@ -988,11 +998,5 @@ mod tests {
     fn otros_tipos_de_alerta_no_cambian_el_estado() {
         let a = [alerta(TipoAlerta::Ghosteo, "claudia")];
         assert_eq!(estado_peer("claudia", &a), EstadoPeer::Trabajando);
-    }
-
-    #[test]
-    fn hora_iso_extrae_hh_mm_ss() {
-        assert_eq!(hora_iso("2026-07-01T17:30:45.123Z"), "17:30:45");
-        assert_eq!(hora_iso("sin-t"), "sin-t");
     }
 }

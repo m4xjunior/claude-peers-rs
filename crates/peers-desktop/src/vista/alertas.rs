@@ -192,31 +192,7 @@ pub(crate) const TIPOS_ORDEN: [TipoAlerta; 5] = [
     TipoAlerta::CancelacionExcesiva,
 ];
 
-/// Recorta a `max` caracteres respetando límites de char, con elipsis. Espejo de `recortar`.
-fn recortar(texto: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let n = texto.chars().count();
-    if n <= max {
-        return texto.to_string();
-    }
-    if max == 1 {
-        return "…".to_string();
-    }
-    let recortado: String = texto.chars().take(max - 1).collect();
-    format!("{recortado}…")
-}
-
-/// Extrae `HH:MM:SS` de un ISO 8601 para la columna "creada". Espejo de `hora_iso`.
-fn hora_iso(iso: &str) -> String {
-    if let Some(pos) = iso.find('T') {
-        let resto = &iso[pos + 1..];
-        let fin = resto.find(['.', 'Z', '+']).unwrap_or(resto.len());
-        return resto[..fin].to_string();
-    }
-    iso.to_string()
-}
+// recortar y hora_iso migrados a tema (s002, 08ceba8).
 
 /// Antigüedad relativa de la alerta (alertas-07): parsea `creada_en` (ISO 8601, timbrado por el
 /// broker en UTC) y devuelve algo como "hace 12m", "hace 2h", "hace 3d". Cálculo LOCAL con el crate
@@ -640,16 +616,16 @@ fn fila(pos: usize, a: &Alerta, seleccion: usize) -> impl IntoElement {
                 .w(px(COL_TIPO))
                 .child(tema::chip_estado(etiqueta_alerta(a.tipo), color_alerta(a.tipo))),
         )
-        .child(celda_dato(&recortar(&a.sujeto, 24), COL_SUJETO))
+        .child(celda_dato(&tema::recortar(&a.sujeto, 24), COL_SUJETO))
         // detalle: columna flexible → recorte generoso; el íntegro se ve en el modal de detalle.
         .child(
             div()
                 .flex_1()
                 .overflow_hidden()
                 .text_color(tema::PAPEL)
-                .child(SharedString::from(recortar(&a.detalle, 72))),
+                .child(SharedString::from(tema::recortar(&a.detalle, 72))),
         )
-        .child(celda_dato(&hora_iso(&a.creada_en), COL_CREADA))
+        .child(celda_dato(&tema::hora_hms(&a.creada_en), COL_CREADA))
         .child(badge_antiguedad(&a.creada_en))
         // Acción rápida de descarte (alertas-10): botón fantasma que DESPACHA `Descartar` sin abrir
         // el modal. `.occlude()` hace que el ratón NO atraviese este botón hacia el `on_click` de la
@@ -836,7 +812,7 @@ fn barra_acciones_modal(idx: usize, tipo_str: &str, sujeto: &str, confirmando: b
             .child(
                 tema::texto_terciario(format!(
                     "¿Descartar la alerta de «{}»? Esta acción resuelve la alerta en el broker.",
-                    recortar(sujeto, 40)
+                    tema::recortar(sujeto, 40)
                 )),
             )
             .child(

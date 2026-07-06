@@ -322,18 +322,7 @@ fn tarea_overrun(t: &Tarea) -> bool {
     }
 }
 
-/// Recorta un texto a `max` caracteres (no bytes) con elipsis. Espejo de `recortar` de la TUI.
-fn recortar(texto: &str, max: usize) -> String {
-    let n = texto.chars().count();
-    if n <= max {
-        return texto.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let recortado: String = texto.chars().take(max.saturating_sub(1)).collect();
-    format!("{recortado}…")
-}
+// recortar migrado a tema (s002, 08ceba8).
 
 // Anchos fijos (px) de las columnas no flexibles. `tarea` es la flexible (`flex_1`).
 const COL_ID: f32 = 76.0;
@@ -501,7 +490,7 @@ fn encabezado_columnas() -> impl IntoElement {
 /// acento brasa tenue (lo hace `tema::fila_seleccionable`).
 fn fila_tarea(idx: usize, t: &Tarea, activa: bool) -> impl IntoElement {
     let overrun = tarea_overrun(t);
-    let peer_txt = recortar(&t.instancia_id, 16);
+    let peer_txt = tema::recortar(&t.instancia_id, 16);
     let color = color_estado(t.estado);
 
     // Celda peer: si la tarea está atascada, prefijo ⚠ y color brasa (llama la atención dentro del
@@ -553,7 +542,7 @@ fn fila_tarea(idx: usize, t: &Tarea, activa: bool) -> impl IntoElement {
                 .flex_1()
                 .min_w(px(160.0))
                 .text_color(tema::PAPEL)
-                .child(SharedString::from(recortar(&t.descripcion, 80))),
+                .child(SharedString::from(tema::recortar(&t.descripcion, 80))),
         )
         // Chip de estado coloreado por semántica (fondo = color del estado, texto SALMO).
         .child(
@@ -635,9 +624,9 @@ fn barra_acciones(t: &Tarea, indice: usize) -> AnyElement {
                 .gap_1()
                 .child(tema::eyebrow(format!(
                     "Acción sobre · {}",
-                    recortar(&t.instancia_id, 24)
+                    tema::recortar(&t.instancia_id, 24)
                 )))
-                .child(tema::texto_primario(recortar(&t.descripcion, 100))),
+                .child(tema::texto_primario(tema::recortar(&t.descripcion, 100))),
         )
         .child(fila_botones)
         .into_any_element()
@@ -1056,7 +1045,7 @@ pub fn render_modal_form(form: &FormTareas, datos: &EstadoPantalla) -> AnyElemen
             modal = modal
                 .child(tema::texto_terciario(format!(
                     "Dueño actual: {} — elige el peer destino.",
-                    recortar(dueno, 40)
+                    tema::recortar(dueno, 40)
                 )))
                 .child(selector_peer(datos, Some(dueno)));
         }
@@ -1114,7 +1103,7 @@ pub fn render_modal_form(form: &FormTareas, datos: &EstadoPantalla) -> AnyElemen
             modal = modal
                 .child(tema::texto_primario(format!(
                     "¿Seguro? «{}»",
-                    recortar(descripcion, 80)
+                    tema::recortar(descripcion, 80)
                 )))
                 .child(tema::texto_terciario(consecuencia.to_string()));
         }
@@ -1250,7 +1239,7 @@ fn selector_peer(datos: &EstadoPantalla, excluir: Option<&str>) -> AnyElement {
                         .flex_1()
                         .font_family(tema::FUENTE_MONO)
                         .text_color(tema::PAPEL)
-                        .child(SharedString::from(recortar(&inst.id, 44))),
+                        .child(SharedString::from(tema::recortar(&inst.id, 44))),
                 )
                 .on_click(move |_e, window, cx| {
                     window.dispatch_action(Box::new(ElegirPeerForm { id: id.clone() }), cx);
