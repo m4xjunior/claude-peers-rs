@@ -111,20 +111,38 @@ let argsFinal = argsBase.slice();
 argsFinal = agregarArg(argsFinal, "--broker-url", cfgUsuario.broker_url, process.env.CLAUDE_PEERS_BROKER_URL);
 argsFinal = agregarArg(argsFinal, "--token", cfgUsuario.token, process.env.CLAUDE_PEERS_TOKEN);
 
-// Ejecuta el binario nativo heredando stdio (el MCP stdio pasa transparente) y reenviando args.
-// `windowsHide` evita una consola parpadeante. NO usamos shell:true (no hace falta y evita
-// problemas de escaping con rutas que tengan espacios). `windowsVerbatimArguments:false` (default)
-// deja que Node escape los args correctamente en Windows.
+// Ejecuta el binario nativo. PUENTE DE PIPES EXPLÍCITO (fix del push en Windows, 2026-07-06):
+// en vez de stdio:"inherit" (que HEREDA los handles de stdin/stdout del SO), usamos stdio:"pipe"
+// y forwardeamos los bytes ACTIVAMENTE con Node (process.stdin→hijo.stdin, hijo.stdout→process.stdout).
+//
+// POR QUÉ: en Windows, un handle heredado a través de DOS niveles de spawn (Claude Code → node → .exe)
+// no propaga bien las escrituras ASYNC del hijo (las notificaciones `notifications/claude/channel`
+// del push, que ocurren FUERA del ciclo request/response). Síntoma exacto de Daniela: revisar_mensajes
+// (respuesta síncrona a un tool/call) llega, pero el push automático no. Con el puente, Node gestiona
+// el forwarding byte a byte por su event loop — no depende del encadenamiento de handles del SO, así
+// que las notificaciones async del .exe llegan a Claude Code igual en las 3 plataformas. En Mac/Linux
+// el comportamiento es idéntico al inherit (verificado). stderr SÍ se hereda (los logs del client van
+// al stderr de Claude Code como antes). `windowsHide` evita una consola parpadeante.
 let hijo;
 try {
   hijo = spawn(exe, argsFinal, {
-    stdio: "inherit",
+    stdio: ["pipe", "pipe", "inherit"],
     windowsHide: true,
   });
 } catch (err) {
   diag(`ERROR: spawn lanzó excepción: ${err && err.message}`);
   process.exit(1);
 }
+
+// Forwarding bidireccional explícito. `.pipe()` conecta los streams y reenvía todos los datos +
+// el fin (EOF): cuando Claude Code cierra stdin, se cierra el del hijo (el client termina limpio).
+process.stdin.pipe(hijo.stdin);
+hijo.stdout.pipe(process.stdout);
+// Si un extremo del pipe se rompe (EPIPE al cerrar la sesión), no queremos un crash del shim:
+// lo tragamos best-effort — el `exit` del hijo hará la salida ordenada.
+process.stdin.on("error", () => {});
+hijo.stdin.on("error", () => {});
+hijo.stdout.on("error", () => {});
 
 hijo.on("error", (err) => {
   // Errores async de spawn (ENOENT, EACCES, bloqueo de Defender…) caen aquí. `code` distingue.
