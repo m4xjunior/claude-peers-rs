@@ -440,6 +440,79 @@ pub fn formatear_fecha(iso: &str) -> String {
     format!("{dia}/{mes}/{anio} {hora}")
 }
 
+/// Extrae la HORA `HH:MM:SS` de un ISO 8601 (lo que va tras la `T`, hasta el primer `.`/`Z`/`+`).
+/// Devuelve el crudo si no hay `T`. Centraliza las copias que había en peers/alertas/trazabilidad
+/// (todas idénticas). Espejo de `peers_tui::app::hora_iso`.
+#[must_use]
+pub fn hora_hms(iso: &str) -> String {
+    if let Some(pos) = iso.find('T') {
+        let resto = &iso[pos + 1..];
+        let fin = resto.find(['.', 'Z', '+']).unwrap_or(resto.len());
+        return resto[..fin].to_string();
+    }
+    iso.to_string()
+}
+
+/// Recorta `texto` a `max` caracteres añadiendo `…` si sobra, respetando fronteras de CARÁCTER (no
+/// de byte) para no partir un multibyte. Centraliza las copias de alertas/trazabilidad/tareas (todas
+/// idénticas). Espejo de `peers_tui::app::recortar`.
+#[must_use]
+pub fn recortar(texto: &str, max: usize) -> String {
+    if texto.chars().count() <= max {
+        return texto.to_string();
+    }
+    // Reservamos un hueco para el '…' final.
+    let corte = max.saturating_sub(1);
+    let recortado: String = texto.chars().take(corte).collect();
+    format!("{recortado}…")
+}
+
+/// Rojo terroso de acción DESTRUCTIVA (kick de peer, purga de Redis). Semántica de dominio "peligro",
+/// NO es el acento de marca — por eso NO cambió con el pivote de paleta. Centraliza el mismo `#C04A3E`
+/// que estaba duplicado como `ROJO_PELIGRO` (peers.rs) y `ROJO_PURGA` (redis.rs).
+pub const ROJO_PELIGRO: Rgba = Rgba {
+    r: 0xC0 as f32 / 255.0,
+    g: 0x4A as f32 / 255.0,
+    b: 0x3E as f32 / 255.0,
+    a: 1.0,
+};
+
+/// Hover del rojo destructivo — un punto más claro. Centraliza el `#D05A4E` duplicado.
+pub const ROJO_PELIGRO_HOVER: Rgba = Rgba {
+    r: 0xD0 as f32 / 255.0,
+    g: 0x5A as f32 / 255.0,
+    b: 0x4E as f32 / 255.0,
+    a: 1.0,
+};
+
+/// El rojo de peligro con alfa controlado (helper, como `acento_tenue`): para fondos tenues de aviso
+/// destructivo. Reemplaza literales como `rgba(0xC04A3E22)` de acceso.rs sin dispersar el hex.
+#[must_use]
+pub fn rojo_peligro_tenue(alpha: f32) -> Rgba {
+    Rgba { a: alpha, ..ROJO_PELIGRO }
+}
+
+#[cfg(test)]
+mod tests_helpers {
+    use super::{hora_hms, recortar};
+
+    #[test]
+    fn hora_hms_extrae_hh_mm_ss() {
+        assert_eq!(hora_hms("2026-07-03T09:42:15.123Z"), "09:42:15");
+        assert_eq!(hora_hms("2026-07-03T09:42:15Z"), "09:42:15");
+        assert_eq!(hora_hms("2026-07-03T09:42:15+02:00"), "09:42:15");
+        assert_eq!(hora_hms("09:42:15"), "09:42:15"); // sin 'T' separadora → crudo
+    }
+
+    #[test]
+    fn recortar_respeta_fronteras_de_caracter() {
+        assert_eq!(recortar("hola", 10), "hola"); // no sobra → intacto
+        assert_eq!(recortar("hola mundo", 5), "hola…"); // 4 chars + …
+        // Multibyte: no parte el carácter acentuado (cuenta chars, no bytes).
+        assert_eq!(recortar("áéíóú", 3), "áé…");
+    }
+}
+
 #[cfg(test)]
 mod tests_formato_fecha {
     use super::formatear_fecha;
