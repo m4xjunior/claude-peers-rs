@@ -6,25 +6,44 @@
 // nativo puro, sin runtime externo). Razón: Claude Code ejecuta el `command` de un mcpServers
 // stdio en "exec form" (directo, sin shell) y NO soporta configuración condicional por plataforma
 // ni resuelve extensiones — así que un solo `command` bash sirve a Mac/Linux pero NUNCA a Windows
-// nativo (sin bash garantizado). Un shim de Node es el patrón IDIOMÁTICO documentado
-// (mcp-quickstart usa `npx`), la única vía cero-fricción para Windows+Mac+Linux con un solo
-// `command`. Node ya está presente en la mayoría de entornos de dev; el costo es aceptable.
+// nativo (sin bash garantizado). Un shim de Node es el patrón idiomático (mcp-quickstart usa npx).
 //
-// ESTE SHIM NO TIENE LÓGICA DE NEGOCIO: su ÚNICO trabajo es (1) mapear plataforma/arch al binario
-// nativo correcto y (2) ejecutarlo pasándole stdin/stdout/stderr y los args tal cual (el protocolo
-// MCP stdio viaja transparente). Toda la lógica del peer vive en el binario Rust, no aquí.
+// ESTE SHIM NO TIENE LÓGICA DE NEGOCIO: su ÚNICO trabajo es mapear plataforma/arch al binario
+// nativo y ejecutarlo pasándole stdio + args tal cual (el protocolo MCP stdio viaja transparente).
+//
+// DIAGNÓSTICO (2026-07-06, bug de Daniela en Windows, error -32000): el shim escribe un log a
+// `<os-tmp>/claude-peers-launcher.log` con cada arranque (plataforma, binario elegido, si existe,
+// y cualquier error de spawn). Así, si el MCP no conecta, hay un rastro concreto en vez de una
+// muerte silenciosa (release del client lleva panic=abort → sin mensaje). El log NUNCA va a stdout
+// (eso rompería el protocolo MCP): solo a archivo y a stderr (que Claude Code captura aparte).
 
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 const fs = require("node:fs");
+const os = require("node:os");
+
+// --- Diagnóstico a archivo (best-effort, jamás rompe el arranque) ---
+const LOG = path.join(os.tmpdir(), "claude-peers-launcher.log");
+function diag(msg) {
+  const linea = `[${new Date().toISOString()}] ${msg}\n`;
+  try {
+    fs.appendFileSync(LOG, linea);
+  } catch (_e) {
+    /* si no se puede escribir el log, seguimos igual */
+  }
+  // stderr NO es el canal del protocolo MCP (ese es stdout) → seguro para diagnóstico.
+  try {
+    process.stderr.write(`claude-peers: ${msg}\n`);
+  } catch (_e) {}
+}
 
 // Raíz del plugin: Claude Code inyecta CLAUDE_PLUGIN_ROOT; si falta (invocación directa), se
-// deriva de la ubicación de este script (bin/ → raíz del plugin es el padre de bin/).
+// deriva de la ubicación de este script (bin/ → la raíz del plugin es el padre de bin/).
 const raiz = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, "..");
 const binDir = path.join(raiz, "bin");
+diag(`arranque: platform=${process.platform} arch=${process.arch} node=${process.version} raiz=${raiz}`);
 
-// Mapa plataforma/arch → nombre del binario nativo empaquetado en bin/. Los nombres siguen la
-// convención `<os>-<arch>` que ya usan los binarios Mac/Linux del plugin. Windows lleva `.exe`.
+// Mapa plataforma/arch → binario nativo. En Windows, `.exe`.
 function nombreBinario() {
   const so = process.platform; // 'darwin' | 'linux' | 'win32'
   const arch = process.arch; // 'arm64' | 'x64' | ...
@@ -33,41 +52,58 @@ function nombreBinario() {
   if (so === "linux" && arch === "x64") return "peers-client-linux-x64";
   if (so === "linux" && arch === "arm64") return "peers-client-linux-arm64";
   if (so === "win32" && arch === "x64") return "peers-client-windows-x64.exe";
-  return null; // plataforma no soportada → error claro abajo
+  // Fallback Windows: cualquier arch → intentar el x64 (WoW64 corre x64 en arm64, y evita quedar
+  // sin binario por un `process.arch` inesperado). Mejor intentar que abortar de una.
+  if (so === "win32") return "peers-client-windows-x64.exe";
+  return null;
 }
 
 const nombre = nombreBinario();
 if (!nombre) {
-  process.stderr.write(
-    `claude-peers: plataforma no soportada: ${process.platform}/${process.arch}\n`
-  );
+  diag(`ERROR: plataforma no soportada (${process.platform}/${process.arch})`);
   process.exit(1);
 }
 
 const exe = path.join(binDir, nombre);
 if (!fs.existsSync(exe)) {
-  process.stderr.write(
-    `claude-peers: binario no encontrado para ${process.platform}/${process.arch} (${exe})\n`
-  );
+  diag(`ERROR: binario no encontrado: ${exe}. Contenido de bin/: ${listarBin(binDir)}`);
+  process.exit(1);
+}
+diag(`binario elegido: ${exe} (existe)`);
+
+// Ejecuta el binario nativo heredando stdio (el MCP stdio pasa transparente) y reenviando args.
+// `windowsHide` evita una consola parpadeante. NO usamos shell:true (no hace falta y evita
+// problemas de escaping con rutas que tengan espacios). `windowsVerbatimArguments:false` (default)
+// deja que Node escape los args correctamente en Windows.
+let hijo;
+try {
+  hijo = spawn(exe, process.argv.slice(2), {
+    stdio: "inherit",
+    windowsHide: true,
+  });
+} catch (err) {
+  diag(`ERROR: spawn lanzó excepción: ${err && err.message}`);
   process.exit(1);
 }
 
-// Ejecuta el binario nativo heredando stdio (el MCP stdio pasa transparente) y reenviando los
-// args (p.ej. --broker-url). Propaga el código de salida real del binario para que Claude Code
-// vea el estado correcto. `windowsHide` evita una consola parpadeante en Windows.
-const hijo = spawn(exe, process.argv.slice(2), {
-  stdio: "inherit",
-  windowsHide: true,
-});
-
 hijo.on("error", (err) => {
-  process.stderr.write(`claude-peers: no se pudo ejecutar ${exe}: ${err.message}\n`);
+  // Errores async de spawn (ENOENT, EACCES, bloqueo de Defender…) caen aquí. `code` distingue.
+  diag(`ERROR: el binario no se pudo ejecutar (${err && err.code}): ${err && err.message}`);
   process.exit(1);
 });
 hijo.on("exit", (code, signal) => {
+  diag(`el binario terminó: code=${code} signal=${signal}`);
   if (signal) {
-    // Terminado por señal (POSIX): replica el código convencional 128+señal.
-    process.exit(128 + (typeof signal === "number" ? signal : 1));
+    process.exit(1);
   }
   process.exit(code === null ? 1 : code);
 });
+
+// Lista bin/ para el diagnóstico (qué binarios hay realmente empaquetados).
+function listarBin(dir) {
+  try {
+    return fs.readdirSync(dir).join(", ");
+  } catch (e) {
+    return `(no se pudo leer ${dir}: ${e && e.message})`;
+  }
+}
