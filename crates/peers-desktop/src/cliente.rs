@@ -359,6 +359,27 @@ impl ClienteBroker {
         self.post("/salir", &PeticionSalir { id: id.to_string() }).await
     }
 
+    // --- Chat privado dueño↔peer (RFC-lanzador §7/R8). El operador (esta app) escribe a un peer y
+    // lee sus respuestas por endpoints propios; el `de` lo fuerza el broker a ID_OPERADOR. ---
+
+    /// `POST /chat-privado/enviar` → Max escribe un mensaje privado al peer `sesion_id`. Va a la
+    /// cola de ENTRADA del peer; el broker fija `de = operador` (no viaja en el payload).
+    pub async fn chat_privado_enviar(&self, sesion_id: &str, texto: &str) -> ResultadoBroker<RespuestaOk> {
+        let p = PeticionChatPrivadoEnviar {
+            sesion_id: sesion_id.to_string(),
+            texto: texto.to_string(),
+        };
+        self.post("/chat-privado/enviar", &p).await
+    }
+
+    /// `POST /chat-privado/leer` → drena las respuestas del peer `sesion_id` (su cola de SALIDA).
+    /// v1: entrega única (una vez leídas, salen de la cola). El hilo visible lo acumula la vista.
+    pub async fn chat_privado_leer(&self, sesion_id: &str) -> ResultadoBroker<Vec<MensajeChatPrivado>> {
+        let p = PeticionChatPrivadoRecibir { sesion_id: sesion_id.to_string() };
+        let r: RespuestaChatPrivadoRecibir = self.post("/chat-privado/leer", &p).await?;
+        Ok(r.mensajes)
+    }
+
     // --- Acciones de gestión de tareas (Pantalla Tareas, R5/R6/R7/R8) ---
     // El jefe opera sobre las tareas de sus peers. Cada acción es un POST idempotente en el
     // broker; la desktop dispara y luego refresca la lista con `admin_tareas`.

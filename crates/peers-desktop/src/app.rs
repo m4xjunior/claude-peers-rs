@@ -39,12 +39,15 @@ pub enum Pantalla {
     Acceso,
     /// 10ª pestaña — RFC Lanzador Fase 1 (Zona A: configuración de sesión + preview del comando).
     Lanzador,
+    /// 11ª pestaña — Chat privado dueño↔peer (RFC-lanzador §7/R8): canal confidencial de Max con
+    /// un peer, con hilo en memoria (v1: el backend no persiste; la vista acumula lo que drena).
+    ChatPrivado,
 }
 
 impl Pantalla {
     /// Orden de aparición en el sidebar. Fuente única para pintar la navegación y para
     /// no repetir la lista en varios sitios (añadir/quitar pantalla = tocar sólo aquí).
-    pub const TODAS: [Pantalla; 10] = [
+    pub const TODAS: [Pantalla; 11] = [
         Pantalla::Peers,
         Pantalla::Alertas,
         Pantalla::Broker,
@@ -55,6 +58,7 @@ impl Pantalla {
         Pantalla::Trazabilidad,
         Pantalla::Acceso,
         Pantalla::Lanzador,
+        Pantalla::ChatPrivado,
     ];
 
     /// Etiqueta visible en el sidebar y en el título del contenido.
@@ -70,6 +74,7 @@ impl Pantalla {
             Pantalla::Trazabilidad => "Trazabilidad",
             Pantalla::Acceso => "Acceso",
             Pantalla::Lanzador => "Lanzador",
+            Pantalla::ChatPrivado => "Chat privado",
         }
     }
 
@@ -89,8 +94,18 @@ impl Pantalla {
             Pantalla::Trazabilidad => "nav-trazabilidad",
             Pantalla::Acceso => "nav-acceso",
             Pantalla::Lanzador => "nav-lanzador",
+            Pantalla::ChatPrivado => "nav-chat-privado",
         }
     }
+}
+
+/// Timestamp ISO 8601 UTC para la burbuja OPTIMISTA de Max en el chat privado (solo orden visual;
+/// el broker timbra el real en su cola). Reusa `time` (ya dependencia) y el formato del resto.
+fn ahora_iso_local() -> String {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_default()
 }
 
 /// Datos que las pantallas consumen para pintarse. En la Fundación está vacío (los stubs no
@@ -129,6 +144,19 @@ pub struct EstadoPantalla {
     /// Input del composer de mensaje (peers-02). `Entity<InputState>` del kit creada al arrancar;
     /// `None` sólo si no llegó a construirse (el modal pinta un aviso; nunca `.unwrap()`).
     pub input_mensaje_peer: Option<Entity<gpui_component::input::InputState>>,
+
+    // --- Pantalla Chat privado (RFC-lanzador §7/R8) ---
+    /// Peer con el que Max chatea en privado (id de la instancia), o `None` si no eligió ninguno.
+    /// El selector de arriba lo fija; al cambiarlo se limpia el hilo en memoria.
+    pub chat_privado_peer: Option<String>,
+    /// Hilo del chat privado EN MEMORIA (v1: el backend no persiste, hace pop). Se acumula aquí:
+    /// lo que Max escribe se añade al enviar; las respuestas del peer se añaden al drenar `/leer`.
+    /// Se pierde al cerrar la app o cambiar de peer — es la decisión v1 (hilo durable = v2).
+    pub chat_privado_hilo: Vec<peers_core::MensajeChatPrivado>,
+    /// Último error del chat privado (envío/lectura), pintado como banner. `None` si todo bien.
+    pub chat_privado_error: Option<crate::cliente::ErrorBroker>,
+    /// Input del composer del chat privado. `Entity<InputState>` del kit; `None` si no se construyó.
+    pub input_chat_privado: Option<Entity<gpui_component::input::InputState>>,
 
     // --- Pantalla Trazabilidad (Fase 2) ---
     /// Peer en foco cuyo historial se muestra (espejo de `traza_peer_actual` de la TUI).
@@ -359,6 +387,11 @@ impl AppDesktop {
         let input_mensaje_peer = Some(cx.new(|cx| {
             gpui_component::input::InputState::new(window, cx).placeholder("Escribe el mensaje…")
         }));
+        // Input del composer del chat privado (RFC-lanzador §7), mismo patrón stateful.
+        let input_chat_privado = Some(cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder("Mensaje privado a este peer…")
+        }));
         let datos = EstadoPantalla {
             acceso_url: cliente.base().to_string(),
             acceso_token: cliente.token_enmascarado(),
@@ -368,6 +401,7 @@ impl AppDesktop {
             panel_lanzador,
             inputs_tareas,
             input_mensaje_peer,
+            input_chat_privado,
             ..EstadoPantalla::default()
         };
         // Arranca la carga inicial + el refresco periódico. El `cx` aquí es `Context<Self>` (viene
@@ -423,6 +457,11 @@ impl AppDesktop {
             Pantalla::Tareas => self.cargar_tareas(cx),
             Pantalla::Trazabilidad => self.cargar_trazabilidad(cx),
             Pantalla::Jornada => self.cargar_jornada(cx),
+            // Chat privado: refresca el roster (para el selector) y drena la salida del peer activo.
+            Pantalla::ChatPrivado => {
+                self.cargar_peers(cx);
+                self.refrescar_chat_privado(cx);
+            }
             // Config y Lanzador editan estado local (no consultan el broker en Fase 1).
             Pantalla::Config | Pantalla::Lanzador => {}
         }
@@ -1253,6 +1292,98 @@ impl AppDesktop {
             self.datos.peers_form_error = None;
             cx.notify();
         }
+    }
+
+    // --- Chat privado (RFC-lanzador §7/R8) ---
+
+    /// Elige el peer con quien Max chatea en privado. Cambiar de peer LIMPIA el hilo en memoria
+    /// (es de otro peer; v1 no persiste) y dispara una lectura de su cola de salida.
+    fn seleccionar_chat_peer(&mut self, id: String, cx: &mut Context<Self>) {
+        // Si es el mismo peer, no reseteamos el hilo (evita perder lo acumulado por un re-clic).
+        if self.datos.chat_privado_peer.as_deref() != Some(id.as_str()) {
+            self.datos.chat_privado_peer = Some(id);
+            self.datos.chat_privado_hilo.clear();
+            self.datos.chat_privado_error = None;
+        }
+        cx.notify();
+        self.refrescar_chat_privado(cx);
+    }
+
+    /// Envía el texto del composer al peer seleccionado (`POST /chat-privado/enviar`). Añade la
+    /// burbuja de Max al hilo local de inmediato (optimista) y limpia el input. El `enviado_en`
+    /// local es solo para el orden visual; el broker timbra el real en su cola.
+    fn enviar_chat_privado(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(peer) = self.datos.chat_privado_peer.clone() else {
+            return;
+        };
+        let texto = self
+            .datos
+            .input_chat_privado
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if texto.is_empty() {
+            return;
+        }
+        // Limpia el input ya (feedback inmediato).
+        if let Some(input) = &self.datos.input_chat_privado {
+            input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        }
+        // Burbuja optimista de Max en el hilo local (el backend no devuelve el mensaje al enviar).
+        self.datos.chat_privado_hilo.push(peers_core::MensajeChatPrivado {
+            id: 0,
+            de: peers_core::ID_OPERADOR.to_string(),
+            texto: texto.clone(),
+            enviado_en: ahora_iso_local(),
+        });
+        self.datos.chat_privado_error = None;
+        cx.notify();
+
+        // POST en segundo plano; si falla, guarda el error (la burbuja optimista se queda, pero el
+        // banner avisa que no llegó). Espejo del patrón `mutar_peer` (red vía `bloquear_en`).
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.chat_privado_enviar(&peer, &texto)) });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                if let Err(e) = r {
+                    esta.datos.chat_privado_error = Some(e);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Drena la cola de SALIDA del peer activo (`POST /chat-privado/leer`) y AÑADE lo nuevo al hilo
+    /// en memoria. v1: entrega única, así que lo drenado no vuelve — por eso se acumula aquí. No-op
+    /// si no hay peer seleccionado.
+    fn refrescar_chat_privado(&mut self, cx: &mut Context<Self>) {
+        let Some(peer) = self.datos.chat_privado_peer.clone() else {
+            return;
+        };
+        let cliente = self.cliente.clone();
+        let fondo = cx
+            .background_executor()
+            .spawn(async move { cliente.bloquear_en(cliente.chat_privado_leer(&peer)) });
+        cx.spawn(async move |esta, cx| {
+            let r = fondo.await;
+            let _ = esta.update(cx, |esta, cx| {
+                match r {
+                    Ok(nuevos) => {
+                        if !nuevos.is_empty() {
+                            esta.datos.chat_privado_hilo.extend(nuevos);
+                        }
+                        esta.datos.chat_privado_error = None;
+                    }
+                    Err(e) => esta.datos.chat_privado_error = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Confirma el formulario de Peers activo: valida la frontera y dispara el POST vía
@@ -2550,7 +2681,11 @@ impl AppDesktop {
                         mover(self.datos.jornada_ses_sel, delta, j.sesiones.len());
                 }
             }
-            Pantalla::Broker | Pantalla::Config | Pantalla::Acceso | Pantalla::Lanzador => {}
+            Pantalla::Broker
+            | Pantalla::Config
+            | Pantalla::Acceso
+            | Pantalla::Lanzador
+            | Pantalla::ChatPrivado => {}
         }
         cx.notify();
     }
@@ -2970,6 +3105,7 @@ impl AppDesktop {
             Pantalla::Trazabilidad => vista::render_trazabilidad(&self.datos).into_any_element(),
             Pantalla::Acceso => vista::render_acceso(&self.datos).into_any_element(),
             Pantalla::Lanzador => vista::render_lanzador(&self.datos).into_any_element(),
+            Pantalla::ChatPrivado => vista::render_chat_privado(&self.datos).into_any_element(),
         }
     }
 
@@ -3421,6 +3557,9 @@ impl Render for AppDesktop {
             AlternarSeccionJornada, CambiarEstadoTareaJornada, CerrarSesionJornada,
             CiclarPeerJornada, ElegirPeerJornada, SeleccionarSesion, SeleccionarTareaJornada,
         };
+        use crate::vista::chat_privado::{
+            EnviarChatPrivado, RefrescarChatPrivado, SeleccionarChatPeer,
+        };
         use crate::vista::peers::{
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
             DeseleccionarPeer, EnviarMensajePeer, PedirKickPeer, SeleccionarPeer, VerJornadaPeer,
@@ -3489,6 +3628,16 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, a: &EnviarMensajePeer, window, cx| {
                 esta.enviar_mensaje_peer(a.id.clone(), window, cx);
+            }))
+            // --- Chat privado (RFC-lanzador §7/R8) ---
+            .on_action(cx.listener(|esta, a: &SeleccionarChatPeer, _window, cx| {
+                esta.seleccionar_chat_peer(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &EnviarChatPrivado, window, cx| {
+                esta.enviar_chat_privado(window, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &RefrescarChatPrivado, _window, cx| {
+                esta.refrescar_chat_privado(cx);
             }))
             // --- Peers: detalle + composer + kick (peers-01/02/03) ---
             .on_action(cx.listener(|esta, a: &AbrirDetallePeer, _window, cx| {

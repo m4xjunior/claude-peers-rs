@@ -16,6 +16,7 @@ use gpui_component::StyledExt;
 pub mod acceso;
 pub mod alertas;
 pub mod broker;
+pub mod chat_privado;
 pub mod config;
 pub mod jornada;
 pub mod lanzador;
@@ -43,6 +44,7 @@ pub(crate) fn placeholder(titulo: impl Into<SharedString>) -> impl IntoElement {
 pub use acceso::render_acceso;
 pub use alertas::render_alertas;
 pub use broker::render_broker;
+pub use chat_privado::render_chat_privado;
 pub use config::render_config;
 pub use jornada::render_jornada;
 pub use lanzador::render_lanzador;
