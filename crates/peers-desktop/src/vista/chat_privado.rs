@@ -85,7 +85,7 @@ fn selector_peers(datos: &EstadoPantalla) -> impl IntoElement {
     if activo.is_some() {
         encabezado = encabezado.child(
             tema::boton_secundario("chat-privado-refrescar", "Refrescar")
-                .on_click(|_, _, cx| cx.dispatch_action(&RefrescarChatPrivado)),
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(RefrescarChatPrivado), cx)),
         );
     }
     div().v_flex().gap_1().child(encabezado).child(fila)
@@ -104,7 +104,9 @@ fn chip_peer(inst: &Instancia, activo: bool) -> impl IntoElement {
                 .text_color(if activo { tema::BRASA } else { tema::PAPEL })
                 .child(SharedString::from(id.clone())),
         )
-        .on_click(move |_, _, cx| cx.dispatch_action(&SeleccionarChatPeer { id: id.clone() }))
+        .on_click(move |_, window, cx| {
+            window.dispatch_action(Box::new(SeleccionarChatPeer { id: id.clone() }), cx)
+        })
 }
 
 /// El hilo de mensajes en burbujas. Max (operador) a la derecha (BRASA-tenue), el peer a la
@@ -174,7 +176,7 @@ fn composer(datos: &EstadoPantalla) -> impl IntoElement {
     if hay_peer {
         fila = fila.child(
             tema::boton_primario("chat-privado-enviar", "Enviar")
-                .on_click(|_, _, cx| cx.dispatch_action(&EnviarChatPrivado)),
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(EnviarChatPrivado), cx)),
         );
     } else {
         fila = fila.child(tema::texto_terciario("(elige un peer)"));
