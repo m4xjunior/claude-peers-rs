@@ -74,8 +74,13 @@ async fn main() -> Result<()> {
     // Logs: SIEMPRE a stderr (stdout está reservado al protocolo MCP) Y, además, a un archivo en el
     // temp del SO (`<tmp>/claude-peers-client.log`). El archivo es el canal de diagnóstico cuando el
     // stderr se pierde (plugin en Windows: el .exe corre bajo un launcher y su stderr no es visible).
-    // Así podemos ver del lado del usuario si el push se intenta ("empujado mensaje de X") o falla
-    // ("push del canal falló"). Best-effort: si no se puede abrir el archivo, solo queda stderr.
+    // Best-effort: si no se puede abrir el archivo, solo queda stderr.
+    //
+    // El archivo es NDJSON (`.json()`, una línea = un evento), no texto formateado: así el
+    // diagnóstico remoto (pedirle a Daniela "mandame el .log") se puede `jq` filtrar por
+    // `event_name`/`outcome` sin parsear texto libre. El stderr sigue en texto legible para
+    // desarrollo interactivo (nadie hace `tail -f` de JSON a mano). Inspirado en el patrón
+    // request_id/session_id de `referencias/lexusfx-code/src/agent/client.rs` (solo lectura).
     use tracing_subscriber::prelude::*;
     let filtro = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -94,7 +99,7 @@ async fn main() -> Result<()> {
             let filtro_archivo = tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,peers_client=debug"));
             let capa_archivo = tracing_subscriber::fmt::layer()
-                .with_ansi(false) // sin códigos de color en el archivo
+                .json()
                 .with_writer(archivo)
                 .with_filter(filtro_archivo);
             registro.with(capa_archivo).init();
@@ -773,7 +778,13 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
                         &ahora_iso_aviso(),
                     )
                     .await;
-                    info!("aviso de chat privado empujado ({} pendiente/s)", ahora);
+                    info!(
+                        event_name = "push_chat_privado_aviso",
+                        outcome = "success",
+                        pendientes = ahora,
+                        "aviso de chat privado empujado ({} pendiente/s)",
+                        ahora
+                    );
                 }
                 chat_priv_prev = ahora;
             }
@@ -818,11 +829,26 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
                 if !ok {
                     // El envío falló (stdout roto): NO confirmamos ni marcamos como empujado.
                     // Se reintentará en el próximo ciclo (R1.4).
-                    warn!("push del canal falló para el mensaje {}; se reintentará", m.id);
+                    warn!(
+                        event_name = "push_canal_mensaje",
+                        outcome = "failure",
+                        mensaje_id = m.id,
+                        de_id = %m.de_id,
+                        "push del canal falló para el mensaje {}; se reintentará",
+                        m.id
+                    );
                     continue;
                 }
                 empujados.insert(m.id);
-                info!("empujado mensaje de {}: {}", m.de_id, recorte(&m.texto, 80));
+                info!(
+                    event_name = "push_canal_mensaje",
+                    outcome = "success",
+                    mensaje_id = m.id,
+                    de_id = %m.de_id,
+                    "empujado mensaje de {}: {}",
+                    m.de_id,
+                    recorte(&m.texto, 80)
+                );
 
                 // Confirmamos la cadena completa de estados al broker (cada uno lo timbra con SU
                 // reloj; transicionar_mensaje es monótono e idempotente):
@@ -835,10 +861,26 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
                     .confirmar(&[m.id], EstadoMensaje::Entregado)
                     .await
                 {
-                    warn!("no se pudo confirmar Entregado del mensaje {}: {e:#}", m.id);
+                    warn!(
+                        event_name = "confirmar_estado_mensaje",
+                        outcome = "failure",
+                        mensaje_id = m.id,
+                        estado = "Entregado",
+                        error = %e,
+                        "no se pudo confirmar Entregado del mensaje {}: {e:#}",
+                        m.id
+                    );
                 }
                 if let Err(e) = estado.broker.confirmar(&[m.id], EstadoMensaje::Leido).await {
-                    warn!("no se pudo confirmar Leido del mensaje {}: {e:#}", m.id);
+                    warn!(
+                        event_name = "confirmar_estado_mensaje",
+                        outcome = "failure",
+                        mensaje_id = m.id,
+                        estado = "Leido",
+                        error = %e,
+                        "no se pudo confirmar Leido del mensaje {}: {e:#}",
+                        m.id
+                    );
                 }
             }
 
