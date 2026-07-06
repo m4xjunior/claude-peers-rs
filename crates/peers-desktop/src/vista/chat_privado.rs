@@ -14,7 +14,7 @@
 //! resto de pantallas. El `Input` del composer es un `Entity<InputState>` creado por la app.
 
 use gpui::{
-    div, prelude::FluentBuilder, IntoElement, ParentElement, SharedString,
+    div, prelude::FluentBuilder, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled,
 };
 use gpui::Action;
@@ -205,7 +205,16 @@ fn composer(datos: &EstadoPantalla) -> impl IntoElement {
 /// exclusiva de operador — se acepta bajo el modelo de red interna de confianza (ver el broker).
 fn selector_de(datos: &EstadoPantalla) -> impl IntoElement {
     let actual = datos.chat_privado_de.as_deref(); // None = operador
-    let mut fila = div().h_flex().gap_2().flex_wrap().items_center();
+    // `flex_wrap` para que los chips envuelvan; `max_h` + scroll (con `.id()`) para que con muchos
+    // peers vivos el selector no crezca sin límite y empuje el composer fuera de la vista (hallazgo UI).
+    let mut fila = div()
+        .id("chat-selector-de")
+        .h_flex()
+        .gap_2()
+        .flex_wrap()
+        .items_center()
+        .max_h(tema::radio(120.0))
+        .overflow_y_scroll();
     fila = fila.child(tema::texto_terciario("aparentar ser:"));
     // Chip "operador" (default): activo cuando no hay `de` fijado.
     fila = fila.child(chip_de("", "operador", actual.is_none()));

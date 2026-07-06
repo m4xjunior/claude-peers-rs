@@ -296,15 +296,33 @@ pub fn id_del_proyecto_activo(id: &str, activo: Option<&str>) -> bool {
 
 /// Render de la pantalla. Si hay un proyecto abierto → su ficha; si no → el grid + CRUD.
 pub fn render_proyectos(datos: &EstadoPantalla) -> impl IntoElement {
-    let raiz = tema::fondo_app().v_flex();
-    match &datos.proyecto_abierto {
+    // El contenido (grid o ficha) va en un cuerpo SCROLLABLE (flex_1 + min_h_0 + overflow_y_scroll),
+    // así la ficha con timeline largo o el grid con muchas cards no desbordan (hallazgo UI #3).
+    let contenido = match &datos.proyecto_abierto {
         Some(id) => match datos.proyectos.iter().find(|p| &p.id == id) {
-            Some(p) => raiz.child(ficha(datos, p)),
+            Some(p) => ficha(datos, p).into_any_element(),
             // El proyecto abierto ya no existe (borrado): cae al grid.
-            None => raiz.child(grid(datos)),
+            None => grid(datos).into_any_element(),
         },
-        None => raiz.child(grid(datos)),
-    }
+        None => grid(datos).into_any_element(),
+    };
+    let cuerpo = div()
+        .id("proyectos-scroll")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .child(contenido);
+
+    // Raíz `relative` (size_full por fondo_app) para que los overlays `absolute().inset_0()` se
+    // posicionen respecto a ESTA vista, no al viewport. Los overlays van a nivel raíz (FUERA del
+    // scroll) para cubrir la vista fija y no scrollear con el contenido.
+    tema::fondo_app()
+        .relative()
+        .v_flex()
+        .child(cuerpo)
+        .when_some(datos.proyecto_form.as_ref(), |el, _| el.child(overlay_form(datos)))
+        .when(datos.proyecto_import_abierto, |el| el.child(overlay_importar_peers(datos)))
+        .when_some(datos.proyecto_borrar_confirmar.clone(), |el, id| el.child(overlay_borrar(&id)))
 }
 
 /// Grid de proyectos: cabecera con "+ Nuevo" y selector activo, luego cards activas y archivadas.
@@ -335,11 +353,9 @@ fn grid(datos: &EstadoPantalla) -> impl IntoElement {
         }
         cont = cont.child(fila);
     }
-
-    // Overlay del formulario de crear/editar, si está abierto.
-    cont.when_some(datos.proyecto_form.as_ref(), |el, _form| {
-        el.child(overlay_form(datos))
-    })
+    // El overlay del formulario (crear/editar) se monta en la RAÍZ (render_proyectos), no aquí,
+    // para que quede fuera del cuerpo scrollable y se posicione respecto a la vista.
+    cont
 }
 
 /// Cabecera del grid: título + botón "Nuevo" + selector de proyecto activo global (R11).
@@ -497,6 +513,8 @@ fn agentes_vivos(datos: &EstadoPantalla, p: &Proyecto) -> (usize, usize) {
 /// Ficha completa de un proyecto abierto. Cabecera (nombre/ubicación + volver) + barra de sub-tabs
 /// + la sección seleccionada. Cada sección cruza el estado vivo del broker filtrado por `@id`.
 fn ficha(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
+    // Los overlays (importar/borrar) se montan en la RAÍZ (render_proyectos), fuera del cuerpo
+    // scrollable, para que se posicionen respecto a la vista y no scrolleen con la ficha.
     div()
         .v_flex()
         .p_8()
@@ -505,12 +523,6 @@ fn ficha(datos: &EstadoPantalla, p: &Proyecto) -> impl IntoElement {
         .child(barra_tabs(datos.proyecto_ficha_tab))
         .child(seccion_activa(datos, p))
         .child(control_aislamiento(datos, p))
-        // Overlay de importar peers (solo si está abierto; se monta sobre toda la ficha).
-        .when(datos.proyecto_import_abierto, |el| el.child(overlay_importar_peers(datos)))
-        // Overlay de confirmación de borrado (destructivo, 2 pasos).
-        .when_some(datos.proyecto_borrar_confirmar.clone(), |el, id| {
-            el.child(overlay_borrar(&id))
-        })
 }
 
 /// Overlay de confirmación de BORRADO de proyecto (R6, destructivo, 2 pasos). Clic fuera = cancelar.
