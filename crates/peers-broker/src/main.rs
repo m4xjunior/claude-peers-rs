@@ -643,18 +643,29 @@ async fn recibir(
 }
 
 /// `POST /chat-privado/enviar` (RFC-lanzador §7): el operador manda un mensaje privado a un peer.
-/// El `de` NO viene del payload — el broker lo FIJA a `ID_OPERADOR` (decisión de Max: el canal es
-/// dueño→peer por definición, un `de` libre sería suplantable y sin sentido). Bajo token.
+/// El `de` es PARAMETRIZABLE (feature "aparentar ser"): si el payload lo trae, se usa ese id como
+/// remitente aparente; si no, default `ID_OPERADOR` (compat). SEGURIDAD (opción C, decisión consciente
+/// de Max): el `de` libre NO exige credencial exclusiva de operador — solo el token de red, que los
+/// peers también tienen. Se acepta que cualquier peer con el token declare un `de` arbitrario, bajo el
+/// modelo de RED INTERNA DE CONFIANZA (equipo de Max, sin hostiles). NO es un descuido: es un trade-off
+/// explícito para habilitar "decile a X que Y se lo pidió" sin montar una credencial de operador aparte.
 async fn chat_privado_enviar(
     State(e): State<Estado>,
     Json(p): Json<peers_core::PeticionChatPrivadoEnviar>,
 ) -> Result<Json<RespuestaOk>, ErrorApp> {
     use peers_core::DireccionChatPrivado;
-    // Operador→peer: encola en la cola de ENTRADA del peer (la que el peer drena). `de`=operador
-    // (lo fija el broker). Este endpoint es del PANEL del operador → basta el token como autoridad.
+    // Remitente aparente: el `de` declarado por el operador, o ID_OPERADOR por defecto. Se recorta
+    // por si viene con espacios; vacío → default (no dejamos encolar un `de` en blanco).
+    let de = p
+        .de
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ID_OPERADOR);
+    // Operador→peer: encola en la cola de ENTRADA del peer (la que el peer drena).
     let msg = e
         .almacen
-        .chat_privado_encolar(&p.sesion_id, DireccionChatPrivado::Entrada, ID_OPERADOR, &p.texto, &ahora_iso())
+        .chat_privado_encolar(&p.sesion_id, DireccionChatPrivado::Entrada, de, &p.texto, &ahora_iso())
         .await?;
     // Bitácora (observabilidad): el operador escribió al peer por el canal privado. El texto NO se
     // registra (es confidencial); solo el destino y un marcador. Best-effort, como el resto.
@@ -668,7 +679,9 @@ async fn chat_privado_enviar(
         None,
     )
     .await;
-    info!("chat privado: operador → '{}' (msg #{})", p.sesion_id, msg.id);
+    // El actor REAL de la bitácora es el operador (ID_OPERADOR arriba), aunque el `de` APARENTE
+    // sea otro: la bitácora registra quién ejecutó la acción, no el remitente declarado.
+    info!("chat privado: operador → '{}' (de aparente: '{}', msg #{})", p.sesion_id, de, msg.id);
     Ok(Json(RespuestaOk { ok: true }))
 }
 

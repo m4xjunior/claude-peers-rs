@@ -298,6 +298,16 @@ pub struct PeticionChatPrivadoEnviar {
     /// Id de la instancia peer destino (la clave de su cola `cprs:chat_priv:{sesion_id}`).
     pub sesion_id: String,
     pub texto: String,
+    /// Remitente APARENTE del mensaje (RFC-lanzador §7, feature "aparentar ser"). Opcional: si el
+    /// operador lo declara desde el panel, el peer verá `de = <ese id>` en vez de "operador"; si es
+    /// `None`, el broker usa `ID_OPERADOR` (compat). SEGURIDAD (decisión consciente de Max, opción C):
+    /// el `de` libre NO está atado a una credencial exclusiva del operador — el endpoint solo exige el
+    /// token de red, que los peers TAMBIÉN tienen. Se acepta el riesgo de que cualquier peer con el
+    /// token declare un `de` arbitrario, bajo el modelo de amenaza de RED INTERNA DE CONFIANZA (el
+    /// equipo de Max, sin peers hostiles). NO usar este campo en `chat_privado_responder` (ahí el `de`
+    /// se resuelve por secreto, anti-IDOR; este campo se ignora en esa ruta).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub de: Option<String>,
 }
 
 /// `POST /chat-privado/recibir`. El peer TIRA de su cola privada (pull). v1: drena (pop) todo lo

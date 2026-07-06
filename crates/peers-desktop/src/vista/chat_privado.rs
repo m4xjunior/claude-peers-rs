@@ -47,6 +47,16 @@ pub struct EnviarChatPrivado;
 #[action(namespace = chat_privado, no_json)]
 pub struct RefrescarChatPrivado;
 
+/// Elegir el remitente APARENTE del mensaje (feature "aparentar ser", RFC-lanzador §7). `de` vacío
+/// ("") = operador (default); un id de peer = el mensaje aparentará venir de ESE peer. `AppDesktop`
+/// fija `chat_privado_de` (None si "", Some(id) si no).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = chat_privado, no_json)]
+pub struct ElegirChatDe {
+    /// id del peer a aparentar, o "" para volver a operador.
+    pub de: String,
+}
+
 /// Render de la pantalla. Selector de peers arriba, hilo en el medio (scroll), composer abajo.
 pub fn render_chat_privado(datos: &EstadoPantalla) -> impl IntoElement {
     tema::raiz_scrollable()
@@ -185,7 +195,46 @@ fn composer(datos: &EstadoPantalla) -> impl IntoElement {
         .v_flex()
         .gap_1()
         .child(tema::eyebrow("mensaje privado"))
+        .when(hay_peer, |el| el.child(selector_de(datos)))
         .child(fila)
+}
+
+/// Selector "aparentar ser" (feature RFC-lanzador §7): chips con "operador" (default) + cada peer
+/// vivo. El activo se resalta. Elegir un peer hace que el mensaje aparente venir de ESE id; "operador"
+/// vuelve al default. NOTA de seguridad (opción C, decisión de Max): el `de` no exige credencial
+/// exclusiva de operador — se acepta bajo el modelo de red interna de confianza (ver el broker).
+fn selector_de(datos: &EstadoPantalla) -> impl IntoElement {
+    let actual = datos.chat_privado_de.as_deref(); // None = operador
+    let mut fila = div().h_flex().gap_2().flex_wrap().items_center();
+    fila = fila.child(tema::texto_terciario("aparentar ser:"));
+    // Chip "operador" (default): activo cuando no hay `de` fijado.
+    fila = fila.child(chip_de("", "operador", actual.is_none()));
+    // Un chip por peer vivo (no incluimos al DESTINO, aparentar ser el propio destinatario no tiene
+    // sentido, pero lo dejamos por simplicidad: el usuario elige; el destino se sabe por otro selector).
+    for inst in &datos.instancias {
+        let activo = actual == Some(inst.id.as_str());
+        fila = fila.child(chip_de(&inst.id, &inst.id, activo));
+    }
+    fila
+}
+
+/// Chip del selector "aparentar ser". `valor` es el id a fijar ("" para volver a operador),
+/// `etiqueta` el texto mostrado, `activo` si es el remitente aparente actual.
+fn chip_de(valor: &str, etiqueta: &str, activo: bool) -> impl IntoElement {
+    let valor = valor.to_string();
+    tema::fila_seleccionable(SharedString::from(format!("chatde-{etiqueta}")), activo)
+        .px_3()
+        .py_1()
+        .rounded(tema::radio(tema::RADIO_PILL))
+        .child(
+            div()
+                .font_family(tema::FUENTE_MONO)
+                .text_color(if activo { tema::BRASA } else { tema::HUMO })
+                .child(SharedString::from(etiqueta.to_string())),
+        )
+        .on_click(move |_, window, cx| {
+            window.dispatch_action(Box::new(ElegirChatDe { de: valor.clone() }), cx)
+        })
 }
 
 /// ¿La burbuja es de Max (operador)? Lógica pura extraída para testearla sin render GPUI (que

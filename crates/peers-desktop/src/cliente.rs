@@ -364,10 +364,18 @@ impl ClienteBroker {
 
     /// `POST /chat-privado/enviar` → Max escribe un mensaje privado al peer `sesion_id`. Va a la
     /// cola de ENTRADA del peer; el broker fija `de = operador` (no viaja en el payload).
-    pub async fn chat_privado_enviar(&self, sesion_id: &str, texto: &str) -> ResultadoBroker<RespuestaOk> {
+    /// Envía un mensaje privado al peer `sesion_id`. `de` es el remitente APARENTE (feature "aparentar
+    /// ser", RFC-lanzador §7): `None` → el broker usa "operador"; `Some(id)` → el peer verá ese id.
+    pub async fn chat_privado_enviar(
+        &self,
+        sesion_id: &str,
+        texto: &str,
+        de: Option<String>,
+    ) -> ResultadoBroker<RespuestaOk> {
         let p = PeticionChatPrivadoEnviar {
             sesion_id: sesion_id.to_string(),
             texto: texto.to_string(),
+            de,
         };
         self.post("/chat-privado/enviar", &p).await
     }

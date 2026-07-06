@@ -189,7 +189,9 @@ impl ClienteBroker {
         texto: &str,
         secreto: Option<&str>,
     ) -> Result<RespuestaOk> {
-        let cuerpo = PeticionChatPrivadoEnviar { sesion_id: String::new(), texto: texto.to_string() };
+        // El peer responde por SU secreto (anti-IDOR); el `de` aparente no aplica aquí (None).
+        let cuerpo =
+            PeticionChatPrivadoEnviar { sesion_id: String::new(), texto: texto.to_string(), de: None };
         match secreto {
             Some(s) => self.post_con_secreto("/chat-privado/responder", &cuerpo, s).await,
             None => self.post("/chat-privado/responder", &cuerpo).await,

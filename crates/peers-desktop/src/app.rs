@@ -156,6 +156,10 @@ pub struct EstadoPantalla {
     /// Peer con el que Max chatea en privado (id de la instancia), o `None` si no eligió ninguno.
     /// El selector de arriba lo fija; al cambiarlo se limpia el hilo en memoria.
     pub chat_privado_peer: Option<String>,
+    /// Remitente APARENTE del mensaje privado (feature "aparentar ser", RFC-lanzador §7). `None` =
+    /// operador (default); `Some(id)` = el mensaje aparentará venir de ese peer. Lo fija el selector
+    /// del composer. Solo afecta el `de` del envío, no a quién se le manda (eso es chat_privado_peer).
+    pub chat_privado_de: Option<String>,
     /// Hilo del chat privado EN MEMORIA (v1: el backend no persiste, hace pop). Se acumula aquí:
     /// lo que Max escribe se añade al enviar; las respuestas del peer se añaden al drenar `/leer`.
     /// Se pierde al cerrar la app o cambiar de peer — es la decisión v1 (hilo durable = v2).
@@ -1382,10 +1386,13 @@ impl AppDesktop {
         if let Some(input) = &self.datos.input_chat_privado {
             input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
         }
-        // Burbuja optimista de Max en el hilo local (el backend no devuelve el mensaje al enviar).
+        // Remitente APARENTE (feature "aparentar ser"): el `de` elegido, o "operador" por defecto.
+        let de_aparente = self.datos.chat_privado_de.clone();
+        let de_burbuja = de_aparente.clone().unwrap_or_else(|| peers_core::ID_OPERADOR.to_string());
+        // Burbuja optimista en el hilo local con el `de` aparente (el backend no devuelve el msg).
         self.datos.chat_privado_hilo.push(peers_core::MensajeChatPrivado {
             id: 0,
-            de: peers_core::ID_OPERADOR.to_string(),
+            de: de_burbuja,
             texto: texto.clone(),
             enviado_en: ahora_iso_local(),
         });
@@ -1395,9 +1402,9 @@ impl AppDesktop {
         // POST en segundo plano; si falla, guarda el error (la burbuja optimista se queda, pero el
         // banner avisa que no llegó). Espejo del patrón `mutar_peer` (red vía `bloquear_en`).
         let cliente = self.cliente.clone();
-        let fondo = cx
-            .background_executor()
-            .spawn(async move { cliente.bloquear_en(cliente.chat_privado_enviar(&peer, &texto)) });
+        let fondo = cx.background_executor().spawn(async move {
+            cliente.bloquear_en(cliente.chat_privado_enviar(&peer, &texto, de_aparente))
+        });
         cx.spawn(async move |esta, cx| {
             let r = fondo.await;
             let _ = esta.update(cx, |esta, cx| {
@@ -3842,7 +3849,7 @@ impl Render for AppDesktop {
             CiclarPeerJornada, ElegirPeerJornada, SeleccionarSesion, SeleccionarTareaJornada,
         };
         use crate::vista::chat_privado::{
-            EnviarChatPrivado, RefrescarChatPrivado, SeleccionarChatPeer,
+            ElegirChatDe, EnviarChatPrivado, RefrescarChatPrivado, SeleccionarChatPeer,
         };
         use crate::vista::proyectos::{
             AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, ArchivarProyecto,
@@ -3928,6 +3935,12 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, _a: &RefrescarChatPrivado, _window, cx| {
                 esta.refrescar_chat_privado(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ElegirChatDe, _window, cx| {
+                // "" → operador (None); un id → aparentar ser ese peer (Some).
+                esta.datos.chat_privado_de =
+                    if a.de.trim().is_empty() { None } else { Some(a.de.clone()) };
+                cx.notify();
             }))
             // --- Proyectos (RFC-proyectos Fase 2) ---
             .on_action(cx.listener(|esta, _a: &AbrirCrearProyecto, window, cx| {
