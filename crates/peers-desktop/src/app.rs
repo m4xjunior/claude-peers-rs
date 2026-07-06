@@ -23,6 +23,7 @@ use crate::tema;
 use crate::vista;
 use crate::vista::config::PanelConfig;
 use crate::vista::lanzador::PanelLanzador;
+use crate::vista::proyectos::{FichaProyectoTab, FormProyecto};
 
 /// Las 9 pantallas de la app, espejo 1:1 de las pantallas de la TUI. `Copy` porque es un
 /// discriminante trivial que se compara y se guarda en el estado sin coste.
@@ -42,12 +43,15 @@ pub enum Pantalla {
     /// 11ª pestaña — Chat privado dueño↔peer (RFC-lanzador §7/R8): canal confidencial de Max con
     /// un peer, con hilo en memoria (v1: el backend no persiste; la vista acumula lo que drena).
     ChatPrivado,
+    /// 12ª pestaña — Proyectos (RFC-proyectos): workspaces aislados. Grid de proyectos + ficha
+    /// (equipo/tablero/actividad/alertas), CRUD, y el selector de proyecto activo global.
+    Proyectos,
 }
 
 impl Pantalla {
     /// Orden de aparición en el sidebar. Fuente única para pintar la navegación y para
     /// no repetir la lista en varios sitios (añadir/quitar pantalla = tocar sólo aquí).
-    pub const TODAS: [Pantalla; 11] = [
+    pub const TODAS: [Pantalla; 12] = [
         Pantalla::Peers,
         Pantalla::Alertas,
         Pantalla::Broker,
@@ -59,6 +63,7 @@ impl Pantalla {
         Pantalla::Acceso,
         Pantalla::Lanzador,
         Pantalla::ChatPrivado,
+        Pantalla::Proyectos,
     ];
 
     /// Etiqueta visible en el sidebar y en el título del contenido.
@@ -75,6 +80,7 @@ impl Pantalla {
             Pantalla::Acceso => "Acceso",
             Pantalla::Lanzador => "Lanzador",
             Pantalla::ChatPrivado => "Chat privado",
+            Pantalla::Proyectos => "Proyectos",
         }
     }
 
@@ -95,6 +101,7 @@ impl Pantalla {
             Pantalla::Acceso => "nav-acceso",
             Pantalla::Lanzador => "nav-lanzador",
             Pantalla::ChatPrivado => "nav-chat-privado",
+            Pantalla::Proyectos => "nav-proyectos",
         }
     }
 }
@@ -157,6 +164,28 @@ pub struct EstadoPantalla {
     pub chat_privado_error: Option<crate::cliente::ErrorBroker>,
     /// Input del composer del chat privado. `Entity<InputState>` del kit; `None` si no se construyó.
     pub input_chat_privado: Option<Entity<gpui_component::input::InputState>>,
+
+    // --- Pantalla Proyectos (RFC-proyectos) ---
+    /// Copia de los proyectos de `Config` para que la vista pura los pinte sin acceso a Config.
+    /// Se re-sincroniza (`sincronizar_proyectos`) tras cada mutación del CRUD. Incluye archivados
+    /// (la vista los separa: activos en el grid, archivados en su sección).
+    pub proyectos: Vec<crate::config::Proyecto>,
+    /// Id del proyecto ABIERTO en la ficha (sub-tabs equipo/tablero/…), o `None` si se ve solo el
+    /// grid. Distinto del "activo" (selector global): abrir la ficha ≠ fijar el filtro global.
+    pub proyecto_abierto: Option<String>,
+    /// Sub-tab activo dentro de la ficha de un proyecto (R8). Default: Equipo.
+    pub proyecto_ficha_tab: FichaProyectoTab,
+    /// Id del proyecto ACTIVO global (selector de cabecera, R11), o `None` = "todos". Filtra las
+    /// otras pantallas (Peers/Tareas/Jornada/Alertas) por el sufijo `@<id>` cuando está fijado.
+    pub proyecto_activo: Option<String>,
+    /// Formulario de proyecto abierto (crear/editar), o `None`. Overlay Ethos (no Dialog del kit).
+    pub proyecto_form: Option<FormProyecto>,
+    /// Error de validación de frontera del formulario de proyecto (nombre vacío, etc.).
+    pub proyecto_form_error: Option<String>,
+    /// Input del nombre del proyecto en el formulario. `Entity<InputState>` del kit.
+    pub input_proyecto_nombre: Option<Entity<gpui_component::input::InputState>>,
+    /// Input de la ruta (carpeta local o ruta remota) del proyecto en el formulario.
+    pub input_proyecto_ruta: Option<Entity<gpui_component::input::InputState>>,
 
     // --- Pantalla Trazabilidad (Fase 2) ---
     /// Peer en foco cuyo historial se muestra (espejo de `traza_peer_actual` de la TUI).
@@ -392,6 +421,16 @@ impl AppDesktop {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder("Mensaje privado a este peer…")
         }));
+        // Inputs del formulario de proyecto (RFC-proyectos): nombre + ruta/host.
+        let input_proyecto_nombre = Some(cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx).placeholder("Nombre del proyecto")
+        }));
+        let input_proyecto_ruta = Some(cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder("/ruta/al/proyecto  o  host:/ruta/remota")
+        }));
+        // Proyectos persistidos: se copian al estado para que la vista pura los pinte sin Config.
+        let proyectos = crate::config::Config::cargar().unwrap_or_default().proyectos;
         let datos = EstadoPantalla {
             acceso_url: cliente.base().to_string(),
             acceso_token: cliente.token_enmascarado(),
@@ -402,6 +441,9 @@ impl AppDesktop {
             inputs_tareas,
             input_mensaje_peer,
             input_chat_privado,
+            input_proyecto_nombre,
+            input_proyecto_ruta,
+            proyectos,
             ..EstadoPantalla::default()
         };
         // Arranca la carga inicial + el refresco periódico. El `cx` aquí es `Context<Self>` (viene
@@ -461,6 +503,12 @@ impl AppDesktop {
             Pantalla::ChatPrivado => {
                 self.cargar_peers(cx);
                 self.refrescar_chat_privado(cx);
+            }
+            // Proyectos: cruza el estado vivo (instancias/tareas/alertas) para la ficha y el conteo
+            // de agentes vivos. Los proyectos en sí ya están en `datos` (de config).
+            Pantalla::Proyectos => {
+                self.cargar_peers(cx); // instancias + alertas (para equipo/alertas de la ficha)
+                self.cargar_tareas(cx); // tablero de la ficha
             }
             // Config y Lanzador editan estado local (no consultan el broker en Fase 1).
             Pantalla::Config | Pantalla::Lanzador => {}
@@ -1384,6 +1432,221 @@ impl AppDesktop {
             });
         })
         .detach();
+    }
+
+    // --- Proyectos (RFC-proyectos Fase 2) ---
+
+    /// Carga la config, aplica `mutar` sobre ella, persiste, y re-sincroniza `datos.proyectos`.
+    /// Centraliza el ciclo cargar→mutar→guardar→sincronizar del CRUD (evita duplicarlo). El error
+    /// de guardado se ignora best-effort con warn (la mutación ya está en memoria; degrada).
+    fn con_config_proyectos(&mut self, mutar: impl FnOnce(&mut crate::config::Config), cx: &mut Context<Self>) {
+        let mut cfg = crate::config::Config::cargar().unwrap_or_default();
+        mutar(&mut cfg);
+        if let Err(e) = cfg.guardar() {
+            tracing::warn!("no se pudo guardar la config de proyectos (cambio en memoria igual): {e:#}");
+        }
+        self.datos.proyectos = cfg.proyectos;
+        cx.notify();
+    }
+
+    /// Abre el formulario de crear proyecto (siembra inputs vacíos, ubicación Local por defecto).
+    fn abrir_crear_proyecto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::vista::proyectos::{FormProyecto, TipoUbicacion};
+        self.sembrar_inputs_proyecto("", "", window, cx);
+        self.datos.proyecto_form_error = None;
+        self.datos.proyecto_form = Some(FormProyecto::Crear { tipo: TipoUbicacion::Local });
+        cx.notify();
+    }
+
+    /// Abre el formulario de editar un proyecto (siembra sus valores actuales).
+    fn abrir_editar_proyecto(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::config::Ubicacion;
+        use crate::vista::proyectos::{FormProyecto, TipoUbicacion};
+        let Some(p) = self.datos.proyectos.iter().find(|p| p.id == id).cloned() else {
+            return;
+        };
+        let (tipo, ruta) = match &p.ubicacion {
+            Ubicacion::Local { ruta } => (TipoUbicacion::Local, ruta.clone()),
+            Ubicacion::Ssh { host, ruta } => (TipoUbicacion::Ssh, format!("{host}:{ruta}")),
+            // Tmux no editable en el form v1 (se muestra como texto libre host:ruta si aplica).
+            Ubicacion::Tmux { nombre, .. } => (TipoUbicacion::Local, nombre.clone()),
+        };
+        self.sembrar_inputs_proyecto(&p.nombre, &ruta, window, cx);
+        self.datos.proyecto_form_error = None;
+        self.datos.proyecto_form = Some(FormProyecto::Editar { id, tipo });
+        cx.notify();
+    }
+
+    /// Siembra los inputs del formulario de proyecto con nombre/ruta dados (vacío = limpiar).
+    fn sembrar_inputs_proyecto(&self, nombre: &str, ruta: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = &self.datos.input_proyecto_nombre {
+            i.update(cx, |s, cx| s.set_value(nombre.to_string(), window, cx));
+        }
+        if let Some(i) = &self.datos.input_proyecto_ruta {
+            i.update(cx, |s, cx| s.set_value(ruta.to_string(), window, cx));
+        }
+    }
+
+    /// Cierra el formulario de proyecto sin confirmar.
+    fn cerrar_form_proyecto(&mut self, cx: &mut Context<Self>) {
+        if self.datos.proyecto_form.is_some() {
+            self.datos.proyecto_form = None;
+            self.datos.proyecto_form_error = None;
+            cx.notify();
+        }
+    }
+
+    /// Cambia la clase de ubicación del formulario (Local/SSH).
+    fn elegir_tipo_ubicacion_proyecto(&mut self, local: bool, cx: &mut Context<Self>) {
+        use crate::vista::proyectos::{FormProyecto, TipoUbicacion};
+        let nuevo_tipo = if local { TipoUbicacion::Local } else { TipoUbicacion::Ssh };
+        if let Some(form) = &mut self.datos.proyecto_form {
+            match form {
+                FormProyecto::Crear { tipo } | FormProyecto::Editar { tipo, .. } => *tipo = nuevo_tipo,
+            }
+            cx.notify();
+        }
+    }
+
+    /// Abre el picker nativo de carpeta y, al elegir, escribe la ruta en el input del formulario.
+    fn elegir_carpeta_proyecto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(gpui::SharedString::from("Elegir carpeta del proyecto")),
+        });
+        cx.spawn_in(window, async move |esta, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let ruta = dir.to_string_lossy().to_string();
+                    let _ = esta.update_in(cx, |esta, window, cx| {
+                        if let Some(i) = &esta.datos.input_proyecto_ruta {
+                            i.update(cx, |s, cx| s.set_value(ruta.clone(), window, cx));
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Confirma el formulario: valida y crea o edita según la variante. Persiste y cierra.
+    fn confirmar_form_proyecto(&mut self, cx: &mut Context<Self>) {
+        use crate::config::Ubicacion;
+        use crate::vista::proyectos::{FormProyecto, TipoUbicacion};
+        let Some(form) = self.datos.proyecto_form.clone() else {
+            return;
+        };
+        let nombre = self
+            .datos
+            .input_proyecto_nombre
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        let ruta = self
+            .datos
+            .input_proyecto_ruta
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if nombre.is_empty() {
+            self.datos.proyecto_form_error = Some("el nombre no puede ir vacío".to_string());
+            cx.notify();
+            return;
+        }
+        if ruta.is_empty() {
+            self.datos.proyecto_form_error = Some("la ubicación no puede ir vacía".to_string());
+            cx.notify();
+            return;
+        }
+        // Componer la Ubicacion según el tipo elegido.
+        let tipo = match &form {
+            FormProyecto::Crear { tipo } | FormProyecto::Editar { tipo, .. } => *tipo,
+        };
+        let ubicacion = match tipo {
+            TipoUbicacion::Local => Ubicacion::Local { ruta: ruta.clone() },
+            TipoUbicacion::Ssh => match ruta.split_once(':') {
+                Some((host, r)) if !host.is_empty() && !r.is_empty() => {
+                    Ubicacion::Ssh { host: host.to_string(), ruta: r.to_string() }
+                }
+                _ => {
+                    self.datos.proyecto_form_error =
+                        Some("para SSH usa el formato host:/ruta/remota".to_string());
+                    cx.notify();
+                    return;
+                }
+            },
+        };
+        // Crear o editar.
+        match form {
+            FormProyecto::Crear { .. } => {
+                self.con_config_proyectos(
+                    |cfg| {
+                        let _ = cfg.crear_proyecto(&nombre, ubicacion);
+                    },
+                    cx,
+                );
+            }
+            FormProyecto::Editar { id, .. } => {
+                self.con_config_proyectos(
+                    |cfg| {
+                        cfg.editar_proyecto(&id, Some(&nombre), Some(ubicacion));
+                    },
+                    cx,
+                );
+            }
+        }
+        self.cerrar_form_proyecto(cx);
+    }
+
+    /// Archiva o reactiva un proyecto.
+    fn archivar_proyecto(&mut self, id: String, archivar: bool, cx: &mut Context<Self>) {
+        self.con_config_proyectos(|cfg| { cfg.archivar_proyecto(&id, archivar); }, cx);
+    }
+
+    /// Duplica un proyecto (misma ubicación de arranque; el usuario la edita luego).
+    fn duplicar_proyecto(&mut self, id: String, cx: &mut Context<Self>) {
+        // Reusa la ubicación del origen como semilla (el usuario la cambia editando el duplicado).
+        let Some(orig) = self.datos.proyectos.iter().find(|p| p.id == id).cloned() else {
+            return;
+        };
+        self.con_config_proyectos(
+            move |cfg| {
+                cfg.duplicar_proyecto(&id, orig.ubicacion.clone());
+            },
+            cx,
+        );
+    }
+
+    /// Abre la ficha de un proyecto (sub-tabs). Vuelve a Equipo por defecto.
+    fn abrir_ficha_proyecto(&mut self, id: String, cx: &mut Context<Self>) {
+        use crate::vista::proyectos::FichaProyectoTab;
+        self.datos.proyecto_abierto = Some(id);
+        self.datos.proyecto_ficha_tab = FichaProyectoTab::Equipo;
+        cx.notify();
+    }
+
+    /// Cierra la ficha, vuelve al grid.
+    fn cerrar_ficha_proyecto(&mut self, cx: &mut Context<Self>) {
+        self.datos.proyecto_abierto = None;
+        cx.notify();
+    }
+
+    /// Cambia el sub-tab de la ficha abierta.
+    fn cambiar_ficha_tab(&mut self, idx: u8, cx: &mut Context<Self>) {
+        use crate::vista::proyectos::FichaProyectoTab;
+        if let Some(t) = FichaProyectoTab::TODAS.get(idx as usize) {
+            self.datos.proyecto_ficha_tab = *t;
+            cx.notify();
+        }
+    }
+
+    /// Fija (o limpia con id vacío) el proyecto activo global (selector de cabecera, R11).
+    fn fijar_proyecto_activo(&mut self, id: String, cx: &mut Context<Self>) {
+        self.datos.proyecto_activo = if id.trim().is_empty() { None } else { Some(id) };
+        cx.notify();
     }
 
     /// Confirma el formulario de Peers activo: valida la frontera y dispara el POST vía
@@ -2685,7 +2948,8 @@ impl AppDesktop {
             | Pantalla::Config
             | Pantalla::Acceso
             | Pantalla::Lanzador
-            | Pantalla::ChatPrivado => {}
+            | Pantalla::ChatPrivado
+            | Pantalla::Proyectos => {}
         }
         cx.notify();
     }
@@ -3106,6 +3370,7 @@ impl AppDesktop {
             Pantalla::Acceso => vista::render_acceso(&self.datos).into_any_element(),
             Pantalla::Lanzador => vista::render_lanzador(&self.datos).into_any_element(),
             Pantalla::ChatPrivado => vista::render_chat_privado(&self.datos).into_any_element(),
+            Pantalla::Proyectos => vista::render_proyectos(&self.datos).into_any_element(),
         }
     }
 
@@ -3560,6 +3825,11 @@ impl Render for AppDesktop {
         use crate::vista::chat_privado::{
             EnviarChatPrivado, RefrescarChatPrivado, SeleccionarChatPeer,
         };
+        use crate::vista::proyectos::{
+            AbrirCrearProyecto, AbrirEditarProyecto, AbrirFichaProyecto, ArchivarProyecto,
+            CambiarFichaTab, CerrarFichaProyecto, CerrarFormProyecto, ConfirmarFormProyecto,
+            DuplicarProyecto, ElegirCarpetaProyecto, ElegirTipoUbicacion, FijarProyectoActivo,
+        };
         use crate::vista::peers::{
             AbrirDetallePeer, CerrarDetallePeer, CerrarFormPeers, ConfirmarFormPeers,
             DeseleccionarPeer, EnviarMensajePeer, PedirKickPeer, SeleccionarPeer, VerJornadaPeer,
@@ -3638,6 +3908,43 @@ impl Render for AppDesktop {
             }))
             .on_action(cx.listener(|esta, _a: &RefrescarChatPrivado, _window, cx| {
                 esta.refrescar_chat_privado(cx);
+            }))
+            // --- Proyectos (RFC-proyectos Fase 2) ---
+            .on_action(cx.listener(|esta, _a: &AbrirCrearProyecto, window, cx| {
+                esta.abrir_crear_proyecto(window, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AbrirEditarProyecto, window, cx| {
+                esta.abrir_editar_proyecto(a.id.clone(), window, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &ConfirmarFormProyecto, _window, cx| {
+                esta.confirmar_form_proyecto(cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarFormProyecto, _window, cx| {
+                esta.cerrar_form_proyecto(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ElegirTipoUbicacion, _window, cx| {
+                esta.elegir_tipo_ubicacion_proyecto(a.local, cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &ElegirCarpetaProyecto, window, cx| {
+                esta.elegir_carpeta_proyecto(window, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &AbrirFichaProyecto, _window, cx| {
+                esta.abrir_ficha_proyecto(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, _a: &CerrarFichaProyecto, _window, cx| {
+                esta.cerrar_ficha_proyecto(cx);
+            }))
+            .on_action(cx.listener(|esta, a: &CambiarFichaTab, _window, cx| {
+                esta.cambiar_ficha_tab(a.tab, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &ArchivarProyecto, _window, cx| {
+                esta.archivar_proyecto(a.id.clone(), a.archivar, cx);
+            }))
+            .on_action(cx.listener(|esta, a: &DuplicarProyecto, _window, cx| {
+                esta.duplicar_proyecto(a.id.clone(), cx);
+            }))
+            .on_action(cx.listener(|esta, a: &FijarProyectoActivo, _window, cx| {
+                esta.fijar_proyecto_activo(a.id.clone(), cx);
             }))
             // --- Peers: detalle + composer + kick (peers-01/02/03) ---
             .on_action(cx.listener(|esta, a: &AbrirDetallePeer, _window, cx| {
