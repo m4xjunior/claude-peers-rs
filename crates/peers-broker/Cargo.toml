@@ -34,6 +34,13 @@ octocrab = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 # Detección de PID vivo (kill(pid,0)) para resolver colisión de id entre peers locales.
 libc = "0.2"
+# Puente WhatsApp (Evolution API): rustls, mismo criterio que peers-client/peers-tui/peers-desktop
+# (sin OpenSSL nativo). Solo lo usa whatsapp.rs (enviar_texto); nadie más en el broker necesita
+# un cliente HTTP saliente.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Decodificar el `base64` de `getBase64FromMediaMessage` (adjuntos de WhatsApp: imagen/documento/
+# audio). E-22 permite deps externas para algo tan puntual como esto.
+base64 = "0.22"
 # CSPRNG del SO para el secreto de sesión (E-10, anti-spoofing del de_id). Ya estaba en el árbol
 # como dep transitiva; se declara directa y se fija a 0.2 (API `getrandom::getrandom(&mut buf)`)
 # para no depender de la resolución entre 0.2/0.3/0.4 del lock. E-22 permite deps externas.

@@ -14,6 +14,7 @@ mod bitacora;
 mod github;
 mod jornada;
 mod store;
+mod whatsapp;
 #[cfg(feature = "sqlite")]
 mod db;
 
@@ -34,12 +35,14 @@ use peers_core::{
     FactorEstimacion, Mensaje, PeticionAbrirTarea, PeticionAcciones, PeticionAsignarTarea,
     PeticionCerrarTarea,
     PeticionConfirmar, PeticionDefinirResumen, PeticionEditarTarea, PeticionEnviar,
-    PeticionEstadoTarea, PeticionForzarTarea, PeticionHistorial, PeticionJornada, PeticionLatido,
+    PeticionEstadoTarea, PeticionForzarTarea, PeticionHistorial, PeticionHistorialGlobal,
+    PeticionJornada, PeticionLatido,
     PeticionListar, PeticionPurgar, PeticionReasignarTarea, PeticionRecibir, PeticionRegistrar,
     PeticionReenviar, PeticionReportarTarea, PeticionReportesTarea, PeticionResolverAlerta,
-    PeticionSalir, Politica,
+    PeerConocido, PeticionSalir, PeticionWhatsappEnviar, PeticionWhatsappHistorial, Politica,
     RespuestaAbrirTarea, RespuestaAdminInfo, RespuestaAdminRedis, RespuestaEnviar,
-    RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, Tarea, TipoAccion,
+    RespuestaJornada, RespuestaOk, RespuestaRegistrar, RespuestaSalud, RespuestaWhatsappHistorial,
+    Tarea, TipoAccion,
     TipoAlerta, ID_OPERADOR, PUERTO_DEFECTO, VENCIMIENTO_MS,
 };
 use store::AlmacenRedis;
@@ -151,6 +154,13 @@ struct EstadoApp {
     /// interruptor de la reversión (decisión de Max): apagado devuelve el comportamiento anterior
     /// sin borrar el código de E-10.
     antispoofing: bool,
+    /// Puente WhatsApp (Evolution API): credenciales + destino FIJO, leídos del entorno UNA vez
+    /// al arrancar. `None` = variables ausentes → el broker opera SIN el puente (R9): `/evo/inbound`
+    /// responde 503 y `/whatsapp/enviar` un `ok:false` explícito, nunca un panic.
+    whatsapp: Option<whatsapp::Config>,
+    /// Cliente HTTP saliente reusado para hablar con Evolution (pool de conexiones de reqwest).
+    /// Se construye siempre, aunque `whatsapp` sea `None` — es barato e infalible en la práctica.
+    whatsapp_http: reqwest::Client,
 }
 
 type Estado = Arc<EstadoApp>;
@@ -403,6 +413,19 @@ async fn registrar(
     if es_alta {
         registrar_accion(&e, &id, TipoAccion::Registrar, None, Some(p.hostname.clone()), None, None).await;
     }
+    // Ancla la identidad durable con el DIRECTORIO en CADA registro (no sólo en el alta): es una
+    // fila que se refresca, no un evento, así que no hace ruido — y un peer puede cambiar de
+    // carpeta entre sesiones. Sin esto, el Chat global no podría filtrar por directorio a nadie
+    // que ya haya cerrado (`instancias` borra la fila al salir; `peers_conocidos` no).
+    // R9 (degradación): la bitácora es observabilidad — si falla, se avisa y el registro sigue.
+    if let Some(b) = &e.bitacora {
+        if let Err(err) = b
+            .peer_visto(&id, &ahora, Some(&p.resumen), Some(&p.directorio))
+            .await
+        {
+            warn!("bitácora: no se pudo anclar la identidad de {id}: {err:#}");
+        }
+    }
     info!("instancia registrada: {id}");
     Ok(Json(RespuestaRegistrar { id, secreto: Some(secreto) }))
 }
@@ -451,6 +474,42 @@ async fn listar(
         )
         .await?;
     Ok(Json(r))
+}
+
+/// Copia a la identidad durable el directorio de cada peer VIVO en el store. Sirve de puente para
+/// el dato que hasta la migración 0003 sólo existía en `instancias` (presencia efímera): sin este
+/// backfill habría que reiniciar cada agente para que su carpeta se conociera.
+///
+/// R9 (degradación): cada peer se intenta por separado y un fallo sólo se avisa — es observabilidad,
+/// jamás puede impedir que el broker arranque.
+async fn backfill_directorios(almacen: &Arc<dyn Almacen>, b: &bitacora::Bitacora) {
+    let ids = match almacen.listar_ids().await {
+        Ok(ids) => ids,
+        Err(err) => {
+            warn!("backfill de directorios: no se pudo listar el roster: {err:#}");
+            return;
+        }
+    };
+    let mut anclados = 0usize;
+    for id in &ids {
+        match almacen.instancia_obtener(id).await {
+            Ok(Some(inst)) => {
+                if let Err(err) = b
+                    .peer_visto(&inst.id, &inst.registrada_en, Some(&inst.resumen), Some(&inst.directorio))
+                    .await
+                {
+                    warn!("backfill de directorios: {id}: {err:#}");
+                } else {
+                    anclados += 1;
+                }
+            }
+            Ok(None) => {} // carrera con un `salir`: nada que anclar
+            Err(err) => warn!("backfill de directorios: leyendo {id}: {err:#}"),
+        }
+    }
+    if anclados > 0 {
+        info!("identidad durable: directorio anclado para {anclados} peer(s) vivo(s)");
+    }
 }
 
 /// Ruta por defecto del fichero de bitácora: `~/.config/claude-peers/bitacora.db` (junto a la
@@ -616,6 +675,35 @@ async fn enviar(
             ok: false,
             error: Some(format!("comunicación bloqueada por política: {motivo}")),
         }));
+    }
+    // Puente WhatsApp: si el destino es el peer SINTÉTICO, `enviar_mensaje`/`avisar_equipo`
+    // normales NO alcanzan — su bandeja no la drena nadie (no es una sesión Claude Code real).
+    // Para que "ella es un peer" sea CIERTO de verdad (pedido de Max), el `/enviar` genérico
+    // reconoce este destino especial y hace lo mismo que `/whatsapp/enviar`: llama a Evolution.
+    // Bug real encontrado en vivo: `enviar_mensaje`/`avisar_equipo` a "leticia" devolvían `ok:true`
+    // (la bandeja se encoló bien) pero el mensaje NUNCA llegaba a su WhatsApp real.
+    if p.para_id == whatsapp::PEER_ID {
+        let Some(cfg) = &e.whatsapp else {
+            return Ok(Json(RespuestaEnviar {
+                ok: false,
+                error: Some("puente WhatsApp no configurado en el broker".to_string()),
+            }));
+        };
+        if let Err(err) = whatsapp::enviar_texto(&e.whatsapp_http, cfg, &p.texto).await {
+            error!("enviar→leticia: fallo llamando a Evolution: {err:#}");
+            return Ok(Json(RespuestaEnviar {
+                ok: false,
+                error: Some(format!("no se pudo enviar por WhatsApp: {err:#}")),
+            }));
+        }
+        if let Some(b) = &e.bitacora {
+            if let Err(err) = b.whatsapp_registrar_salida(&p.texto, Some(&p.de_id), &ahora_iso(), None).await {
+                warn!("enviar→leticia: no se pudo registrar el historial (el envío YA salió): {err:#}");
+            }
+        }
+        marcar_actividad(&e, &p.de_id).await;
+        registrar_accion(&e, &p.de_id, TipoAccion::EnviarWhatsapp, Some(p.para_id.clone()), None, None, None).await;
+        return Ok(Json(RespuestaEnviar { ok: true, error: None }));
     }
     e.almacen
         .encolar_mensaje(&p.de_id, &p.para_id, &p.texto, &ahora_iso())
@@ -1665,6 +1753,37 @@ async fn admin_historial(
     Ok(Json(msgs))
 }
 
+/// Techo duro del feed global. Con la retención de 500/cola y ~10 peers, el histórico completo
+/// rondaría los 5.000 mensajes: devolverlos todos en cada refresco de 2s sería absurdo. La UI
+/// pide el tramo reciente y luego pagina con `desde`.
+const MAX_HISTORIAL_GLOBAL: usize = 500;
+
+/// `GET /admin/historial-global?desde=&limite=` → feed unificado de TODAS las colas, ordenado
+/// por msg_id (== msgseq, contador global → orden real de envío sin depender de relojes).
+/// Lo consume la pantalla Chat global del desktop. SOLO LECTURA. Va en `rutas_protegidas`.
+///
+/// Agrega en el handler en vez de en el store a propósito: `historial` ya resuelve el cursor y
+/// el filtro por cola, así que esto vale igual para Redis y para SQLite sin duplicar lógica de
+/// persistencia. Un mensaje vive en la cola de su destinatario y solo en ella, así que la unión
+/// no puede producir duplicados.
+async fn admin_historial_global(
+    State(e): State<Estado>,
+    axum::extract::Query(p): axum::extract::Query<PeticionHistorialGlobal>,
+) -> Result<Json<Vec<Mensaje>>, ErrorApp> {
+    let colas = e.almacen.colas_conocidas().await?;
+    let mut msgs = Vec::new();
+    for cola in &colas {
+        msgs.extend(e.almacen.historial(cola, p.desde, None).await?);
+    }
+    msgs.sort_by_key(|m| m.id);
+    // Recorta por la COLA de la lista: lo que interesa son los más recientes.
+    let limite = p.limite.unwrap_or(MAX_HISTORIAL_GLOBAL).min(MAX_HISTORIAL_GLOBAL);
+    if msgs.len() > limite {
+        msgs.drain(..msgs.len() - limite);
+    }
+    Ok(Json(msgs))
+}
+
 /// `POST /admin/reenviar` { msg_id } → re-encola un mensaje del historial como uno NUEVO
 /// (msgseq fresco, estado `Enviado`, `reenviado_de = msg_id`, `reenvios + 1`) en la bandeja
 /// del `para_id` original (R2.3). Devuelve el `msg_id` del nuevo. Va en `rutas_protegidas`.
@@ -1685,6 +1804,183 @@ async fn admin_reenviar(
         p.msg_id, nuevo_id, original.para_id
     );
     Ok(Json(serde_json::json!({ "ok": true, "msg_id": nuevo_id })))
+}
+
+// --- Puente WhatsApp (Evolution API) — pedido directo de Max, ver módulo `whatsapp` ---
+
+/// `POST /evo/inbound?clave=...` — webhook de Evolution (evento `MESSAGES_UPSERT`). Deliberadamente
+/// FUERA de `rutas_protegidas`: quien llama es Evolution (o un fan-out externo en la VM), nunca un
+/// peer con `X-Peers-Token`. Se autentica con la clave compartida `?clave=` — único guardián del
+/// endpoint (`whatsapp::Config::webhook_clave`).
+///
+/// Filtro de privacidad (PF-1, incidente ya documentado por el equipo LexusFX: la instancia de
+/// Evolution ingiere TODAS las conversas del número de negocio, no solo las relevantes — un aviso
+/// con datos de una clienta llegó una vez, de forma automática, al WhatsApp personal de la esposa
+/// de Max). `whatsapp::extraer_entrante` descarta CUALQUIER remitente que no sea el destino FIJO
+/// autorizado antes de que este handler toque el historial o el push a peers.
+async fn evo_inbound(
+    State(e): State<Estado>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(payload): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let Some(cfg) = &e.whatsapp else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "puente WhatsApp no configurado").into_response();
+    };
+    if q.get("clave").map(String::as_str) != Some(cfg.webhook_clave.as_str()) {
+        warn!("evo/inbound: intento sin clave válida rechazado");
+        return (StatusCode::UNAUTHORIZED, "clave inválida").into_response();
+    }
+    let Some(evento) = whatsapp::extraer_entrante(cfg, &payload) else {
+        // Eco nuestro, remitente NO autorizado, o payload sin texto reconocible: nada que hacer.
+        // 200 siempre — un descarte no es un fallo del webhook (evita reintentos innecesarios).
+        return StatusCode::OK.into_response();
+    };
+    procesar_entrante_whatsapp(&e, evento).await;
+    StatusCode::OK.into_response()
+}
+
+/// Registra (si es nuevo, dedupe por `evo_message_id`) y empuja a los peers vivos un evento
+/// entrante de WhatsApp. COMPARTIDO entre el webhook (`evo_inbound`) y el polling de respaldo
+/// (`whatsapp::buscar_recientes`, spawneado en `main`): misma ruta de dedupe/push para los dos
+/// caminos, así nunca hay lógica duplicada que diverja entre ellos.
+///
+/// El remitente es `whatsapp::PEER_ID` — el peer SINTÉTICO registrado al arrancar (ver `main`):
+/// no es un tag anónimo, es su identidad real en el roster (pedido explícito de Max: "não deve
+/// ser anônimo, ela tem nome"). Se salta el push a ella misma si por algún motivo apareciera en
+/// el roster de vivos (no debería, pero es una guarda barata).
+async fn procesar_entrante_whatsapp(e: &Estado, mut evento: whatsapp::EventoEntrante) {
+    let Some(b) = &e.bitacora else {
+        warn!("whatsapp: bitácora desactivada, mensaje NO persistido ni empujado");
+        return;
+    };
+    // Adjunto (imagen/documento/audio/video) en vez de texto plano: resolverlo ANTES de
+    // persistir/empujar (pedido de Max: "o time n ta recebendo os html dela nem arquivo"; audio
+    // se transcribe — ver `whatsapp::resolver_adjunto`). Nunca deja `evento.texto` vacío: si la
+    // resolución falla, degrada a un aviso explícito en vez de empujar una cadena vacía.
+    //
+    // `whatsapp_ya_existe` ANTES de resolver: el polling de respaldo relee el mismo backlog cada
+    // 20s (y en cada restart del broker) — sin este chequeo previo, cada pasada re-descargaría y
+    // re-transcribiría (whisper-cli, no gratis) el mismo adjunto ya procesado. El dedupe real del
+    // INSERT (`whatsapp_registrar_entrada`) sigue como red de seguridad contra la carrera entre
+    // este chequeo y el registro.
+    if let (Some(adjunto), Some(cfg)) = (evento.adjunto.as_ref(), e.whatsapp.as_ref()) {
+        let ya_visto = b.whatsapp_ya_existe(&evento.evo_message_id).await.unwrap_or(false);
+        if !ya_visto {
+            evento.texto = match whatsapp::resolver_adjunto(cfg, &evento.evo_message_id, adjunto).await {
+                Ok(texto) => texto,
+                Err(err) => {
+                    warn!("whatsapp: fallo resolviendo adjunto de '{}': {err:#}", evento.evo_message_id);
+                    format!(
+                        "[Letícia enviou um anexo ({}) — falha ao processar, ver logs do broker]",
+                        adjunto.tipo
+                    )
+                }
+            };
+        }
+    }
+    let cuando = ahora_iso();
+    // Dos direcciones reales de diálogo humano en el hilo LID (pedido de Max: "os peers pelo mcp
+    // deve poder ver minha mensagem tb, pra ter historico da conversa"). `from_me` distingue cuál:
+    // sus propios mensajes se guardan como `salida` (autor_peer_id=None → "el operador", igual que
+    // cuando responde desde el desktop) y NO se empujan al equipo (ya las escribió él, no es una
+    // novedad que el equipo deba atender) — pero SÍ quedan en el historial que el MCP expone.
+    if evento.from_me {
+        if let Err(err) = b
+            .whatsapp_registrar_salida(&evento.texto, None, &cuando, Some(&evento.evo_message_id))
+            .await
+        {
+            error!("whatsapp: fallo al registrar el mensaje de Max en el historial: {err:#}");
+        }
+        return;
+    }
+    let es_nuevo = match b
+        .whatsapp_registrar_entrada(&evento.texto, evento.nombre.as_deref(), &cuando, &evento.evo_message_id)
+        .await
+    {
+        Ok(nuevo) => nuevo,
+        Err(err) => {
+            error!("whatsapp: fallo al registrar el mensaje entrante: {err:#}");
+            return; // ya quedó trazado; nunca reintenta desde aquí
+        }
+    };
+    if !es_nuevo {
+        return; // ya visto antes (reintento del webhook o solape con el polling de respaldo)
+    }
+    // Push a TODOS los peers vivos (pedido explícito de Max: sin filtro adicional de curación).
+    match e
+        .almacen
+        .listar(peers_core::Alcance::Maquina, "", None, None, &vencidas_antes_iso())
+        .await
+    {
+        Ok(vivos) => {
+            let mut empujados = 0usize;
+            for peer in &vivos {
+                if peer.id == whatsapp::PEER_ID {
+                    continue;
+                }
+                if let Err(err) = e
+                    .almacen
+                    .encolar_mensaje(whatsapp::PEER_ID, &peer.id, &evento.texto, &cuando)
+                    .await
+                {
+                    warn!("whatsapp: no se pudo empujar a '{}': {err:#}", peer.id);
+                } else {
+                    empujados += 1;
+                }
+            }
+            info!("whatsapp: mensaje de '{}' empujado a {empujados} peer(s)", whatsapp::PEER_ID);
+        }
+        Err(err) => error!("whatsapp: no se pudo listar los peers vivos: {err:#}"),
+    }
+}
+
+/// `POST /whatsapp/enviar` (rutas_protegidas): un peer responde al destino WhatsApp FIJO
+/// configurado en el broker. SIN campo `numero` en el payload a propósito — el destino nunca es
+/// elegible por el caller (ver `peers_core::PeticionWhatsappEnviar`). El autor real se resuelve
+/// por el secreto de sesión (anti-IDOR, mismo patrón que `chat_privado_responder`), nunca por un
+/// campo del body.
+async fn whatsapp_enviar(
+    State(e): State<Estado>,
+    headers: axum::http::HeaderMap,
+    Json(p): Json<PeticionWhatsappEnviar>,
+) -> Result<Json<RespuestaEnviar>, ErrorApp> {
+    let Some(cfg) = &e.whatsapp else {
+        return Ok(Json(RespuestaEnviar {
+            ok: false,
+            error: Some("puente WhatsApp no configurado en el broker".to_string()),
+        }));
+    };
+    if let Err(err) = whatsapp::enviar_texto(&e.whatsapp_http, cfg, &p.texto).await {
+        error!("whatsapp/enviar: fallo llamando a Evolution: {err:#}");
+        return Ok(Json(RespuestaEnviar {
+            ok: false,
+            error: Some(format!("no se pudo enviar: {err:#}")),
+        }));
+    }
+    let autor = id_del_llamador(&e, &headers).await.unwrap_or(None);
+    if let Some(b) = &e.bitacora {
+        if let Err(err) = b.whatsapp_registrar_salida(&p.texto, autor.as_deref(), &ahora_iso(), None).await {
+            warn!("whatsapp/enviar: no se pudo registrar el historial (el envío YA salió): {err:#}");
+        }
+    }
+    if let Some(id) = &autor {
+        marcar_actividad(&e, id).await;
+        registrar_accion(&e, id, TipoAccion::EnviarWhatsapp, None, None, None, None).await;
+    }
+    Ok(Json(RespuestaEnviar { ok: true, error: None }))
+}
+
+/// `GET /whatsapp/historial?desde=&limite=` (rutas_protegidas): feed de la conversación completa
+/// (ambas direcciones) para la pantalla del desktop (RFC "integrado en mi app"). SOLO LECTURA.
+async fn whatsapp_historial(
+    State(e): State<Estado>,
+    axum::extract::Query(p): axum::extract::Query<PeticionWhatsappHistorial>,
+) -> Result<Json<RespuestaWhatsappHistorial>, ErrorApp> {
+    let Some(b) = &e.bitacora else {
+        return Ok(Json(RespuestaWhatsappHistorial { mensajes: vec![] }));
+    };
+    let mensajes = b.whatsapp_historial(p.desde, p.limite.unwrap_or(200)).await?;
+    Ok(Json(RespuestaWhatsappHistorial { mensajes }))
 }
 
 // --- Supervisor (fase 5): detección de ociosos / atascados / ghosteo ---
@@ -1774,6 +2070,20 @@ async fn acciones(
         b.listar(&p.instancia_id, p.desde.as_deref(), p.limite.unwrap_or(100))
             .await?,
     ))
+}
+
+/// `GET /admin/peers-conocidos` (bajo token) → identidad DURABLE de todos los peers vistos alguna
+/// vez, con su directorio. Lo consume el Chat global para filtrar el historial por carpeta
+/// incluyendo a los agentes que ya cerraron. Bitácora desactivada → lista vacía (misma degradación
+/// que `/acciones`: la observabilidad ausente nunca es un error, la UI simplemente no ofrece el
+/// filtro). SOLO LECTURA. Va en `rutas_protegidas`.
+async fn admin_peers_conocidos(
+    State(e): State<Estado>,
+) -> Result<Json<Vec<PeerConocido>>, ErrorApp> {
+    let Some(b) = &e.bitacora else {
+        return Ok(Json(vec![]));
+    };
+    Ok(Json(b.peers_conocidos().await?))
 }
 
 /// Evalúa los 3 detectores del supervisor y emite/resuelve alertas (R1–R4, R7).
@@ -2073,6 +2383,25 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Backfill de la identidad durable desde el roster VIVO. La migración 0003 añadió
+    // `directorio` a `peers_conocidos` como NULL: sin esto, el dato sólo aparecería cuando cada
+    // peer volviese a registrarse (es decir, al reiniciarlo), y el filtro por directorio del Chat
+    // global nacería vacío pese a que el store SÍ sabe dónde trabaja cada peer vivo ahora mismo.
+    // Es idempotente (upsert) y barato (una vez por arranque, sólo los vivos), así que también
+    // repara la tabla si alguna vez se queda atrás.
+    if let Some(b) = &bitacora {
+        backfill_directorios(&almacen, b).await;
+    }
+
+    // Puente WhatsApp (Evolution API): credenciales + destino contenidos en el entorno del
+    // broker (pedido explícito de Max). Ausentes → `None`, el broker opera sin el puente (R9).
+    let whatsapp_cfg = whatsapp::Config::desde_entorno();
+    if whatsapp_cfg.is_some() {
+        info!("puente WhatsApp (Evolution) ACTIVO — destino fijo configurado");
+    } else {
+        info!("puente WhatsApp (Evolution) inactivo (faltan variables EVOLUTION_*)");
+    }
+
     let estado: Estado = Arc::new(EstadoApp {
         almacen,
         github,
@@ -2082,7 +2411,58 @@ async fn main() -> anyhow::Result<()> {
         politica: tokio::sync::RwLock::new(politica_inicial),
         bitacora,
         antispoofing: args.antispoofing,
+        whatsapp: whatsapp_cfg,
+        whatsapp_http: reqwest::Client::new(),
     });
+
+    // Puente WhatsApp: registra el peer SINTÉTICO (pedido de Max: "não deve ser anônimo, ela tem
+    // nome, ela deve ser um peer" — pero NO es una sesión Claude Code). `hostname="whatsapp"`
+    // (no coincide con ningún host real) hace que la anti-colisión por PID la trate como
+    // "remota, no verificable" — nunca intenta un `kill(pid, 0)` sobre un pid inventado.
+    // Liveness SINTÉTICO (decisión de Max): late cada 30s en el mismo ciclo de limpieza de abajo,
+    // así nunca vence ni dispara alertas de ociosa/ghosteo por sí sola.
+    if estado.whatsapp.is_some() {
+        let secreto_leticia = generar_secreto();
+        let ahora = ahora_iso();
+        match estado
+            .almacen
+            .registrar(
+                whatsapp::PEER_ID, 0, "whatsapp", "whatsapp", None, None, None,
+                whatsapp::PEER_RESUMEN, &ahora, &secreto_leticia,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!("puente WhatsApp: '{}' registrada como peer (liveness sintético)", whatsapp::PEER_ID);
+                if let Err(err) = estado.almacen.latido(whatsapp::PEER_ID, &ahora).await {
+                    warn!("puente WhatsApp: latido inicial de '{}' falló: {err:#}", whatsapp::PEER_ID);
+                }
+            }
+            Err(err) => warn!("puente WhatsApp: no se pudo registrar '{}' como peer: {err:#}", whatsapp::PEER_ID),
+        }
+    }
+
+    // Polling de RESPALDO (no depende de que nadie más conecte un webhook/fan-out): mientras esa
+    // pieza externa no esté lista, esto YA entrega mensajes reales. Mismo filtro/dedupe/push que
+    // el webhook (`procesar_entrante_whatsapp`) — nunca diverge en dos rutas de lógica distintas.
+    if let Some(cfg) = estado.whatsapp.clone() {
+        let estado_poll = estado.clone();
+        tokio::spawn(async move {
+            let mut intervalo = tokio::time::interval(std::time::Duration::from_secs(20));
+            loop {
+                intervalo.tick().await;
+                match whatsapp::buscar_recientes(&estado_poll.whatsapp_http, &cfg).await {
+                    Ok(eventos) => {
+                        for evento in eventos {
+                            procesar_entrante_whatsapp(&estado_poll, evento).await;
+                        }
+                    }
+                    Err(err) => warn!("whatsapp: polling de respaldo falló: {err:#}"),
+                }
+            }
+        });
+        info!("whatsapp: polling de respaldo ACTIVO (cada 20s) — no depende del webhook/fan-out");
+    }
 
     // Umbrales del supervisor (R8): resueltos una vez, copiados al spawn (Copy).
     let umbrales = Umbrales {
@@ -2102,6 +2482,13 @@ async fn main() -> anyhow::Result<()> {
         let mut intervalo = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             intervalo.tick().await;
+            // Liveness SINTÉTICO del puente WhatsApp: late en el MISMO ciclo, antes de la
+            // limpieza de vencidas — así nunca hay una ventana donde ella pudiera vencer.
+            if limpieza.whatsapp.is_some() {
+                if let Err(err) = limpieza.almacen.latido(whatsapp::PEER_ID, &ahora_iso()).await {
+                    warn!("puente WhatsApp: latido periódico de '{}' falló: {err:#}", whatsapp::PEER_ID);
+                }
+            }
             match limpieza.almacen.limpiar_vencidas(&vencidas_antes_iso()).await {
                 Ok(n) if n > 0 => info!("limpieza periódica: {n} instancia(s) vencida(s)"),
                 Ok(_) => {}
@@ -2184,6 +2571,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/redis", get(admin_redis))
         .route("/admin/purgar", post(admin_purgar))
         .route("/admin/historial", get(admin_historial))
+        .route("/admin/historial-global", get(admin_historial_global))
+        .route("/admin/peers-conocidos", get(admin_peers_conocidos))
         .route("/admin/reenviar", post(admin_reenviar))
         // Supervisor (fase 5): alertas vigentes para el banner de la TUI (R6/AC3).
         .route("/admin/alertas", get(admin_alertas))
@@ -2199,10 +2588,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/politica/bloqueos", get(admin_politica_bloqueos))
         // Bitácora de acciones (RFC registro-acciones R6): el feed que la Jornada pinta.
         .route("/acciones", get(acciones))
+        // Puente WhatsApp (Evolution API): responder al destino fijo + leer el historial para
+        // la pantalla del desktop. Bajo token, como el resto — sólo `/evo/inbound` (el webhook
+        // en sí) queda exento, porque quien lo llama no es un peer.
+        .route("/whatsapp/enviar", post(whatsapp_enviar))
+        .route("/whatsapp/historial", get(whatsapp_historial))
         .layer(from_fn_with_state(args.token.clone(), verificar_token));
 
     let app = Router::new()
         .route("/salud", get(salud))   // exenta de auth
+        // Webhook de Evolution: se autentica con `?clave=`, NUNCA con el X-Peers-Token (quien
+        // llama es Evolution/un fan-out externo, no un peer registrado).
+        .route("/evo/inbound", post(evo_inbound))
         .merge(rutas_protegidas)
         .with_state(estado);
 

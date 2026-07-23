@@ -1,0 +1,14 @@
+-- Directorio de trabajo en la identidad DURABLE (ADR-001).
+--
+-- POR QUÉ: el directorio de un peer sólo vivía en `instancias` (Redis/rusqlite), que es presencia
+-- EFÍMERA — `salir` borra la fila. Resultado: en cuanto un agente cerraba, dejaba de saberse desde
+-- qué carpeta habló, y el Chat global no podía filtrar por directorio a nadie que no estuviese vivo
+-- en ese instante (que es la mayoría del historial).
+--
+-- `peers_conocidos` es la tabla que JAMÁS se borra y a la que apuntan las FK de `acciones` y
+-- `tareas_conocidas`, así que es el sitio correcto para anclar el dato: mientras exista una acción
+-- o un mensaje de ese peer, su directorio sigue resolviendo.
+--
+-- NULLable a propósito: las filas ya existentes (peers vistos antes de esta migración) no tienen
+-- de dónde sacarlo. Se rellenan solas en el siguiente registro del peer (upsert con COALESCE).
+ALTER TABLE peers_conocidos ADD COLUMN directorio TEXT;

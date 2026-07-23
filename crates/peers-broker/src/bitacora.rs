@@ -15,7 +15,7 @@
 //! JAMÁS tumba la mutación de negocio (la bitácora es observabilidad).
 
 use anyhow::Context as _;
-use peers_core::{AccionRegistrada, Tarea, TipoAccion};
+use peers_core::{AccionRegistrada, DireccionWhatsapp, MensajeWhatsapp, PeerConocido, Tarea, TipoAccion};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row as _, SqlitePool};
 use std::time::Duration;
@@ -60,10 +60,10 @@ impl Bitacora {
     /// último el evento en `acciones`. Así las FK SIEMPRE resuelven.
     pub async fn registrar(&self, a: &AccionRegistrada, tarea: Option<&Tarea>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        upsert_peer(&mut tx, &a.quien, &a.cuando, None).await?;
+        upsert_peer(&mut tx, &a.quien, &a.cuando, None, None).await?;
         let mut tarea_id: Option<&str> = None;
         if let Some(t) = tarea {
-            upsert_peer(&mut tx, &t.instancia_id, &a.cuando, None).await?;
+            upsert_peer(&mut tx, &t.instancia_id, &a.cuando, None, None).await?;
             sqlx::query(
                 "INSERT INTO tareas_conocidas (id, instancia_id, descripcion, creada_en)
                  VALUES (?1, ?2, ?3, ?4)
@@ -133,6 +133,49 @@ impl Bitacora {
         Ok(filas.iter().filter_map(fila_a_accion).collect())
     }
 
+    /// Ancla la identidad DURABLE de un peer en cada REGISTRO (alta y re-registro), con su
+    /// directorio y resumen. Es lo que permite al Chat global filtrar por directorio a peers que
+    /// ya cerraron: `instancias` los borra al salir, esta tabla no.
+    ///
+    /// Se llama también en el RE-registro (a diferencia de `TipoAccion::Registrar`, que sólo se
+    /// emite en el alta para no inundar la bitácora): aquí no se inserta un evento, sólo se
+    /// refresca una fila — y un peer puede cambiar de directorio entre sesiones, así que el dato
+    /// tiene que seguirle.
+    pub async fn peer_visto(
+        &self,
+        id: &str,
+        cuando: &str,
+        resumen: Option<&str>,
+        directorio: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        upsert_peer(&mut tx, id, cuando, resumen, directorio).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Todos los peers que el broker vio ALGUNA VEZ, con su directorio (identidad durable, R6).
+    /// Lo consume el Chat global para poder filtrar por directorio incluyendo a los que ya no
+    /// están vivos. Orden por id para que la UI no salte entre refrescos.
+    pub async fn peers_conocidos(&self) -> anyhow::Result<Vec<PeerConocido>> {
+        let filas: Vec<SqliteRow> = sqlx::query(
+            "SELECT id, primer_visto, ultimo_visto, ultimo_resumen, directorio
+             FROM peers_conocidos ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(filas
+            .iter()
+            .map(|f| PeerConocido {
+                id: f.get("id"),
+                primer_visto: f.get("primer_visto"),
+                ultimo_visto: f.get("ultimo_visto"),
+                ultimo_resumen: f.get("ultimo_resumen"),
+                directorio: f.get("directorio"),
+            })
+            .collect())
+    }
+
     /// Poda la bitácora a las últimas `retener` acciones POR PEER (R7). Corre en el barrido
     /// periódico del broker (mismo ciclo que podar_historial/podar_tareas).
     pub async fn podar(&self, retener: i64) -> anyhow::Result<()> {
@@ -150,6 +193,107 @@ impl Bitacora {
         .await?;
         Ok(())
     }
+
+    /// Chequeo barato de "¿ya vi este `evo_message_id`?" — usado para saltar trabajo caro (bajar
+    /// y transcribir un adjunto) en mensajes que el webhook/polling ya reintentó, ANTES de pagar
+    /// ese costo. `whatsapp_registrar_entrada` ya deduplica el INSERT, pero eso pasa DESPUÉS de
+    /// resolver el adjunto — sin este chequeo previo, cada reintento re-descarga y re-transcribe.
+    pub async fn whatsapp_ya_existe(&self, evo_message_id: &str) -> anyhow::Result<bool> {
+        let fila: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM whatsapp_mensajes WHERE evo_message_id = ?1 LIMIT 1")
+                .bind(evo_message_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(fila.is_some())
+    }
+
+    /// Registra un mensaje ENTRANTE del webhook de Evolution. Dedupe por `evo_message_id` vía el
+    /// índice único parcial (0004): un reintento del webhook con el mismo `key.id` (at-least-once
+    /// delivery es la norma) no duplica la fila — se ignora en silencio. Devuelve `false` cuando
+    /// el mensaje ya existía, para que el caller sepa que NO debe re-empujarlo a los peers.
+    pub async fn whatsapp_registrar_entrada(
+        &self,
+        texto: &str,
+        nombre: Option<&str>,
+        cuando: &str,
+        evo_message_id: &str,
+    ) -> anyhow::Result<bool> {
+        // El índice único (0004) es PARCIAL (`WHERE evo_message_id IS NOT NULL`): SQLite exige
+        // repetir esa misma condición en el `ON CONFLICT` para que el conflict-target resuelva al
+        // índice parcial — sin ella, "no matching unique/primary key" (comprobado en vivo).
+        let resultado = sqlx::query(
+            "INSERT INTO whatsapp_mensajes (direccion, texto, nombre, cuando, evo_message_id)
+             VALUES ('entrada', ?1, ?2, ?3, ?4)
+             ON CONFLICT(evo_message_id) WHERE evo_message_id IS NOT NULL DO NOTHING",
+        )
+        .bind(texto)
+        .bind(nombre)
+        .bind(cuando)
+        .bind(evo_message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(resultado.rows_affected() > 0)
+    }
+
+    /// Registra un mensaje SALIENTE: un peer (o el operador, desde el desktop) le respondió.
+    /// `autor_peer_id = None` significa "el operador" (vía la pantalla del desktop).
+    /// `evo_message_id`: `Some` cuando el mensaje viene de Evolution (el hilo LID, "salida" =
+    /// lo que Max escribió de verdad — el polling de respaldo lo relee cada 20s, así que sin
+    /// dedupe duplicaría sin fin); `None` para el envío iniciado por un peer vía
+    /// `/whatsapp/enviar` (no viene de Evolution, no lo necesita).
+    pub async fn whatsapp_registrar_salida(
+        &self,
+        texto: &str,
+        autor_peer_id: Option<&str>,
+        cuando: &str,
+        evo_message_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO whatsapp_mensajes (direccion, texto, autor_peer_id, cuando, evo_message_id)
+             VALUES ('salida', ?1, ?2, ?3, ?4)
+             ON CONFLICT(evo_message_id) WHERE evo_message_id IS NOT NULL DO NOTHING",
+        )
+        .bind(texto)
+        .bind(autor_peer_id)
+        .bind(cuando)
+        .bind(evo_message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Historial completo de la conversación (ambas direcciones), MÁS RECIENTE PRIMERO. Mismo
+    /// contrato de paginación que `listar` (cursor `desde` = id exclusivo hacia atrás). Lo
+    /// consume la pantalla del desktop (RFC "integrado en mi app").
+    pub async fn whatsapp_historial(
+        &self,
+        desde: Option<i64>,
+        limite: i64,
+    ) -> anyhow::Result<Vec<MensajeWhatsapp>> {
+        let limite = limite.clamp(1, 500);
+        let filas: Vec<SqliteRow> = match desde {
+            Some(d) => {
+                sqlx::query(
+                    "SELECT id, direccion, texto, nombre, autor_peer_id, cuando
+                     FROM whatsapp_mensajes WHERE id < ?1 ORDER BY id DESC LIMIT ?2",
+                )
+                .bind(d)
+                .bind(limite)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, direccion, texto, nombre, autor_peer_id, cuando
+                     FROM whatsapp_mensajes ORDER BY id DESC LIMIT ?1",
+                )
+                .bind(limite)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(filas.iter().filter_map(fila_a_mensaje_whatsapp).collect())
+    }
 }
 
 /// Upsert de identidad durable (ADR-001): registra la primera vez y refresca la última.
@@ -159,17 +303,23 @@ async fn upsert_peer(
     id: &str,
     visto: &str,
     resumen: Option<&str>,
+    directorio: Option<&str>,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO peers_conocidos (id, primer_visto, ultimo_visto, ultimo_resumen)
-         VALUES (?1, ?2, ?2, ?3)
+        // COALESCE en resumen y directorio: un caller que no los conoce (p. ej. `registrar` de una
+        // acción, que sólo tiene el id del actor) pasa None y NO debe borrar lo que ya se sabía.
+        // Sólo `peer_visto` — que viene del registro, donde el peer los declara — los refresca.
+        "INSERT INTO peers_conocidos (id, primer_visto, ultimo_visto, ultimo_resumen, directorio)
+         VALUES (?1, ?2, ?2, ?3, ?4)
          ON CONFLICT(id) DO UPDATE SET
            ultimo_visto = excluded.ultimo_visto,
-           ultimo_resumen = COALESCE(excluded.ultimo_resumen, peers_conocidos.ultimo_resumen)",
+           ultimo_resumen = COALESCE(excluded.ultimo_resumen, peers_conocidos.ultimo_resumen),
+           directorio = COALESCE(excluded.directorio, peers_conocidos.directorio)",
     )
     .bind(id)
     .bind(visto)
     .bind(resumen)
+    .bind(directorio)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -196,6 +346,25 @@ fn fila_a_accion(f: &SqliteRow) -> Option<AccionRegistrada> {
         detalle: f.try_get::<Option<String>, _>("detalle").ok().flatten(),
         cuando: f.try_get("cuando").ok()?,
         evidencia: f.try_get::<Option<String>, _>("evidencia").ok().flatten(),
+    })
+}
+
+/// Reconstruye un `MensajeWhatsapp` desde una fila. `None` si la fila es ilegible o trae una
+/// `direccion` que este binario no conoce — degradación por fila, igual que `fila_a_accion`.
+fn fila_a_mensaje_whatsapp(f: &SqliteRow) -> Option<MensajeWhatsapp> {
+    let direccion_txt: String = f.try_get("direccion").ok()?;
+    let direccion = match direccion_txt.as_str() {
+        "entrada" => DireccionWhatsapp::Entrada,
+        "salida" => DireccionWhatsapp::Salida,
+        _ => return None,
+    };
+    Some(MensajeWhatsapp {
+        id: f.try_get("id").ok()?,
+        direccion,
+        texto: f.try_get("texto").ok()?,
+        nombre: f.try_get::<Option<String>, _>("nombre").ok().flatten(),
+        autor_peer_id: f.try_get::<Option<String>, _>("autor_peer_id").ok().flatten(),
+        cuando: f.try_get("cuando").ok()?,
     })
 }
 
@@ -228,6 +397,59 @@ mod pruebas {
             cuando: cuando.to_string(),
             evidencia: None,
         }
+    }
+
+    /// El directorio se ancla en la identidad durable y se puede leer de vuelta. Es lo que permite
+    /// al Chat global filtrar por carpeta; la migración 0003 lo añade nullable sin romper nada.
+    #[tokio::test]
+    async fn peer_visto_ancla_el_directorio() {
+        let b = bitacora_en_memoria().await;
+        b.peer_visto("pa", "2026-01-01T00:00:01Z", Some("hago cosas"), Some("/repo/a"))
+            .await
+            .expect("peer_visto");
+        let conocidos = b.peers_conocidos().await.expect("peers_conocidos");
+        assert_eq!(conocidos.len(), 1);
+        assert_eq!(conocidos[0].directorio.as_deref(), Some("/repo/a"));
+        assert_eq!(conocidos[0].ultimo_resumen.as_deref(), Some("hago cosas"));
+    }
+
+    /// Un peer que MUEVE de carpeta actualiza el directorio; pero una acción posterior (que no
+    /// sabe el directorio y pasa None) NO puede borrarlo — de ahí el COALESCE. Sin él, el primer
+    /// mensaje que enviara el peer dejaría su directorio a NULL y el filtro se vaciaría solo.
+    #[tokio::test]
+    async fn el_directorio_se_refresca_pero_una_accion_no_lo_borra() {
+        let b = bitacora_en_memoria().await;
+        b.peer_visto("pa", "2026-01-01T00:00:01Z", None, Some("/repo/viejo")).await.unwrap();
+        b.peer_visto("pa", "2026-01-01T00:00:02Z", None, Some("/repo/nuevo")).await.unwrap();
+        assert_eq!(
+            b.peers_conocidos().await.unwrap()[0].directorio.as_deref(),
+            Some("/repo/nuevo"),
+            "un re-registro desde otra carpeta debe seguir al peer"
+        );
+        // Una acción cualquiera (upsert con directorio None) no debe pisar lo conocido.
+        b.registrar(&accion("pa", "2026-01-01T00:00:03Z"), None).await.unwrap();
+        assert_eq!(
+            b.peers_conocidos().await.unwrap()[0].directorio.as_deref(),
+            Some("/repo/nuevo"),
+            "una acción sin directorio NO puede borrar el ya anclado"
+        );
+    }
+
+    /// La identidad durable sobrevive a cualquier peer: `peers_conocidos` los devuelve todos,
+    /// ordenados, hayan salido o no (aquí no hay `salir` — esa tabla sencillamente no se borra).
+    #[tokio::test]
+    async fn peers_conocidos_lista_todos_ordenados() {
+        let b = bitacora_en_memoria().await;
+        b.peer_visto("pz", "2026-01-01T00:00:01Z", None, Some("/z")).await.unwrap();
+        b.peer_visto("pa", "2026-01-01T00:00:02Z", None, Some("/a")).await.unwrap();
+        let ids: Vec<_> = b
+            .peers_conocidos()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec!["pa", "pz"], "orden estable por id");
     }
 
     /// AC1/R4: registrar + listar devuelve el evento con su cuando y sujeto; más reciente primero.
@@ -332,5 +554,59 @@ mod pruebas {
         assert_eq!(pagina.len(), 2);
         assert_eq!(pagina[0].cuando, "2026-01-01T00:00:03Z", "exclusivo hacia atrás");
         assert_eq!(pagina[1].cuando, "2026-01-01T00:00:02Z");
+    }
+
+    /// Un reintento del webhook (mismo `evo_message_id`) NO duplica la fila — el índice único
+    /// PARCIAL (0004) exige repetir el `WHERE` en el `ON CONFLICT`; sin eso, SQLite rechaza el
+    /// INSERT entero con "no matching unique/primary key" (bug real, comprobado en vivo contra
+    /// el broker corriendo antes de este test).
+    #[tokio::test]
+    async fn whatsapp_entrada_deduplica_por_evo_message_id() {
+        let b = bitacora_en_memoria().await;
+        let primero = b
+            .whatsapp_registrar_entrada("oi", Some("Letícia"), "2026-01-01T00:00:01Z", "MSG-1")
+            .await
+            .expect("primer registro");
+        assert!(primero, "primera vez: debe insertar");
+        let repetido = b
+            .whatsapp_registrar_entrada("oi", Some("Letícia"), "2026-01-01T00:00:02Z", "MSG-1")
+            .await
+            .expect("reintento no debe fallar");
+        assert!(!repetido, "reintento con el mismo evo_message_id: no debe duplicar");
+        let historial = b.whatsapp_historial(None, 100).await.expect("historial");
+        assert_eq!(historial.len(), 1, "solo una fila pese al reintento");
+    }
+
+    /// Dos mensajes de ENTRADA sin `evo_message_id` en común (o de `SALIDA`, que nunca lo lleva)
+    /// no chocan entre sí: el índice parcial permite múltiples NULL.
+    #[tokio::test]
+    async fn whatsapp_historial_mezcla_entrada_y_salida_en_orden() {
+        let b = bitacora_en_memoria().await;
+        b.whatsapp_registrar_entrada("oi", Some("Letícia"), "2026-01-01T00:00:01Z", "MSG-A")
+            .await
+            .expect("entrada");
+        b.whatsapp_registrar_salida("oi de volta", Some("claude-peers-rs-s021"), "2026-01-01T00:00:02Z", None)
+            .await
+            .expect("salida");
+        let historial = b.whatsapp_historial(None, 100).await.expect("historial");
+        assert_eq!(historial.len(), 2);
+        assert_eq!(historial[0].direccion, DireccionWhatsapp::Salida, "más reciente primero");
+        assert_eq!(historial[1].direccion, DireccionWhatsapp::Entrada);
+    }
+
+    /// El hilo LID (diálogo humano real en ambas direcciones) también deduplica por
+    /// `evo_message_id` del lado de SALIDA — sin esto, el polling de respaldo (cada 20s, relee
+    /// todo el hilo) duplicaría cada mensaje de Max una vez por ciclo.
+    #[tokio::test]
+    async fn whatsapp_salida_con_evo_message_id_deduplica() {
+        let b = bitacora_en_memoria().await;
+        b.whatsapp_registrar_salida("mor vou dormir", None, "2026-01-01T00:00:01Z", Some("MSG-MAX-1"))
+            .await
+            .expect("primer registro");
+        b.whatsapp_registrar_salida("mor vou dormir", None, "2026-01-01T00:00:02Z", Some("MSG-MAX-1"))
+            .await
+            .expect("reintento no debe fallar");
+        let historial = b.whatsapp_historial(None, 100).await.expect("historial");
+        assert_eq!(historial.len(), 1, "el polling repetido no debe duplicar los mensajes de Max");
     }
 }
