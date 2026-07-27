@@ -56,6 +56,32 @@ impl ClienteBroker {
             .with_context(|| format!("respuesta inválida del broker en {ruta}"))
     }
 
+    /// GET genérico con query string que deserializa la respuesta. Espejo de `post` pero para
+    /// rutas de solo lectura (ej. `/whatsapp/historial`).
+    async fn get_con_query<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        ruta: &str,
+        q: &Q,
+    ) -> Result<R> {
+        let url = format!("{}{}", self.base, ruta);
+        let mut req = self.http.get(&url).query(q);
+        if let Some(t) = &self.token {
+            req = req.header("X-Peers-Token", t);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("broker no responde en {url} (¿está levantado?)"))?;
+        if !resp.status().is_success() {
+            let estado = resp.status();
+            let texto = resp.text().await.unwrap_or_default();
+            anyhow::bail!("error del broker ({ruta}): {estado} {texto}");
+        }
+        resp.json::<R>()
+            .await
+            .with_context(|| format!("respuesta inválida del broker en {ruta}"))
+    }
+
     /// Comprueba si el broker está vivo (GET /salud). No lanza: devuelve false si no responde.
     pub async fn esta_vivo(&self) -> bool {
         let url = format!("{}/salud", self.base);
@@ -196,6 +222,81 @@ impl ClienteBroker {
             Some(s) => self.post_con_secreto("/chat-privado/responder", &cuerpo, s).await,
             None => self.post("/chat-privado/responder", &cuerpo).await,
         }
+    }
+
+    /// Puente WhatsApp (Evolution API): responde al destino FIJO configurado en el broker
+    /// (nunca parametrizable — sin campo `numero`, ver `PeticionWhatsappEnviar`). El autor real
+    /// se resuelve por el secreto de sesión (anti-IDOR), igual que `chat_privado_responder`.
+    pub async fn whatsapp_enviar(&self, texto: &str, secreto: Option<&str>) -> Result<RespuestaEnviar> {
+        let cuerpo = PeticionWhatsappEnviar { texto: texto.to_string() };
+        match secreto {
+            Some(s) => self.post_con_secreto("/whatsapp/enviar", &cuerpo, s).await,
+            None => self.post("/whatsapp/enviar", &cuerpo).await,
+        }
+    }
+
+    /// Igual que `whatsapp_enviar` pero para un ARCHIVO — la ruta debe existir en el disco del
+    /// broker (mismo Mac), ver `PeticionWhatsappEnviarDocumento`.
+    pub async fn whatsapp_enviar_documento(
+        &self,
+        ruta_local: &str,
+        nombre_archivo: Option<&str>,
+        legenda: Option<&str>,
+        secreto: Option<&str>,
+    ) -> Result<RespuestaEnviar> {
+        let cuerpo = PeticionWhatsappEnviarDocumento {
+            ruta_local: ruta_local.to_string(),
+            nombre_archivo: nombre_archivo.map(str::to_string),
+            legenda: legenda.map(str::to_string),
+        };
+        match secreto {
+            Some(s) => self.post_con_secreto("/whatsapp/enviar-documento", &cuerpo, s).await,
+            None => self.post("/whatsapp/enviar-documento", &cuerpo).await,
+        }
+    }
+
+    /// Igual que `whatsapp_enviar` pero manda una MENSAJE DE VOZ (PTT) — `url_audio` es remota,
+    /// el broker la descarga y convierte, ver `PeticionWhatsappEnviarAudio`.
+    pub async fn whatsapp_enviar_audio(
+        &self,
+        url_audio: &str,
+        secreto: Option<&str>,
+    ) -> Result<RespuestaEnviar> {
+        let cuerpo = PeticionWhatsappEnviarAudio { url_audio: url_audio.to_string() };
+        match secreto {
+            Some(s) => self.post_con_secreto("/whatsapp/enviar-audio", &cuerpo, s).await,
+            None => self.post("/whatsapp/enviar-audio", &cuerpo).await,
+        }
+    }
+
+    /// Historial completo de la conversación de WhatsApp (ambas direcciones), MÁS RECIENTE
+    /// PRIMERO. `limite` = flag de "cuántos mensajes" (pedido explícito de Max); `None` cae al
+    /// default del broker (200).
+    pub async fn whatsapp_historial(
+        &self,
+        limite: Option<i64>,
+    ) -> Result<RespuestaWhatsappHistorial> {
+        let q = PeticionWhatsappHistorial { desde: None, limite };
+        self.get_con_query("/whatsapp/historial", &q).await
+    }
+
+    /// Historial DURABLE de la propia cola (`GET /admin/historial`), incluidos los mensajes ya
+    /// procesados que salieron de la bandeja activa.
+    ///
+    /// INTENCIÓN: desde que el client confirma `Procesado` (ver la nota del bucle de push), la
+    /// bandeja activa drena — y eso abre un agujero que el peer del trader identificó: la
+    /// COMPACTACIÓN DE CONTEXTO borra mensajes ya entregados. No es la ventana estrecha de un
+    /// crash; es ancha y rutinaria, pasa en toda sesión larga por diseño, y el agente sigue vivo
+    /// convencido de que lo leyó todo. Sin esta vía, un mensaje perdido así no volvía por ningún
+    /// lado. El historial ya existía y ya era durable: lo único que faltaba era que el agente
+    /// pudiera leer EL SUYO. Va bajo el token de red, que este client ya presenta.
+    pub async fn historial_mensajes(&self, id: &str, desde: Option<i64>) -> Result<Vec<Mensaje>> {
+        let q = PeticionHistorial {
+            id: id.to_string(),
+            desde,
+            estado: None,
+        };
+        self.get_con_query("/admin/historial", &q).await
     }
 
     pub async fn salir(&self, id: &str) -> Result<RespuestaOk> {

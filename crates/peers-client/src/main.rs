@@ -159,7 +159,31 @@ async fn main() -> Result<()> {
         .await
     {
         Ok(r) => {
-            info!("registrado como instancia '{}'", r.id);
+            // El broker resuelve colisiones SUFIJANDO en silencio (`resolver_id_sin_colision`):
+            // si el id pedido lo ocupa otro proceso vivo, devuelve `<id>-2` y el registro es un
+            // ÉXITO — solo queda un warn! en el log DEL BROKER, que este proceso nunca ve. Para
+            // una sesión interactiva es una molestia; para un consumidor no interactivo es una
+            // trampa: se queda escuchando una cola distinta de aquella a la que los demás le
+            // escriben, y sus comandos entrantes (incluido un paro de emergencia) esperan para
+            // siempre en la cola del id que pidió. Sin error, sin rebote, sin señal.
+            //
+            // No podemos rechazar el registro desde aquí sin dejar al peer fuera de la red, pero
+            // callarlo es lo único inaceptable. Se emite a nivel ERROR y con el par de ids para
+            // que sea grepeable en el NDJSON.
+            if r.id != id_efectivo {
+                error!(
+                    event_name = "registro_id_sufijado",
+                    outcome = "failure",
+                    id_pedido = %id_efectivo,
+                    id_asignado = %r.id,
+                    "el id '{}' ya estaba ocupado por otro proceso VIVO: esta instancia quedó como \
+                     '{}'. Los mensajes dirigidos a '{}' NO llegan aquí. Si este peer recibe \
+                     órdenes por la red, detenelo y relanzalo con un id libre.",
+                    id_efectivo, r.id, id_efectivo
+                );
+            } else {
+                info!("registrado como instancia '{}'", r.id);
+            }
             // E-10: guardamos el secreto emitido (si el broker lo manda; broker viejo → None).
             (Some(r.id), r.secreto)
         }
@@ -424,9 +448,86 @@ pub(crate) async fn tool_revisar(estado: &Arc<EstadoCliente>) -> Result<String, 
         .iter()
         .map(|m| format!("De {} ({}):\n{}", m.de_id, m.enviado_en, m.texto))
         .collect();
+    // Drena lo entregado (ver la nota larga del bucle de push sobre por qué `Procesado`).
+    //
+    // Esta era la vía que MÁS duplicaba, y por partida doble: `/recibir` es un peek NO
+    // destructivo, esta función no tocaba `empujados` (ese HashSet vive en la task del bucle de
+    // push, fuera de alcance) y NO confirmaba ningún estado — ni `Entregado` ni `Leido`. O sea:
+    // devolvía la bandeja ENTERA desde el principio en cada llamada. Verificado con el peer del
+    // trader el 27/07/2026 desde el lado receptor: tres llamadas seguidas le devolvieron 17 → 19
+    // → 20 mensajes, siempre incluyendo todos los anteriores. Y es justo la vía que usa un
+    // consumidor DELIBERADO (un agente que llama la tool a mano), no la de respaldo.
+    //
+    // Best-effort a propósito: si el broker no responde al confirmar, el agente YA tiene el
+    // contenido delante — devolver un error aquí sería peor (perdería la lectura por un fallo
+    // del acuse). Se queda en la bandeja y se drena en la próxima llamada.
+    let ids: Vec<i64> = resp.mensajes.iter().map(|m| m.id).collect();
+    if let Err(e) = estado.broker.confirmar(&ids, EstadoMensaje::Procesado).await {
+        warn!(
+            event_name = "confirmar_estado_mensaje",
+            outcome = "failure",
+            estado = "Procesado",
+            via = "revisar_mensajes",
+            cantidad = ids.len(),
+            error = %e,
+            "no se pudieron confirmar {} mensaje(s) leídos por revisar_mensajes: {e:#}",
+            ids.len()
+        );
+    }
+    // "pendiente(s)", no "nuevo(s)": el rótulo viejo era un `format!` sobre el largo de la
+    // bandeja completa, así que afirmaba "nuevos" sobre mensajes ya leídos hacía horas. Ahora
+    // que la lectura drena, lo que venga en la próxima llamada sí será nuevo de verdad.
     Ok(format!(
-        "{} mensaje(s) nuevo(s):\n\n{}",
+        "{} mensaje(s) pendiente(s):\n\n{}",
         resp.mensajes.len(),
+        bloques.join("\n\n---\n\n")
+    ))
+}
+
+/// Relee el historial durable de MI PROPIA cola, incluidos los mensajes ya procesados.
+///
+/// INTENCIÓN: la red de contención de `revisar_mensajes`. Desde que la lectura drena la bandeja,
+/// un mensaje que la compactación de contexto se llevó no volvía por ninguna vía — el agente
+/// quedaba vivo y convencido de haberlo leído todo. Esto le devuelve el acceso a lo que ya salió
+/// de la bandeja. Es SOLO LECTURA y no cambia ningún estado: releer no "desprocesa" nada.
+///
+/// Acotado a `limite` (default 20, los más recientes) porque el historial retiene hasta
+/// `RETENCION_HISTORIAL` (500) por cola y volcar 500 mensajes al contexto sería justo el problema
+/// que este cambio intenta resolver.
+pub(crate) async fn tool_historial_mensajes(
+    estado: &Arc<EstadoCliente>,
+    args: &Value,
+) -> Result<String, String> {
+    let mi_id = estado
+        .id
+        .read()
+        .await
+        .clone()
+        .ok_or("Aún no registrado en el broker")?;
+    let limite = args
+        .get("limite")
+        .and_then(Value::as_i64)
+        .unwrap_or(20)
+        .clamp(1, 200) as usize;
+    let msgs = estado
+        .broker
+        .historial_mensajes(&mi_id, None)
+        .await
+        .map_err(|e| format!("Error al leer el historial: {e}"))?;
+    if msgs.is_empty() {
+        return Ok("Tu historial de mensajes está vacío.".into());
+    }
+    // El broker devuelve por msg_id ascendente (orden real de envío): los últimos son los recientes.
+    let recientes: Vec<&Mensaje> = msgs.iter().rev().take(limite).collect();
+    let bloques: Vec<String> = recientes
+        .iter()
+        .rev()
+        .map(|m| format!("De {} ({}) [{:?}]:\n{}", m.de_id, m.enviado_en, m.estado, m.texto))
+        .collect();
+    Ok(format!(
+        "{} mensaje(s) de tu historial (de {} retenidos), del más antiguo al más reciente:\n\n{}",
+        recientes.len(),
+        msgs.len(),
         bloques.join("\n\n---\n\n")
     ))
 }
@@ -477,6 +578,104 @@ pub(crate) async fn tool_chat_privado_responder(
         return Err("No se pudo responder: identidad no verificada (falta el secreto de sesión).".into());
     }
     Ok("Respuesta privada enviada al operador.".into())
+}
+
+/// Puente WhatsApp (Evolution API): responde al ÚNICO contacto autorizado configurado en el
+/// broker. Sin parámetro de número — nunca elegible por el peer, ver `PeticionWhatsappEnviar`.
+pub(crate) async fn tool_whatsapp_enviar(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+    let texto = args
+        .get("texto")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'texto'")?;
+    let secreto = estado.secreto.read().await.clone();
+    let resp = estado
+        .broker
+        .whatsapp_enviar(texto, secreto.as_deref())
+        .await
+        .map_err(|e| format!("Error al responder por WhatsApp: {e}"))?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "No se pudo enviar el mensaje de WhatsApp.".to_string()));
+    }
+    Ok("Mensaje de WhatsApp enviado.".into())
+}
+
+/// Igual que `tool_whatsapp_enviar` pero para un archivo — ver `PeticionWhatsappEnviarDocumento`.
+pub(crate) async fn tool_whatsapp_enviar_documento(
+    estado: &Arc<EstadoCliente>,
+    args: &Value,
+) -> Result<String, String> {
+    let ruta_local = args
+        .get("ruta_local")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'ruta_local'")?;
+    let nombre_archivo = args.get("nombre_archivo").and_then(Value::as_str);
+    let legenda = args.get("legenda").and_then(Value::as_str);
+    let secreto = estado.secreto.read().await.clone();
+    let resp = estado
+        .broker
+        .whatsapp_enviar_documento(ruta_local, nombre_archivo, legenda, secreto.as_deref())
+        .await
+        .map_err(|e| format!("Error al enviar el documento por WhatsApp: {e}"))?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "No se pudo enviar el documento de WhatsApp.".to_string()));
+    }
+    Ok("Documento de WhatsApp enviado.".into())
+}
+
+/// Igual que `tool_whatsapp_enviar` pero manda una MENSAJE DE VOZ (PTT) — ver
+/// `PeticionWhatsappEnviarAudio`.
+pub(crate) async fn tool_whatsapp_enviar_audio(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+    let url_audio = args
+        .get("url_audio")
+        .and_then(Value::as_str)
+        .ok_or("Falta el campo 'url_audio'")?;
+    let secreto = estado.secreto.read().await.clone();
+    let resp = estado
+        .broker
+        .whatsapp_enviar_audio(url_audio, secreto.as_deref())
+        .await
+        .map_err(|e| format!("Error al enviar el audio por WhatsApp: {e}"))?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "No se pudo enviar el audio de WhatsApp.".to_string()));
+    }
+    Ok("Mensaje de voz de WhatsApp enviada.".into())
+}
+
+/// Historial de la conversación de WhatsApp con el contacto autorizado — ambas direcciones
+/// (lo que ella escribió y lo que Max/los peers respondieron), MÁS RECIENTE PRIMERO.
+pub(crate) async fn tool_whatsapp_historial(estado: &Arc<EstadoCliente>, args: &Value) -> Result<String, String> {
+    let limite = args.get("limite").and_then(Value::as_i64);
+    let resp = estado
+        .broker
+        .whatsapp_historial(limite)
+        .await
+        .map_err(|e| format!("Error al leer el historial de WhatsApp: {e}"))?;
+    if resp.mensajes.is_empty() {
+        return Ok("Sin mensajes en el historial de WhatsApp todavía.".into());
+    }
+    let bloques: Vec<String> = resp
+        .mensajes
+        .iter()
+        .rev() // el historial viene más-reciente-primero; para leer como conversación, cronológico
+        .map(|m| {
+            let quien = match m.direccion {
+                peers_core::DireccionWhatsapp::Entrada => {
+                    m.nombre.clone().unwrap_or_else(|| "ella".to_string())
+                }
+                peers_core::DireccionWhatsapp::Salida => {
+                    m.autor_peer_id.clone().unwrap_or_else(|| "operador".to_string())
+                }
+            };
+            format!("[{}] {}: {}", m.cuando, quien, m.texto)
+        })
+        .collect();
+    Ok(format!("{} mensaje(s):\n\n{}", resp.mensajes.len(), bloques.join("\n")))
 }
 
 /// Crea una tarea con el estimado de la IA. Devuelve al agente el estimado corregido por su
@@ -879,6 +1078,40 @@ fn lanzar_recepcion(estado: Arc<EstadoCliente>) {
                         estado = "Leido",
                         error = %e,
                         "no se pudo confirmar Leido del mensaje {}: {e:#}",
+                        m.id
+                    );
+                }
+                //  - Procesado: SALE de la bandeja activa (es la ÚNICA transición que hace el
+                //    ZREM, ver store.rs `transicionar_mensaje`).
+                //
+                // INTENCIÓN (por qué se confirma aquí y no lo confirma el agente): `Procesado`
+                // no tenía NINGÚN productor en todo el sistema — el client paraba en `Leido`, y
+                // desktop/TUI solo lo dibujan. Resultado medido el 27/07/2026: ninguna bandeja
+                // de la red drenaba jamás (un peer acumulaba 19 mensajes desde su arranque), el
+                // peek de `/recibir` devolvía la bandeja entera cada segundo, y el ÚNICO motivo
+                // por el que no se veían duplicados infinitos era `empujados` — un HashSet EN
+                // MEMORIA, por proceso. Cada proceso nuevo arrancaba con el set vacío y volvía a
+                // empujar todo lo acumulado: 617 de 1452 mensajes (36%) se entregaron más de una
+                // vez. Peor con ids derivados del TTY, que se reciclan: una sesión nueva heredaba
+                // la bandeja de otra y recibía mensajes rancios fuera de contexto.
+                //
+                // El criterio es el honesto para un transporte: la obligación de ENTREGA se
+                // cumple cuando el mensaje entra en el contexto del agente, y eso ya ocurrió
+                // arriba (el push devolvió ok). Guardar el mensaje en la bandeja después de eso
+                // no protege a ESTA sesión (si muere, muere con su contexto) — solo se lo replica
+                // a una sesión FUTURA que herede el id, que es precisamente el fallo. El registro
+                // durable para auditoría no vive aquí: vive en el historial (`k_historial`).
+                //
+                // Si el push falla, el `continue` de arriba impide llegar hasta acá: el mensaje
+                // se queda en la bandeja y se reintenta en el próximo ciclo (R1.4). Intacto.
+                if let Err(e) = estado.broker.confirmar(&[m.id], EstadoMensaje::Procesado).await {
+                    warn!(
+                        event_name = "confirmar_estado_mensaje",
+                        outcome = "failure",
+                        mensaje_id = m.id,
+                        estado = "Procesado",
+                        error = %e,
+                        "no se pudo confirmar Procesado del mensaje {}: {e:#}",
                         m.id
                     );
                 }

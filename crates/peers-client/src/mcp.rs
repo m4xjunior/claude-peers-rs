@@ -100,6 +100,51 @@ pub struct ArgsChatPrivadoResponder {
     pub texto: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArgsWhatsappHistorial {
+    /// Cuántos mensajes traer como máximo (más recientes primero). Opcional; por defecto 200.
+    #[serde(default)]
+    pub limite: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArgsHistorialMensajes {
+    /// Cuántos mensajes traer como máximo (los más recientes). Opcional; por defecto 20, tope 200.
+    #[serde(default)]
+    pub limite: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArgsWhatsappEnviar {
+    /// Tu respuesta al ÚNICO contacto de WhatsApp autorizado. Escribe en portugués de Brasil,
+    /// coloquial, clonando el tono y la forma de hablar de Max (informal, directo) — ella ya
+    /// sabe que quien escribe es el equipo de peers, así que no hay engaño, solo continuidad de
+    /// tono. Formato WhatsApp: negrito con *asteriscos*, itálico con _underscores_, SIN '#', SIN
+    /// emojis, SIN guiones/rayas, frases cortas.
+    pub texto: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArgsWhatsappEnviarDocumento {
+    /// Ruta ABSOLUTA local del archivo (tiene que existir en este mismo Mac, donde corre el
+    /// broker — no funciona para peers en otra máquina, ej. la VM).
+    pub ruta_local: String,
+    /// Nombre a mostrar en WhatsApp; si falta, usa el nombre del archivo en `ruta_local`.
+    #[serde(default)]
+    pub nombre_archivo: Option<String>,
+    /// Texto opcional que acompaña el documento (aparece como legenda en WhatsApp).
+    #[serde(default)]
+    pub legenda: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArgsWhatsappEnviarAudio {
+    /// URL remota del audio a enviar como mensaje de voz (ej. mp3 de HeyGen/ElevenLabs). El
+    /// broker la descarga y la convierte a ogg/opus antes de mandarla — no hace falta convertir
+    /// nada de tu lado, solo pasar la URL.
+    pub url_audio: String,
+}
+
 /// Servidor MCP de la instancia. Lleva el estado compartido (broker, id, secreto, etc.) para que
 /// las tools puedan operar. `tool_router` es el registro de tools que genera el macro.
 #[derive(Clone)]
@@ -238,6 +283,62 @@ impl ServidorPeers {
             .await
             .unwrap_or_else(|e| e)
     }
+
+    #[tool(
+        name = "responder_whatsapp",
+        description = "Responde por WhatsApp al ÚNICO contacto autorizado por el dueño (Evolution API, vía el broker). USO EXCLUSIVO para ese contacto — no acepta ni necesita número, el destino es fijo y está contenido en el broker, nunca elegible por el peer. Al escribir: clona el tono y la forma de hablar del dueño (informal, directo, como habla él) para que la conversación se sienta natural — el contacto YA SABE que quien escribe es el equipo de peers, así que esto no es un engaño, es solo continuidad de tono. Formato WhatsApp: negrito *asteriscos*, itálico _underscores_, sin '#', sin emojis, sin guiones, frases cortas."
+    )]
+    async fn responder_whatsapp(&self, Parameters(a): Parameters<ArgsWhatsappEnviar>) -> String {
+        crate::tool_whatsapp_enviar(&self.estado, &json!({ "texto": a.texto }))
+            .await
+            .unwrap_or_else(|e| e)
+    }
+
+    #[tool(
+        name = "enviar_documento_whatsapp",
+        description = "Envía un ARCHIVO (documento) por WhatsApp al ÚNICO contacto autorizado, igual que responder_whatsapp pero para un archivo en vez de texto. La ruta debe ser ABSOLUTA y existir en este mismo Mac (donde corre el broker). LÍMITE de ~60MB — para archivos más grandes, suba a un link (ej. Cloud Storage) y mande el link con responder_whatsapp en vez de usar esta tool. Formato: PDF, CSV, imagem, etc. — o que for, WhatsApp mostra como documento."
+    )]
+    async fn enviar_documento_whatsapp(
+        &self,
+        Parameters(a): Parameters<ArgsWhatsappEnviarDocumento>,
+    ) -> String {
+        crate::tool_whatsapp_enviar_documento(
+            &self.estado,
+            &json!({ "ruta_local": a.ruta_local, "nombre_archivo": a.nombre_archivo, "legenda": a.legenda }),
+        )
+        .await
+        .unwrap_or_else(|e| e)
+    }
+
+    #[tool(
+        name = "responder_whatsapp_audio",
+        description = "Responde por WhatsApp con una MENSAJE DE VOZ (nota de voz, PTT) al ÚNICO contacto autorizado — igual que responder_whatsapp pero por audio en vez de texto. Pásale la URL del audio ya generado (ej. HeyGen create_speech, ElevenLabs) — el broker lo descarga y convierte, no hace falta preprocesar nada de tu lado. Úsala cuando el dueño pida explícitamente que la respuesta salga como voz en vez de texto."
+    )]
+    async fn responder_whatsapp_audio(&self, Parameters(a): Parameters<ArgsWhatsappEnviarAudio>) -> String {
+        crate::tool_whatsapp_enviar_audio(&self.estado, &json!({ "url_audio": a.url_audio }))
+            .await
+            .unwrap_or_else(|e| e)
+    }
+
+    #[tool(
+        name = "historial_whatsapp",
+        description = "Lee el historial de la conversación de WhatsApp con el contacto autorizado — ambas direcciones (lo que ella escribió y lo que se le respondió), más reciente primero. Usa 'limite' para controlar cuántos mensajes traer (por defecto 200)."
+    )]
+    async fn historial_whatsapp(&self, Parameters(a): Parameters<ArgsWhatsappHistorial>) -> String {
+        crate::tool_whatsapp_historial(&self.estado, &json!({ "limite": a.limite }))
+            .await
+            .unwrap_or_else(|e| e)
+    }
+
+    #[tool(
+        name = "historial_mensajes",
+        description = "Relee TU historial de mensajes de la red, incluidos los que ya procesaste y salieron de tu bandeja. Úsala cuando sospeches que perdiste contexto de una conversación — por ejemplo tras una compactación, o si alguien menciona algo que te dijo y no lo tienes. Solo lectura: releer no reenvía ni cambia nada. Usa 'limite' (por defecto 20)."
+    )]
+    async fn historial_mensajes(&self, Parameters(a): Parameters<ArgsHistorialMensajes>) -> String {
+        crate::tool_historial_mensajes(&self.estado, &json!({ "limite": a.limite }))
+            .await
+            .unwrap_or_else(|e| e)
+    }
 }
 
 #[tool_handler]
@@ -348,14 +449,28 @@ Tools disponibles:\n\
 - enviar_mensaje: envía un mensaje a otra instancia por su id\n\
 - avisar_equipo: envía el MISMO mensaje a TODAS las demás instancias vivas (broadcast)\n\
 - definir_resumen: fija un resumen de lo que haces (visible a las demás)\n\
-- revisar_mensajes: revisa manualmente mensajes nuevos\n\
+- revisar_mensajes: revisa manualmente mensajes pendientes (leerlos los saca de tu bandeja)\n\
+- historial_mensajes: relee tu historial, incluidos los ya procesados (red de contención si \
+perdiste contexto por una compactación)\n\
 - crear_tarea: crea una tarea con tu estimado de duración\n\
 - reportar_tarea: añade una nota de progreso a una tarea\n\
 - cerrar_tarea: cierra una tarea al terminarla\n\
 - listar_tareas: lista tus tareas con sus tiempos\n\
 - revisar_tareas: resumen de tus tareas abiertas\n\
 - chat_privado_recibir: consulta tu canal PRIVADO y confidencial con el operador (el dueño)\n\
-- chat_privado_responder: responde al operador por ese canal privado\n\n\
+- chat_privado_responder: responde al operador por ese canal privado\n\
+- responder_whatsapp: responde por WhatsApp al ÚNICO contacto autorizado por el dueño (destino fijo, \
+contenido en el broker — no elegible por ti)\n\
+- responder_whatsapp_audio: igual que responder_whatsapp pero manda una MENSAJE DE VOZ (PTT) — le \
+pasas la URL de un audio ya generado (ej. HeyGen, ElevenLabs) y el broker lo descarga/convierte\n\
+- historial_whatsapp: lee la conversación completa de WhatsApp con ese contacto (ambas direcciones), \
+con flag 'limite' para cuántos mensajes traer\n\n\
+PUENTE WHATSAPP: si ves en el canal un mensaje formateado como '[WhatsApp <nombre>] <texto>', es un \
+mensaje REAL que ese contacto escribió por WhatsApp (push automático del broker, vía Evolution API). \
+Si quieres responderle, usa responder_whatsapp — NUNCA enviar_mensaje/avisar_equipo para eso, y NUNCA \
+inventes o asumas otro número: el destino es fijo y único. Al responder, clona el tono y la forma de \
+hablar del dueño (informal, directo) para que se sienta natural — el contacto ya sabe que quien \
+escribe es el equipo de peers.\n\n\
 CANAL PRIVADO CON EL OPERADOR (confidencial): tienes un canal privado y directo con el dueño, \
 separado de los mensajes normales. Consulta chat_privado_recibir periódicamente y cuando el \
 contexto lo sugiera. IMPORTANTE — AVISO DE MENSAJE PRIVADO: si en el canal normal ves un mensaje \
