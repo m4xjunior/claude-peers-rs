@@ -299,6 +299,21 @@ impl ClienteBroker {
         self.get_con_query("/admin/historial", &q).await
     }
 
+    /// Feed global de mensajes (`GET /admin/historial-global`), del que el client filtra los que
+    /// ENVIÓ este peer para responder "¿llegó lo que mandé?".
+    ///
+    /// INTENCIÓN: el broker es la única parte que sabe si un mensaje se entregó, y hasta ahora
+    /// solo su dueño podía consultarlo — un cuello de botella humano en el protocolo de una mesa
+    /// que ejecuta dinero. Lo pidió el peer `risco` con el argumento correcto: "una reprobación
+    /// sin confirmación de entrega es una reprobación que puede no existir". El caso peligroso no
+    /// es el id muerto que da error al enviar (ese se ve), sino el id muerto DENTRO de la ventana
+    /// de liveness de 45s: el envío tiene éxito, la cola no la consume nadie, y del lado del
+    /// emisor es indistinguible de entregada.
+    pub async fn historial_global(&self, limite: Option<usize>) -> Result<Vec<Mensaje>> {
+        let q = PeticionHistorialGlobal { desde: None, limite };
+        self.get_con_query("/admin/historial-global", &q).await
+    }
+
     pub async fn salir(&self, id: &str) -> Result<RespuestaOk> {
         self.post("/salir", &PeticionSalir { id: id.to_string() }).await
     }

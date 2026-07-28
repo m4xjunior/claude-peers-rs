@@ -484,6 +484,115 @@ pub(crate) async fn tool_revisar(estado: &Arc<EstadoCliente>) -> Result<String, 
     ))
 }
 
+/// Estado de entrega de los mensajes que ESTE peer envió: ¿llegaron, los leyeron, los procesaron?
+///
+/// INTENCIÓN: cerrar el circuito que el emisor no puede cerrar solo. "Enviado con éxito" solo
+/// dice que el broker lo encoló; no dice que del otro lado haya alguien. El caso que esto cubre
+/// —y que motivó la petición— es el id muerto DENTRO de la ventana de liveness de 45s: el envío
+/// devuelve ok, la cola no la consume nadie, y desde el emisor es idéntico a una entrega buena.
+/// Con esto, un peer que manda una validación crítica puede exigir prueba en vez de asumirla.
+///
+/// Cómo leer los estados: `enviado` = encolado, nadie lo vio todavía (si persiste, sospechá del
+/// destinatario); `entregado`/`leido` = llegó a su sesión y se renderizó; `procesado` = además
+/// salió de su bandeja. `leido` sin `procesado` NO es un problema: significa que el destinatario
+/// corre un client viejo, que entrega igual pero no drena.
+pub(crate) async fn tool_estado_entrega(
+    estado: &Arc<EstadoCliente>,
+    args: &Value,
+) -> Result<String, String> {
+    let mi_id = estado
+        .id
+        .read()
+        .await
+        .clone()
+        .ok_or("Aún no registrado en el broker")?;
+    let limite = args
+        .get("limite")
+        .and_then(Value::as_i64)
+        .unwrap_or(15)
+        .clamp(1, 100) as usize;
+    let para = args.get("para").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    // Pedimos un tramo amplio del feed global y filtramos por emisor acá: el endpoint no tiene
+    // filtro por `de_id` y añadirlo al broker obligaría a redesplegarlo (los peers vivos no lo
+    // reinician). El recorte del broker ya acota el coste.
+    let todos = estado
+        .broker
+        .historial_global(Some(500))
+        .await
+        .map_err(|e| format!("Error al consultar el estado de entrega: {e}"))?;
+    let mios: Vec<&Mensaje> = todos
+        .iter()
+        .filter(|m| m.de_id == mi_id)
+        .filter(|m| para.is_none_or(|p| m.para_id == p))
+        .rev()
+        .take(limite)
+        .collect();
+    if mios.is_empty() {
+        return Ok(match para {
+            Some(p) => format!("No hay mensajes tuyos a '{p}' en el tramo reciente del historial."),
+            None => "No hay mensajes tuyos en el tramo reciente del historial.".into(),
+        });
+    }
+    // ¿Sigue vivo cada destino? El `para_id` YA es la identidad de quien consume — una cola solo
+    // la puede drenar un peer registrado con ese id, así que no hace falta (ni existe) un registro
+    // aparte de "quién lo consumió". Lo que el emisor no puede ver es si ese id sigue perteneciendo
+    // a alguien: un `Enviado` hacia un id que ya no está en la red es una cola huérfana confirmada,
+    // no una sospecha. Best-effort: si el listado falla, se omite la anotación en vez de fallar.
+    let vivos: Vec<String> = estado
+        .broker
+        .listar(&PeticionListar {
+            alcance: Alcance::Maquina,
+            directorio: estado.directorio.clone(),
+            repo_git: estado.repo_git.clone(),
+            excluir_id: None,
+        })
+        .await
+        .map(|is| is.into_iter().map(|i| i.id).collect())
+        .unwrap_or_default();
+    let lineas: Vec<String> = mios
+        .iter()
+        .rev()
+        .map(|m| {
+            let destino_vivo = vivos.iter().any(|v| *v == m.para_id);
+            let alerta = match (m.estado, destino_vivo) {
+                // Encolado y el destino ya ni existe: cola huérfana, esto no llega nunca.
+                (EstadoMensaje::Enviado, false) => "  ⚠ SIN ENTREGAR — destino YA NO ESTÁ en la red",
+                (EstadoMensaje::Enviado, true) => "  ⚠ SIN ENTREGAR — destino vivo pero no lo consumió",
+                // Consumido por alguien que ya se fue: llegó, pero ese id no responderá más.
+                (_, false) => "  (destino ya no está en la red)",
+                _ => "",
+            };
+            format!(
+                "[{:?}] → {} ({}){}\n    {}",
+                m.estado,
+                m.para_id,
+                m.enviado_en,
+                alerta,
+                recorte(&m.texto, 70)
+            )
+        })
+        .collect();
+    let sin_entregar = mios
+        .iter()
+        .filter(|m| m.estado == EstadoMensaje::Enviado)
+        .count();
+    let resumen = if sin_entregar > 0 {
+        format!(
+            "\n\n⚠ {sin_entregar} de {} SIN entregar: encolados pero nadie los consumió. Verificá con \
+             listar_instancias que el destino siga vivo — un id que cambió deja la cola huérfana.",
+            mios.len()
+        )
+    } else {
+        format!("\n\nLos {} llegaron a destino.", mios.len())
+    };
+    Ok(format!(
+        "Estado de entrega de tus últimos {} mensaje(s):\n\n{}{}",
+        mios.len(),
+        lineas.join("\n"),
+        resumen
+    ))
+}
+
 /// Relee el historial durable de MI PROPIA cola, incluidos los mensajes ya procesados.
 ///
 /// INTENCIÓN: la red de contención de `revisar_mensajes`. Desde que la lectura drena la bandeja,

@@ -108,6 +108,16 @@ pub struct ArgsWhatsappHistorial {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArgsEstadoEntrega {
+    /// Cuántos mensajes tuyos revisar (los más recientes). Opcional; por defecto 15, tope 100.
+    #[serde(default)]
+    pub limite: Option<i64>,
+    /// Filtra por destinatario (id exacto). Opcional; sin él, revisa los envíos a todos.
+    #[serde(default)]
+    pub para: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ArgsHistorialMensajes {
     /// Cuántos mensajes traer como máximo (los más recientes). Opcional; por defecto 20, tope 200.
     #[serde(default)]
@@ -331,6 +341,16 @@ impl ServidorPeers {
     }
 
     #[tool(
+        name = "estado_entrega",
+        description = "Comprueba si los mensajes que TÚ enviaste llegaron a destino: entregado, leído o procesado. Úsala cuando mandaste algo crítico y necesitas PRUEBA de que llegó en vez de asumirlo — 'enviado con éxito' solo dice que se encoló. Un estado 'enviado' que no avanza significa que nadie lo consumió (destino caído o con otro id). Usa 'para' para filtrar por destinatario y 'limite' (por defecto 15)."
+    )]
+    async fn estado_entrega(&self, Parameters(a): Parameters<ArgsEstadoEntrega>) -> String {
+        crate::tool_estado_entrega(&self.estado, &json!({ "limite": a.limite, "para": a.para }))
+            .await
+            .unwrap_or_else(|e| e)
+    }
+
+    #[tool(
         name = "historial_mensajes",
         description = "Relee TU historial de mensajes de la red, incluidos los que ya procesaste y salieron de tu bandeja. Úsala cuando sospeches que perdiste contexto de una conversación — por ejemplo tras una compactación, o si alguien menciona algo que te dijo y no lo tienes. Solo lectura: releer no reenvía ni cambia nada. Usa 'limite' (por defecto 20)."
     )]
@@ -452,6 +472,8 @@ Tools disponibles:\n\
 - revisar_mensajes: revisa manualmente mensajes pendientes (leerlos los saca de tu bandeja)\n\
 - historial_mensajes: relee tu historial, incluidos los ya procesados (red de contención si \
 perdiste contexto por una compactación)\n\
+- estado_entrega: comprueba si lo que TÚ enviaste llegó a destino (prueba de entrega, no \
+suposición) — úsala tras mandar algo crítico\n\
 - crear_tarea: crea una tarea con tu estimado de duración\n\
 - reportar_tarea: añade una nota de progreso a una tarea\n\
 - cerrar_tarea: cierra una tarea al terminarla\n\
